@@ -29,6 +29,11 @@ MODE_INFO = {
     "normal": ("Обычно", "Фраза, рисунок, подпись, рисунок — испорченный телефон"),
     "sandwich": ("Сэндвич", "Фраза, потом только рисунки, в конце подпись"),
     "plagiat": ("Плагиат", "Копируй предыдущий рисунок, времени всё меньше"),
+    "animation": ("Анимация", "Кадр за кадром, предыдущий виден калькой"),
+    "complete": ("Дополнение", "Каракули превращаются в рисунок, рисунок — в подпись"),
+    "coop": ("Сотрудничество", "Один рисунок на всех, каждый добавляет своё"),
+    "corpse": ("Изысканный труп", "У каждого своя полоса, виден только край соседней"),
+    "missing": ("Недостающая часть", "Кусок рисунка пропадает, дорисовывай на его месте"),
 }
 
 DEFAULT_SETTINGS = {
@@ -37,6 +42,8 @@ DEFAULT_SETTINGS = {
     "draw_time": 80,
     "write_time": 45,
     "steps": 0,            # 0 — по числу игроков
+    "fps": 4,
+    "background": False,
     "hints": 2,
     "difficulty": "mixed",
     "custom_words": "",
@@ -48,6 +55,7 @@ SETTINGS_LIMITS = {
     "draw_time": (20, 180),
     "write_time": (15, 120),
     "steps": (0, 12),
+    "fps": (1, 12),
     "hints": (0, 3),
     "difficulty": {"easy", "mixed", "hard"},
 }
@@ -228,6 +236,8 @@ class Room:
                     continue
             elif key == "custom_words":
                 value = str(value)[:4000]
+            elif key == "background":
+                value = value in (True, "true", "True", "on", 1, "1")
             self.settings[key] = value
         self.broadcast_room()
 

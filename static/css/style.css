@@ -243,3 +243,7 @@ button, input, select, textarea {
 .album-step .author { font-size: 13px; color: var(--card-2); margin-bottom: 6px; font-weight: 700; }
 .album-step .said { font-size: 20px; font-weight: 700; }
 .album-step canvas { width: 100%; display: block; border-radius: 12px; background: #fff; }
+
+.checkline { display: flex; align-items: center; gap: 8px; background: var(--panel-2);
+  border-radius: var(--radius); padding: 12px 14px; font-size: 14px; }
+.checkline input { width: 18px; height: 18px; accent-color: var(--accent); }

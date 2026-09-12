@@ -16,8 +16,9 @@ const PALETTE = [
   "#3a2d1f", "#0b6e4f", "#123a8f", "#5c2d91",
 ];
 const SIZES = [4, 9, 18, 32];
-const PLANNED = ["Анимация", "Дополнение", "Изысканный труп", "Сотрудничество"];
-const SETTING_KEYS = ["rounds", "steps", "draw_time", "write_time", "hints", "difficulty", "custom_words"];
+const PLANNED = [];  // всё задуманное сделано; сюда попадут будущие режимы
+const SETTING_KEYS = ["rounds", "steps", "draw_time", "write_time", "fps", "background",
+                      "hints", "difficulty", "custom_words"];
 
 let room = null;
 let game = null;
@@ -57,7 +58,10 @@ function handle(message) {
     case "game":
       game = message;
       if (typeof message.remaining === "number") deadlineAt = Date.now() + message.remaining;
-      if (message.canvas) board.setOps(message.canvas);
+      board.under = message.under || [];
+      board.band = (message.band && message.band.count) ? message.band : null;
+      if (message.canvas) board.setOps(message.canvas, message.locked || 0);
+      else if (message.family === "album") board.redraw();
       renderGame();
       break;
     case "draw":
@@ -177,12 +181,17 @@ function renderLobby() {
   for (const key of SETTING_KEYS) {
     const input = $("s-" + key);
     if (!input) continue;
-    if (document.activeElement !== input) input.value = room.settings[key];
+    if (document.activeElement !== input) {
+      if (input.type === "checkbox") input.checked = !!room.settings[key];
+      else input.value = room.settings[key];
+    }
     input.disabled = !isHost();
   }
   const isAlbum = room.settings.mode !== "guess";
+  const isAnimation = room.settings.mode === "animation";
   document.querySelectorAll(".only-guess").forEach((el) => el.classList.toggle("hidden", isAlbum));
   document.querySelectorAll(".only-album").forEach((el) => el.classList.toggle("hidden", !isAlbum));
+  document.querySelectorAll(".only-animation").forEach((el) => el.classList.toggle("hidden", !isAnimation));
 
   const enoughPlayers = room.players.length >= 2;
   $("start").disabled = !isHost() || !enoughPlayers;
@@ -200,6 +209,7 @@ function renderGame() {
 }
 
 function renderGuess() {
+  stopLoops();
   const artistNow = game.youAreArtist && game.phase === "drawing";
   $("album-bar").classList.add("hidden");
   $("source-box").classList.add("hidden");
@@ -232,6 +242,30 @@ function renderGuess() {
   renderOverlay();
 }
 
+const loops = [];
+
+function stopLoops() {
+  while (loops.length) clearInterval(loops.pop());
+}
+
+function playAnimation(target, anim) {
+  const frames = (anim.frames || []).filter((frame) => frame && frame.length);
+  const background = anim.background || [];
+  if (!frames.length) {
+    target.under = [];
+    target.setOps(background);
+    return;
+  }
+  let index = 0;
+  const tick = () => {
+    target.under = [];
+    target.setOps(background.concat(frames[index % frames.length]));
+    index += 1;
+  };
+  tick();
+  loops.push(setInterval(tick, Math.max(80, 1000 / (anim.fps || 4))));
+}
+
 function renderAlbum() {
   const g = game;
   $("overlay").classList.add("hidden");
@@ -253,21 +287,25 @@ function renderAlbum() {
 }
 
 function renderAlbumTask(g) {
+  stopLoops();
   const isText = g.task === "text";
   const source = g.source;
+  const mode = g.sourceMode || "none";
 
   $("round").textContent = `Ход ${g.round}/${g.rounds}`;
   $("word").textContent = g.hint || "";
   $("word").style.letterSpacing = "0";
   $("word").style.fontSize = "20px";
 
-  const sourceIsText = !!source && source.type === "text";
+  const sourceIsText = mode === "text" && !!source;
   $("source-text").classList.toggle("hidden", !sourceIsText);
   if (sourceIsText) $("source-text").textContent = source.text;
 
-  const sourceIsDraw = !!source && source.type === "draw";
-  $("source-box").classList.toggle("hidden", !sourceIsDraw);
-  if (sourceIsDraw) sourceBoard.setOps(source.ops || []);
+  // «рядом» — только для копирования и для подписи к чужому рисунку;
+  // кальку и дорисовку игрок видит прямо в своём холсте
+  const sideBySide = mode === "copy" && !!source;
+  $("source-box").classList.toggle("hidden", !sideBySide);
+  if (sideBySide) sourceBoard.setOps(source.ops || []);
 
   $("canvas-box").classList.toggle("hidden", isText);
   $("canvas-box").classList.toggle("watching", g.done);
@@ -286,6 +324,7 @@ function renderAlbumTask(g) {
 }
 
 function renderAlbumShow(g) {
+  stopLoops();
   const step = g.step;
   $("round").textContent = `Альбом ${g.albumIndex + 1}/${g.albumsTotal} · шаг ${g.stepIndex + 1}/${g.stepsTotal}`;
   $("word").textContent = `Начал ${g.ownerNick}`;
@@ -298,6 +337,14 @@ function renderAlbumShow(g) {
   $("submit").classList.add("hidden");
   board.enabled = false;
 
+  if (g.animation) {
+    $("source-text").classList.add("hidden");
+    $("canvas-box").classList.remove("hidden");
+    $("canvas-box").classList.add("watching");
+    playAnimation(board, g.animation);
+    $("album-note").textContent = "анимация целиком";
+    return;
+  }
   if (!step) return;
   const isText = step.type === "text";
   $("source-text").classList.toggle("hidden", !isText);
@@ -355,6 +402,7 @@ function renderOverlay() {
 let gallery = { albums: [], index: 0 };
 
 function renderResults(message) {
+  stopLoops();
   if (message.albums && message.albums.length) {
     gallery = { albums: message.albums, index: 0 };
     renderGallery();
@@ -386,6 +434,7 @@ function renderResults(message) {
 }
 
 function renderGallery() {
+  stopLoops();
   const box = $("results");
   box.textContent = "";
   const album = gallery.albums[gallery.index];
@@ -410,6 +459,35 @@ function renderGallery() {
 
   const steps = document.createElement("div");
   steps.className = "album-steps";
+
+  if (album.kind === "corpse") {
+    const card = document.createElement("div");
+    card.className = "album-step";
+    const author = document.createElement("div");
+    author.className = "author";
+    author.textContent = "рисовали: " + album.steps.map((step) => step.authorNick).join(", ");
+    const canvas = document.createElement("canvas");
+    card.append(author, canvas);
+    steps.append(card);
+    box.append(head, steps);
+    new Board(canvas).setOps(album.full || []);
+    return;
+  }
+
+  if (album.kind === "animation") {
+    const card = document.createElement("div");
+    card.className = "album-step";
+    const author = document.createElement("div");
+    author.className = "author";
+    author.textContent = "кадров: " + (album.frames || []).length;
+    const canvas = document.createElement("canvas");
+    card.append(author, canvas);
+    steps.append(card);
+    box.append(head, steps);
+    playAnimation(new Board(canvas), album);
+    return;
+  }
+
   for (const step of album.steps) {
     const card = document.createElement("div");
     card.className = "album-step";
@@ -512,7 +590,8 @@ for (const key of SETTING_KEYS) {
   const input = $("s-" + key);
   if (!input) continue;
   input.addEventListener("change", () => {
-    net.send({ t: "settings", patch: { [key]: input.value } });
+    const value = input.type === "checkbox" ? input.checked : input.value;
+    net.send({ t: "settings", patch: { [key]: value } });
   });
 }
 

@@ -184,6 +184,17 @@ class GuessMode(Mode):
             self.room.broadcast({"t": "canvas", "ops": []}, exclude={player.token})
 
     @staticmethod
+    def band_of(op):
+        """Полоса, в которую заперта операция (режим «Изысканный труп»)."""
+        band = op.get("b")
+        if isinstance(band, list) and len(band) == 2:
+            try:
+                return [round(float(band[0]), 1), round(float(band[1]), 1)]
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
     def sanitize(ops):
         """Пропускаем только то, что умеем рисовать, и режем великанов."""
         result = []
@@ -207,13 +218,20 @@ class GuessMode(Mode):
                 clean = {"t": "p", "c": color, "w": width, "pts": points}
                 if isinstance(op.get("s"), int):
                     clean["s"] = op["s"]
+                band = GuessMode.band_of(op)
+                if band:
+                    clean["b"] = band
                 result.append(clean)
             elif kind == "f":
                 try:
-                    result.append({"t": "f", "c": color,
-                                   "x": round(float(op["x"]), 1), "y": round(float(op["y"]), 1)})
+                    clean = {"t": "f", "c": color,
+                             "x": round(float(op["x"]), 1), "y": round(float(op["y"]), 1)}
                 except (KeyError, TypeError, ValueError):
                     continue
+                band = GuessMode.band_of(op)
+                if band:
+                    clean["b"] = band
+                result.append(clean)
         return result
 
     def handle_chat(self, player, text):
