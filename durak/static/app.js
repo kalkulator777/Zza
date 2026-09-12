@@ -17,10 +17,17 @@ const SLOT = new URLSearchParams(location.search).get('p');
 const TOKEN_KEY = 'durak_token' + (SLOT ? '_' + SLOT : '');
 const NAME_KEY = 'durak_name' + (SLOT ? '_' + SLOT : '');
 
+const PARAMS = new URLSearchParams(location.search);
+const PENDING_ROOM = (PARAMS.get('room') || '').trim().toUpperCase();
+// имя приходит в ссылке при переходе на другой компьютер: там свой localStorage
+const URL_NAME = (PARAMS.get('name') || '').trim().slice(0, 20);
+let pendingRoom = PENDING_ROOM;
+
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || null,
-  name: localStorage.getItem(NAME_KEY) || '',
+  name: URL_NAME || localStorage.getItem(NAME_KEY) || '',
   rooms: [],
+  peers: [],
   room: null,
   selected: null,       // выбранная в руке карта
   resultHidden: false,
@@ -76,9 +83,18 @@ function handle(msg) {
       localStorage.setItem(NAME_KEY, msg.name);
       $('me-box').classList.remove('hidden');
       $('me-name').textContent = msg.name;
+      if (pendingRoom) {
+        send({ t: 'join', room: pendingRoom });
+        pendingRoom = null;
+      }
+      if (PARAMS.has('room') || PARAMS.has('name')) {
+        history.replaceState(null, '', location.pathname +
+          (SLOT ? '?p=' + encodeURIComponent(SLOT) : ''));
+      }
       break;
     case 'rooms':
       state.rooms = msg.rooms;
+      state.peers = msg.peers || [];
       state.room = null;
       renderRooms();
       showScreen('screen-lobby');
@@ -127,44 +143,99 @@ function rulesText(s) {
   ].join(' · ');
 }
 
+function peerUrl(peer, code) {
+  const q = [];
+  if (code) q.push('room=' + encodeURIComponent(code));
+  if (state.name) q.push('name=' + encodeURIComponent(state.name));
+  return 'http://' + peer.ip + ':' + peer.port + '/' +
+    (q.length ? '?' + q.join('&') : '');
+}
+
+function roomRow(r, peer) {
+  const row = document.createElement('div');
+  row.className = 'room-row' + (peer ? ' remote' : '');
+
+  const code = document.createElement('span');
+  code.className = 'code';
+  code.textContent = r.id;
+
+  const mid = document.createElement('div');
+  mid.className = 'mid';
+  const title = document.createElement('div');
+  title.textContent = r.title;
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  meta.textContent = r.players + '/' + r.max +
+    (r.settings ? ' · ' + rulesText(r.settings) : '') +
+    (r.in_game ? ' · идёт партия' : '');
+  const where = document.createElement('div');
+  where.className = 'where';
+  where.textContent = peer ? 'на компьютере ' + peer.host + ' (' + peer.ip + ')'
+    : 'на этом компьютере';
+  mid.appendChild(title);
+  mid.appendChild(meta);
+  mid.appendChild(where);
+
+  const btn = document.createElement('button');
+  btn.textContent = r.in_game ? 'Идёт партия' : 'Войти';
+  btn.disabled = !!r.in_game || r.players >= r.max;
+  btn.onclick = peer ? () => { location.href = peerUrl(peer, r.id); }
+    : () => send({ t: 'join', room: r.id });
+
+  row.appendChild(code);
+  row.appendChild(mid);
+  row.appendChild(btn);
+  return row;
+}
+
 function renderRooms() {
   const box = $('rooms-list');
   box.textContent = '';
-  if (!state.rooms.length) {
+  let shown = 0;
+
+  for (const r of state.rooms) {
+    box.appendChild(roomRow(r, null));
+    shown++;
+  }
+  for (const peer of state.peers) {
+    for (const r of (peer.rooms || [])) {
+      box.appendChild(roomRow(r, peer));
+      shown++;
+    }
+    if (!(peer.rooms || []).length) {
+      const row = document.createElement('div');
+      row.className = 'room-row remote';
+      const mid = document.createElement('div');
+      mid.className = 'mid';
+      const title = document.createElement('div');
+      title.textContent = 'Компьютер ' + peer.host;
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = 'игра запущена, комнат пока нет · ' + peer.ip;
+      mid.appendChild(title);
+      mid.appendChild(meta);
+      const btn = document.createElement('button');
+      btn.textContent = 'Открыть';
+      btn.onclick = () => { location.href = peerUrl(peer, null); };
+      row.appendChild(mid);
+      row.appendChild(btn);
+      box.appendChild(row);
+      shown++;
+    }
+  }
+
+  if (!shown) {
     const p = document.createElement('div');
     p.className = 'empty';
-    p.textContent = 'Пока пусто — создайте комнату справа.';
+    p.textContent = 'Открытых комнат не видно — создайте свою справа.';
     box.appendChild(p);
-    return;
   }
-  for (const r of state.rooms) {
-    const row = document.createElement('div');
-    row.className = 'room-row';
 
-    const code = document.createElement('span');
-    code.className = 'code';
-    code.textContent = r.id;
-
-    const mid = document.createElement('div');
-    const title = document.createElement('div');
-    title.textContent = r.title;
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    meta.textContent = r.players + '/' + r.max + ' · ' + rulesText(r.settings) +
-      (r.in_game ? ' · идёт партия' : '');
-    mid.appendChild(title);
-    mid.appendChild(meta);
-
-    const btn = document.createElement('button');
-    btn.textContent = r.in_game ? 'Идёт партия' : 'Войти';
-    btn.disabled = r.in_game || r.players >= r.max;
-    btn.onclick = () => send({ t: 'join', room: r.id });
-
-    row.appendChild(code);
-    row.appendChild(mid);
-    row.appendChild(btn);
-    box.appendChild(row);
-  }
+  const hint = $('lan-hint');
+  const n = state.peers.length;
+  hint.textContent = n
+    ? 'В сети найдено компьютеров с игрой: ' + n + '. Комнаты соседей открываются в этом же окне.'
+    : 'Другие компьютеры с игрой пока не видны. Если у соседа игра уже запущена, введите его адрес вручную.';
 }
 
 function readSettings(prefix) {
@@ -597,6 +668,18 @@ function init() {
   };
   $('btn-join-code').onclick = joinByCode;
   onEnter('join-code', joinByCode);
+
+  const goToAddress = () => {
+    let addr = $('lan-addr').value.trim();
+    if (!addr) return;
+    if (!/^https?:\/\//.test(addr)) addr = 'http://' + addr;
+    if (!/:\d+/.test(addr.replace(/^https?:\/\//, ''))) {
+      addr = addr.replace(/\/+$/, '') + ':' + (location.port || '8888');
+    }
+    location.href = addr;
+  };
+  $('btn-lan-go').onclick = goToAddress;
+  onEnter('lan-addr', goToAddress);
 
   $('btn-start').onclick = () => send({ t: 'start' });
   $('btn-leave').onclick = () => send({ t: 'leave' });

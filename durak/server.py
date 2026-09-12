@@ -96,6 +96,17 @@ class Hub:
     def __init__(self):
         self.players = {}   # pid -> Player
         self.rooms = {}     # rid -> Room
+        self.peers_provider = None  # ставит durak.py: поиск игр в локальной сети
+
+    def peers(self) -> list:
+        """Другие компьютеры сети, где запущен «Дурак»."""
+        if self.peers_provider is None:
+            return []
+        try:
+            return self.peers_provider()
+        except Exception:  # pragma: no cover
+            log.exception("Не смог получить список соседей")
+            return []
 
     # -- игроки ---------------------------------------------------------
 
@@ -185,7 +196,7 @@ class Hub:
                 "settings": room.settings.to_dict(),
                 "in_game": room.in_game,
             })
-        return {"t": "rooms", "rooms": items}
+        return {"t": "rooms", "rooms": items, "peers": self.peers()}
 
     def room_payload(self, room: Room, pid: str) -> dict:
         online = {}

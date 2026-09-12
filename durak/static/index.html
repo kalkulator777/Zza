@@ -34,11 +34,16 @@
 <section id="screen-lobby" class="screen">
   <div class="lobby-grid">
     <div class="panel">
-      <h2>Комнаты</h2>
+      <h2>Открытые комнаты в сети</h2>
       <div id="rooms-list" class="rooms"></div>
+      <p id="lan-hint" class="hint"></p>
       <div class="row">
         <input id="join-code" maxlength="4" placeholder="Код комнаты" class="code-input" autocomplete="off">
         <button id="btn-join-code">Войти по коду</button>
+      </div>
+      <div class="row">
+        <input id="lan-addr" placeholder="Адрес компьютера, например 192.168.1.42" autocomplete="off">
+        <button id="btn-lan-go">Перейти</button>
       </div>
     </div>
 

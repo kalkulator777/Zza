@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Дурак
+Comment=Карточная игра «Дурак» по локальной сети
+# Замените /opt/durak на путь, куда положили папку с игрой
+Exec=python3 /opt/durak/durak.py
+Path=/opt/durak
+Icon=applications-games
+Terminal=true
+Categories=Game;CardGame;
