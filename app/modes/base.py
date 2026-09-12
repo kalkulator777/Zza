@@ -66,5 +66,9 @@ class Mode:
     def on_disconnect(self, player):
         pass
 
+    def results_payload(self):
+        """Что добавить в итоговое сообщение сверх таблицы очков."""
+        return {}
+
     def state_for(self, player, with_canvas=False):
         return {"t": "game", "mode": self.key}

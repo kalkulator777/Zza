@@ -29,20 +29,25 @@
         <div class="grid" id="mode-cards"></div>
         <h2 style="margin-top:8px">Настройки</h2>
         <div class="grid">
-          <label><div class="label">Кругов</div>
+          <label class="only-guess"><div class="label">Кругов</div>
             <input id="s-rounds" class="field" type="number" min="1" max="10"></label>
+          <label class="only-album"><div class="label">Ходов в альбоме</div>
+            <input id="s-steps" class="field" type="number" min="0" max="12"
+                   title="0 — по числу игроков"></label>
           <label><div class="label">Секунд на рисунок</div>
-            <input id="s-draw_time" class="field" type="number" min="30" max="180" step="5"></label>
-          <label><div class="label">Подсказок (букв)</div>
+            <input id="s-draw_time" class="field" type="number" min="20" max="180" step="5"></label>
+          <label class="only-album"><div class="label">Секунд на подпись</div>
+            <input id="s-write_time" class="field" type="number" min="15" max="120" step="5"></label>
+          <label class="only-guess"><div class="label">Подсказок (букв)</div>
             <input id="s-hints" class="field" type="number" min="0" max="3"></label>
-          <label><div class="label">Сложность слов</div>
+          <label class="only-guess"><div class="label">Сложность слов</div>
             <select id="s-difficulty" class="field">
               <option value="easy">Простые</option>
               <option value="mixed">Вперемешку</option>
               <option value="hard">Посложнее</option>
             </select></label>
         </div>
-        <label><div class="label">Свои слова — через запятую (тогда банк не используется)</div>
+        <label class="only-guess"><div class="label">Свои слова — через запятую (тогда банк не используется)</div>
           <textarea id="s-custom_words" class="field" rows="2" placeholder="необязательно"></textarea></label>
         <div class="row">
           <div id="invite" class="round-label"></div>
@@ -65,9 +70,17 @@
           <div class="word" id="word"></div>
           <div class="round-label" id="round"></div>
         </div>
-        <div class="canvas-box watching" id="canvas-box">
-          <canvas id="board"></canvas>
-          <div class="overlay hidden" id="overlay"></div>
+        <div id="source-text" class="source-text hidden"></div>
+
+        <div class="work">
+          <div class="canvas-box watching hidden" id="source-box">
+            <div class="canvas-tag">Было</div>
+            <canvas id="source"></canvas>
+          </div>
+          <div class="canvas-box watching" id="canvas-box">
+            <canvas id="board"></canvas>
+            <div class="overlay hidden" id="overlay"></div>
+          </div>
         </div>
         <div class="tools hidden" id="tools">
           <button class="btn small tool active" data-tool="pen">Карандаш</button>
@@ -79,6 +92,14 @@
             <button class="btn small" id="undo">Отменить</button>
             <button class="btn small" id="clear">Очистить</button>
           </div>
+        </div>
+
+        <div class="album-bar hidden" id="album-bar">
+          <input id="album-text" class="field hidden" maxlength="140" placeholder="Пиши фразу…" autocomplete="off">
+          <div id="album-note" class="round-label"></div>
+          <div class="spacer"></div>
+          <button id="submit" class="btn primary hidden">Готово</button>
+          <button id="next" class="btn ghost hidden">Дальше</button>
         </div>
       </div>
 

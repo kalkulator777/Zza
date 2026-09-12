@@ -16,7 +16,8 @@ const PALETTE = [
   "#3a2d1f", "#0b6e4f", "#123a8f", "#5c2d91",
 ];
 const SIZES = [4, 9, 18, 32];
-const PLANNED = ["Обычно", "Сэндвич", "Плагиат", "Анимация", "Дополнение"];
+const PLANNED = ["Анимация", "Дополнение", "Изысканный труп", "Сотрудничество"];
+const SETTING_KEYS = ["rounds", "steps", "draw_time", "write_time", "hints", "difficulty", "custom_words"];
 
 let room = null;
 let game = null;
@@ -28,6 +29,8 @@ $("code").textContent = code;
 const board = new Board($("board"), {
   onOps: (ops) => net.send({ t: "draw", ops }),
 });
+// второй холст — только показать чужой рисунок: источник хода или кадр показа
+const sourceBoard = new Board($("source"));
 
 const net = connect({
   code,
@@ -70,7 +73,7 @@ function handle(message) {
       pushChat(message);
       break;
     case "results":
-      renderResults(message.table || []);
+      renderResults(message);
       break;
     case "toast":
       toast(message.text);
@@ -147,13 +150,13 @@ function renderLobby() {
 
   const cards = $("mode-cards");
   cards.textContent = "";
-  for (const [key, title] of Object.entries(room.modes)) {
+  for (const [key, info] of Object.entries(room.modes)) {
     const card = document.createElement("div");
     card.className = "mode-card" + (room.settings.mode === key ? " active" : "");
     const head = document.createElement("h3");
-    head.textContent = title;
+    head.textContent = info.title;
     const text = document.createElement("p");
-    text.textContent = "Один рисует, остальные угадывают";
+    text.textContent = info.about;
     card.append(head, text);
     card.addEventListener("click", () => {
       if (isHost()) net.send({ t: "settings", patch: { mode: key } });
@@ -171,12 +174,15 @@ function renderLobby() {
     cards.append(card);
   }
 
-  for (const key of ["rounds", "draw_time", "hints", "difficulty", "custom_words"]) {
+  for (const key of SETTING_KEYS) {
     const input = $("s-" + key);
     if (!input) continue;
     if (document.activeElement !== input) input.value = room.settings[key];
     input.disabled = !isHost();
   }
+  const isAlbum = room.settings.mode !== "guess";
+  document.querySelectorAll(".only-guess").forEach((el) => el.classList.toggle("hidden", isAlbum));
+  document.querySelectorAll(".only-album").forEach((el) => el.classList.toggle("hidden", !isAlbum));
 
   const enoughPlayers = room.players.length >= 2;
   $("start").disabled = !isHost() || !enoughPlayers;
@@ -189,7 +195,19 @@ function renderLobby() {
 
 function renderGame() {
   if (!game) return;
+  if (game.family === "album") renderAlbum();
+  else renderGuess();
+}
+
+function renderGuess() {
   const artistNow = game.youAreArtist && game.phase === "drawing";
+  $("album-bar").classList.add("hidden");
+  $("source-box").classList.add("hidden");
+  $("source-text").classList.add("hidden");
+  $("canvas-box").classList.remove("hidden");
+  $("chat-input").disabled = false;
+  $("word").style.letterSpacing = "";
+  $("word").style.fontSize = "";
 
   const box = $("game-players");
   box.textContent = "";
@@ -212,6 +230,82 @@ function renderGame() {
   input.placeholder = game.youAreArtist ? "Не подсказывай словами!" : "Пиши догадку…";
 
   renderOverlay();
+}
+
+function renderAlbum() {
+  const g = game;
+  $("overlay").classList.add("hidden");
+  $("album-bar").classList.remove("hidden");
+  const chatInput = $("chat-input");
+  chatInput.disabled = g.phase === "task";
+  chatInput.placeholder = chatInput.disabled ? "Чат откроется на показе" : "Пиши сюда";
+  $("next").classList.toggle("hidden", !(g.phase === "present" && g.isHost));
+
+  const box = $("game-players");
+  box.textContent = "";
+  const submitted = g.submitted || [];
+  for (const player of (room ? room.players : [])) {
+    box.append(playerCard(player, { guessed: submitted.includes(player.token) }));
+  }
+
+  if (g.phase === "task") renderAlbumTask(g);
+  else renderAlbumShow(g);
+}
+
+function renderAlbumTask(g) {
+  const isText = g.task === "text";
+  const source = g.source;
+
+  $("round").textContent = `Ход ${g.round}/${g.rounds}`;
+  $("word").textContent = g.hint || "";
+  $("word").style.letterSpacing = "0";
+  $("word").style.fontSize = "20px";
+
+  const sourceIsText = !!source && source.type === "text";
+  $("source-text").classList.toggle("hidden", !sourceIsText);
+  if (sourceIsText) $("source-text").textContent = source.text;
+
+  const sourceIsDraw = !!source && source.type === "draw";
+  $("source-box").classList.toggle("hidden", !sourceIsDraw);
+  if (sourceIsDraw) sourceBoard.setOps(source.ops || []);
+
+  $("canvas-box").classList.toggle("hidden", isText);
+  $("canvas-box").classList.toggle("watching", g.done);
+  $("tools").classList.toggle("hidden", isText || g.done || !g.playing);
+  board.enabled = !isText && !g.done && g.playing;
+
+  const textField = $("album-text");
+  textField.classList.toggle("hidden", !isText || !g.playing);
+  textField.disabled = g.done;
+  if (!isText) textField.value = "";
+
+  $("submit").classList.toggle("hidden", g.done || !g.playing);
+  $("album-note").textContent = g.done
+    ? "Ждём: " + (g.waiting || []).join(", ")
+    : (g.playing ? "" : "Ты смотришь со стороны");
+}
+
+function renderAlbumShow(g) {
+  const step = g.step;
+  $("round").textContent = `Альбом ${g.albumIndex + 1}/${g.albumsTotal} · шаг ${g.stepIndex + 1}/${g.stepsTotal}`;
+  $("word").textContent = `Начал ${g.ownerNick}`;
+  $("word").style.letterSpacing = "0";
+  $("word").style.fontSize = "20px";
+
+  $("tools").classList.add("hidden");
+  $("source-box").classList.add("hidden");
+  $("album-text").classList.add("hidden");
+  $("submit").classList.add("hidden");
+  board.enabled = false;
+
+  if (!step) return;
+  const isText = step.type === "text";
+  $("source-text").classList.toggle("hidden", !isText);
+  if (isText) $("source-text").textContent = step.text;
+  $("canvas-box").classList.toggle("hidden", isText);
+  $("canvas-box").classList.add("watching");
+  if (!isText) board.setOps(step.ops || []);
+  $("album-note").textContent = (isText ? "написал " : "нарисовал ") + (step.authorNick || "");
 }
 
 function renderOverlay() {
@@ -258,10 +352,18 @@ function renderOverlay() {
   }
 }
 
-function renderResults(table) {
+let gallery = { albums: [], index: 0 };
+
+function renderResults(message) {
+  if (message.albums && message.albums.length) {
+    gallery = { albums: message.albums, index: 0 };
+    renderGallery();
+    $("again").disabled = !isHost();
+    return;
+  }
   const box = $("results");
   box.textContent = "";
-  table.forEach((player, index) => {
+  (message.table || []).forEach((player, index) => {
     const row = document.createElement("div");
     row.className = "results-row" + (index === 0 ? " first" : "");
     const place = document.createElement("div");
@@ -281,6 +383,53 @@ function renderResults(table) {
     box.append(row);
   });
   $("again").disabled = !isHost();
+}
+
+function renderGallery() {
+  const box = $("results");
+  box.textContent = "";
+  const album = gallery.albums[gallery.index];
+  if (!album) return;
+
+  const head = document.createElement("div");
+  head.className = "gallery-head";
+  const prev = document.createElement("button");
+  prev.className = "btn small";
+  prev.textContent = "◀";
+  prev.disabled = gallery.index === 0;
+  prev.addEventListener("click", () => { gallery.index -= 1; renderGallery(); });
+  const title = document.createElement("div");
+  title.innerHTML = "";
+  title.textContent = `Альбом ${album.ownerNick} · ${gallery.index + 1}/${gallery.albums.length}`;
+  const next = document.createElement("button");
+  next.className = "btn small";
+  next.textContent = "▶";
+  next.disabled = gallery.index >= gallery.albums.length - 1;
+  next.addEventListener("click", () => { gallery.index += 1; renderGallery(); });
+  head.append(prev, title, next);
+
+  const steps = document.createElement("div");
+  steps.className = "album-steps";
+  for (const step of album.steps) {
+    const card = document.createElement("div");
+    card.className = "album-step";
+    const author = document.createElement("div");
+    author.className = "author";
+    author.textContent = (step.type === "text" ? "написал " : "нарисовал ") + (step.authorNick || "");
+    card.append(author);
+    if (step.type === "text") {
+      const said = document.createElement("div");
+      said.className = "said";
+      said.textContent = step.text;
+      card.append(said);
+    } else {
+      const canvas = document.createElement("canvas");
+      card.append(canvas);
+      new Board(canvas).setOps(step.ops || []);
+    }
+    steps.append(card);
+  }
+  box.append(head, steps);
 }
 
 // ---------- чат ----------
@@ -359,13 +508,21 @@ $("clear").addEventListener("click", () => {
 
 // ---------- прочее ----------
 
-for (const key of ["rounds", "draw_time", "hints", "difficulty", "custom_words"]) {
+for (const key of SETTING_KEYS) {
   const input = $("s-" + key);
   if (!input) continue;
   input.addEventListener("change", () => {
     net.send({ t: "settings", patch: { [key]: input.value } });
   });
 }
+
+$("submit").addEventListener("click", () => {
+  net.send({ t: "submit", text: $("album-text").value.trim() });
+});
+$("album-text").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") $("submit").click();
+});
+$("next").addEventListener("click", () => net.send({ t: "next" }));
 
 $("start").addEventListener("click", () => net.send({ t: "start" }));
 $("again").addEventListener("click", () => net.send({ t: "again" }));

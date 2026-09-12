@@ -11,7 +11,7 @@ export class Board {
     canvas.width = W;
     canvas.height = H;
     this.ctx = canvas.getContext("2d", { willReadFrequently: true });
-    this.onOps = onOps || (() => {});
+    this.onOps = onOps || null;
     this.ops = [];
     this.pending = [];
     this.tool = "pen";
@@ -27,7 +27,8 @@ export class Board {
     canvas.addEventListener("pointermove", (e) => this.onMove(e));
     window.addEventListener("pointerup", () => this.onUp());
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-    setInterval(() => this.flush(), FLUSH_MS);
+    // холст только для показа чужого рисунка ничего не отправляет
+    if (this.onOps) setInterval(() => this.flush(), FLUSH_MS);
   }
 
   // --- состояние ------------------------------------------------------
@@ -147,7 +148,7 @@ export class Board {
   }
 
   drain() {
-    if (!this.pending.length) return;
+    if (!this.onOps || !this.pending.length) return;
     const ops = this.pending;
     this.pending = [];
     this.onOps(ops);

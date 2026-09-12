@@ -149,8 +149,15 @@ button, input, select, textarea {
 .word { flex: 1; text-align: center; font-size: 26px; font-weight: 800; letter-spacing: 6px; font-family: monospace; }
 .round-label { color: var(--card-2); font-size: 14px; font-weight: 700; }
 
-.canvas-box { position: relative; background: #fff; border-radius: 18px; overflow: hidden; box-shadow: var(--shadow); }
-#board { display: block; width: 100%; height: auto; touch-action: none; cursor: crosshair; }
+.canvas-box {
+  position: relative; background: #fff; border-radius: 18px; overflow: hidden;
+  box-shadow: var(--shadow);
+  /* холст 4:3 растянут по ширине, но не настолько, чтобы выпихнуть кнопки за экран */
+  max-width: calc((100vh - 290px) * 4 / 3);
+  margin-inline: auto;
+}
+#board, #source { display: block; width: 100%; height: auto; touch-action: none; }
+#board { cursor: crosshair; }
 .canvas-box.watching #board { cursor: default; }
 
 .overlay {
@@ -211,3 +218,28 @@ button, input, select, textarea {
   background: var(--card); color: var(--ink); font-weight: 700;
   padding: 12px 20px; border-radius: 14px; box-shadow: var(--shadow); z-index: 50;
 }
+
+/* --- альбомные режимы --- */
+.work { display: flex; gap: 10px; align-items: flex-start; }
+.work > .canvas-box { flex: 1; min-width: 0; }
+.source-text {
+  background: var(--card); color: var(--ink);
+  border-radius: 16px; padding: 14px 18px; margin-bottom: 10px;
+  font-size: 22px; font-weight: 700; text-align: center; word-break: break-word;
+}
+.canvas-tag {
+  position: absolute; top: 8px; left: 8px; z-index: 2;
+  background: var(--panel); color: var(--card);
+  font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 8px;
+}
+.album-bar { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.album-bar .field { flex: 1; }
+.album-bar #album-note { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* --- галерея альбомов в итогах --- */
+.gallery-head { display: flex; align-items: center; gap: 12px; justify-content: center; margin-bottom: 14px; }
+.album-steps { display: flex; flex-direction: column; gap: 12px; max-width: 720px; margin: 0 auto; }
+.album-step { background: var(--panel-2); border-radius: 16px; padding: 12px; }
+.album-step .author { font-size: 13px; color: var(--card-2); margin-bottom: 6px; font-weight: 700; }
+.album-step .said { font-size: 20px; font-weight: 700; }
+.album-step canvas { width: 100%; display: block; border-radius: 12px; background: #fff; }

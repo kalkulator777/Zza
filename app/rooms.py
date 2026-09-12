@@ -24,21 +24,30 @@ PLAYER_COLORS = [
     "#5cd6ff", "#ff6bcb",
 ]
 
-MODE_TITLES = {"guess": "Угадайка"}
+MODE_INFO = {
+    "guess": ("Угадайка", "Один рисует, остальные угадывают слово"),
+    "normal": ("Обычно", "Фраза, рисунок, подпись, рисунок — испорченный телефон"),
+    "sandwich": ("Сэндвич", "Фраза, потом только рисунки, в конце подпись"),
+    "plagiat": ("Плагиат", "Копируй предыдущий рисунок, времени всё меньше"),
+}
 
 DEFAULT_SETTINGS = {
     "mode": "guess",
     "rounds": 3,
     "draw_time": 80,
+    "write_time": 45,
+    "steps": 0,            # 0 — по числу игроков
     "hints": 2,
     "difficulty": "mixed",
     "custom_words": "",
 }
 
 SETTINGS_LIMITS = {
-    "mode": set(MODE_TITLES),
+    "mode": set(MODE_INFO),
     "rounds": (1, 10),
-    "draw_time": (30, 180),
+    "draw_time": (20, 180),
+    "write_time": (15, 120),
+    "steps": (0, 12),
     "hints": (0, 3),
     "difficulty": {"easy", "mixed", "hard"},
 }
@@ -186,7 +195,8 @@ class Room:
             "settings": self.settings,
             "players": [self.players[t].public() for t in self.order if t in self.players],
             "invite": self.manager.invite_url(self.code),
-            "modes": MODE_TITLES,
+            "modes": {key: {"title": title, "about": about}
+                      for key, (title, about) in MODE_INFO.items()},
         }
 
     def broadcast_room(self):
@@ -247,8 +257,11 @@ class Room:
             (self.players[t].public() for t in self.order if t in self.players),
             key=lambda p: -p["score"],
         )
+        payload = {"t": "results", "table": table}
+        if self.mode is not None:
+            payload.update(self.mode.results_payload())
         self.broadcast_room()
-        self.broadcast({"t": "results", "table": table})
+        self.broadcast(payload)
 
     def back_to_lobby(self):
         if self.mode is not None:
@@ -353,7 +366,7 @@ class RoomManager:
                 "owner": host.nick if host else "",
                 "players": len(players),
                 "max": MAX_PLAYERS,
-                "mode": MODE_TITLES.get(room.settings.get("mode"), ""),
+                "mode": MODE_INFO.get(room.settings.get("mode"), ("", ""))[0],
             })
         return result
 
