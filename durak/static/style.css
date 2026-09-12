@@ -1,0 +1,244 @@
+/* Дурак — оформление. Всё локально: ни шрифтов, ни картинок извне. */
+
+:root {
+  --felt: #14532d;
+  --felt-dark: #0d3b20;
+  --panel: #1b2430;
+  --panel-2: #232e3c;
+  --line: #36465a;
+  --text: #e8edf3;
+  --muted: #93a4b8;
+  --accent: #f5c542;
+  --danger: #e0544e;
+  --ok: #4caf7d;
+  --card-w: 62px;
+  --card-h: 88px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at 50% 0%, var(--felt) 0%, var(--felt-dark) 70%) fixed;
+  color: var(--text);
+  font: 15px/1.4 "DejaVu Sans", "Liberation Sans", Arial, sans-serif;
+}
+
+/* ---------- каркас ---------- */
+
+#topbar {
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 16px;
+  background: rgba(0, 0, 0, .35);
+  border-bottom: 1px solid rgba(255, 255, 255, .08);
+}
+.brand { font-size: 18px; font-weight: bold; letter-spacing: .5px; }
+#me-box { color: var(--muted); }
+#me-name { color: var(--text); font-weight: bold; }
+.conn { margin-left: auto; font-size: 13px; color: var(--accent); }
+.conn.ok { color: var(--ok); }
+.conn.bad { color: var(--danger); }
+
+main { padding: 16px; }
+.screen { display: none; }
+.screen.active { display: block; }
+.hidden { display: none !important; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.panel.narrow { max-width: 360px; margin: 8vh auto; }
+.lobby-grid {
+  display: grid; gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+}
+h1 { font-size: 22px; margin: 0 0 14px; }
+h2 { font-size: 17px; margin: 0 0 12px; }
+.hint { color: var(--muted); font-size: 13px; }
+.warn { color: var(--accent); font-size: 13px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+
+/* ---------- поля и кнопки ---------- */
+
+label { display: block; margin-bottom: 10px; color: var(--muted); font-size: 13px; }
+label.check { display: flex; align-items: center; gap: 8px; color: var(--text); }
+input[type=text], input:not([type]), select {
+  width: 100%; margin-top: 4px; padding: 8px 10px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; font-size: 15px;
+}
+input[type=checkbox] { width: auto; margin: 0; }
+.code-input { text-transform: uppercase; max-width: 140px; letter-spacing: 3px; }
+
+button {
+  padding: 8px 14px; font-size: 15px; cursor: pointer;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); color: #1b1b1b; border-color: var(--accent); font-weight: bold; }
+button.danger { border-color: var(--danger); color: var(--danger); }
+button.link { background: none; border: none; color: var(--muted); text-decoration: underline; padding: 0; font-size: 13px; }
+
+/* ---------- список комнат ---------- */
+
+.rooms { display: flex; flex-direction: column; gap: 8px; }
+.room-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel-2);
+}
+.room-row .code { font-weight: bold; color: var(--accent); letter-spacing: 2px; }
+.room-row .meta { color: var(--muted); font-size: 13px; }
+.room-row button { margin-left: auto; }
+.empty { color: var(--muted); font-style: italic; }
+
+.code { font-family: monospace; font-size: 16px; color: var(--accent); }
+
+/* ---------- комната ---------- */
+
+.players { display: flex; flex-direction: column; gap: 6px; }
+.player-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.player-row .tag { font-size: 12px; color: var(--muted); }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); flex: none; }
+.dot.off { background: #7a8899; }
+.rules { color: var(--muted); font-size: 14px; }
+.rules b { color: var(--text); }
+
+/* ---------- чат ---------- */
+
+.chat {
+  height: 160px; overflow-y: auto; padding: 8px;
+  background: rgba(0, 0, 0, .25); border-radius: 8px; font-size: 13px;
+}
+.chat .msg { margin-bottom: 3px; }
+.chat .who { color: var(--accent); }
+.chat .sys { color: var(--muted); font-style: italic; }
+.chat-panel { max-width: 560px; }
+
+/* ---------- игровой стол ---------- */
+
+#screen-game.active { display: grid; grid-template-columns: 1fr 240px; gap: 16px; align-items: start; }
+.table-wrap {
+  min-width: 0; display: flex; flex-direction: column;
+  min-height: calc(100vh - 90px);
+}
+.side { display: flex; flex-direction: column; gap: 8px; }
+.side .log {
+  height: 190px; overflow-y: auto; padding: 8px; font-size: 13px;
+  background: rgba(0, 0, 0, .25); border-radius: 8px; color: var(--muted);
+}
+.side .log div { margin-bottom: 2px; }
+.side .chat { height: 150px; }
+
+.opponents { display: flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+.opp {
+  min-width: 130px; padding: 8px 10px; border-radius: 10px;
+  background: rgba(0, 0, 0, .28); border: 1px solid transparent; text-align: center;
+}
+.opp.attacker { border-color: var(--accent); }
+.opp.defender { border-color: #58a6ff; }
+.opp.out { opacity: .45; }
+.opp .nm { font-weight: bold; display: block; }
+.opp .role { font-size: 12px; color: var(--accent); }
+.opp .role.def { color: #58a6ff; }
+.opp .state { font-size: 12px; color: var(--muted); }
+.mini-fan { display: flex; justify-content: center; margin-top: 4px; min-height: 34px; }
+.mini-back {
+  width: 20px; height: 30px; margin-left: -8px; border-radius: 3px;
+  background: repeating-linear-gradient(45deg, #2d4a7a, #2d4a7a 3px, #1d3254 3px, #1d3254 6px);
+  border: 1px solid #0c1830;
+}
+.mini-fan .mini-back:first-child { margin-left: 0; }
+
+.board {
+  display: grid; grid-template-columns: 140px 1fr 90px; gap: 10px;
+  align-items: center; margin: 14px 0; min-height: 180px; flex: 1;
+}
+.deck-box, .discard-box { text-align: center; color: var(--muted); font-size: 13px; white-space: pre-line; }
+.deck-stack { position: relative; height: var(--card-h); width: 122px; margin: 0 auto 4px; }
+.deck-stack .back {
+  position: absolute; left: 58px; top: 0; width: var(--card-w); height: var(--card-h);
+  border-radius: 6px; border: 1px solid #0c1830;
+  background: repeating-linear-gradient(45deg, #2d4a7a, #2d4a7a 5px, #1d3254 5px, #1d3254 10px);
+}
+.deck-stack .trump-card { position: absolute; left: 13px; top: 0; transform: rotate(-90deg); }
+.trump-alone { margin: 0 auto 4px; }
+
+.table-cards {
+  display: flex; flex-wrap: wrap; gap: 18px; justify-content: center;
+  min-height: calc(var(--card-h) + 30px); align-content: center;
+  padding: 10px; border-radius: 12px; background: rgba(0, 0, 0, .18);
+}
+.pair { position: relative; width: var(--card-w); height: calc(var(--card-h) + 26px); }
+.pair .card { position: absolute; left: 0; top: 0; }
+.pair .card.def { left: 16px; top: 24px; }
+.pair.target .card.att { outline: 3px solid var(--accent); outline-offset: 2px; cursor: pointer; }
+.table-hint { color: var(--muted); align-self: center; }
+
+.status { text-align: center; min-height: 22px; margin: 6px 0; font-size: 15px; }
+.status b { color: var(--accent); }
+.actions { display: flex; gap: 8px; justify-content: center; min-height: 38px; flex-wrap: wrap; }
+
+.hand {
+  display: flex; justify-content: center; flex-wrap: wrap;
+  gap: 6px; margin-top: auto; padding-top: 14px;
+  min-height: calc(var(--card-h) + 14px);
+}
+
+/* ---------- карта ---------- */
+
+.card {
+  width: var(--card-w); height: var(--card-h);
+  background: #fbfbf7; color: #1a1a1a;
+  border: 1px solid #8a8a7a; border-radius: 6px;
+  position: relative; user-select: none;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, .4);
+}
+.card .r { position: absolute; top: 2px; left: 4px; font-weight: bold; font-size: 15px; line-height: 1; }
+.card .s { position: absolute; top: 16px; left: 4px; font-size: 13px; line-height: 1; }
+.card .big { position: absolute; right: 4px; bottom: 2px; font-size: 26px; line-height: 1; opacity: .9; }
+.card.red { color: #c62828; }
+.card.trump-suit { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(245, 197, 66, .35); }
+
+.hand .card { cursor: default; transition: transform .08s; }
+.hand .card.playable { cursor: pointer; }
+.hand .card.playable:hover { transform: translateY(-8px); }
+.hand .card.dim { filter: brightness(.72) saturate(.7); }
+.hand .card.selected { transform: translateY(-14px); outline: 3px solid var(--accent); }
+
+/* ---------- итог партии ---------- */
+
+.result {
+  position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .6); z-index: 20;
+}
+.result-box {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 24px 28px; text-align: center; max-width: 420px;
+}
+
+/* ---------- всплывающее сообщение ---------- */
+
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: var(--danger); color: #fff; padding: 10px 16px;
+  border-radius: 8px; z-index: 30; max-width: 90vw;
+}
+
+@media (max-width: 900px) {
+  #screen-game.active { grid-template-columns: 1fr; }
+  .board { grid-template-columns: 90px 1fr 70px; }
+  :root { --card-w: 52px; --card-h: 74px; }
+}

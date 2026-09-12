@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Дурак — игра по локальной сети</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='27' font-size='28'>%E2%99%A0</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header id="topbar">
+  <span class="brand">♠ Дурак ♥</span>
+  <span id="me-box" class="hidden">
+    <span id="me-name"></span>
+    <button id="btn-rename" class="link">сменить имя</button>
+  </span>
+  <span id="conn" class="conn">подключение…</span>
+</header>
+
+<main>
+
+<!-- ---------- вход ---------- -->
+<section id="screen-login" class="screen">
+  <div class="panel narrow">
+    <h1>Как вас звать?</h1>
+    <input id="login-name" maxlength="20" placeholder="Имя" autocomplete="off">
+    <button id="btn-login" class="primary">Играть</button>
+    <p class="hint">Имя видят остальные игроки. Его можно поменять позже.</p>
+  </div>
+</section>
+
+<!-- ---------- лобби ---------- -->
+<section id="screen-lobby" class="screen">
+  <div class="lobby-grid">
+    <div class="panel">
+      <h2>Комнаты</h2>
+      <div id="rooms-list" class="rooms"></div>
+      <div class="row">
+        <input id="join-code" maxlength="4" placeholder="Код комнаты" class="code-input" autocomplete="off">
+        <button id="btn-join-code">Войти по коду</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Новая комната</h2>
+      <label>Название
+        <input id="c_title" maxlength="30" placeholder="Комната" autocomplete="off">
+      </label>
+      <label>Колода
+        <select id="c_deck_size">
+          <option value="24">24 карты (9…А)</option>
+          <option value="32">32 карты (7…А)</option>
+          <option value="36" selected>36 карт (6…А)</option>
+          <option value="52">52 карты (2…А)</option>
+        </select>
+      </label>
+      <label>Игроков
+        <select id="c_max_players">
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4" selected>4</option>
+          <option value="5">5</option>
+          <option value="6">6</option>
+        </select>
+      </label>
+      <label>Подкидывают
+        <select id="c_throw_in">
+          <option value="all" selected>все игроки</option>
+          <option value="neighbors">только соседи отбивающегося</option>
+        </select>
+      </label>
+      <label>Максимум карт в кону
+        <select id="c_max_attack_cards">
+          <option value="6" selected>6</option>
+          <option value="5">5</option>
+          <option value="4">4</option>
+          <option value="3">3</option>
+          <option value="2">2</option>
+        </select>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="c_transfer"> Переводной
+      </label>
+      <p id="create-warn" class="warn hidden"></p>
+      <button id="btn-create" class="primary">Создать</button>
+    </div>
+  </div>
+</section>
+
+<!-- ---------- комната ---------- -->
+<section id="screen-room" class="screen">
+  <div class="lobby-grid">
+    <div class="panel">
+      <h2><span id="room-title"></span> <span id="room-code" class="code"></span></h2>
+      <div id="room-players" class="players"></div>
+      <div class="row">
+        <button id="btn-start" class="primary">Начать партию</button>
+        <button id="btn-leave">Выйти</button>
+      </div>
+      <p id="room-hint" class="hint"></p>
+    </div>
+
+    <div class="panel">
+      <h2>Правила комнаты</h2>
+      <div id="room-settings-view" class="rules"></div>
+      <div id="room-settings-edit">
+        <label>Колода
+          <select id="r_deck_size">
+            <option value="24">24 карты (9…А)</option>
+            <option value="32">32 карты (7…А)</option>
+            <option value="36">36 карт (6…А)</option>
+            <option value="52">52 карты (2…А)</option>
+          </select>
+        </label>
+        <label>Игроков
+          <select id="r_max_players">
+            <option value="2">2</option><option value="3">3</option>
+            <option value="4">4</option><option value="5">5</option>
+            <option value="6">6</option>
+          </select>
+        </label>
+        <label>Подкидывают
+          <select id="r_throw_in">
+            <option value="all">все игроки</option>
+            <option value="neighbors">только соседи отбивающегося</option>
+          </select>
+        </label>
+        <label>Максимум карт в кону
+          <select id="r_max_attack_cards">
+            <option value="6">6</option><option value="5">5</option>
+            <option value="4">4</option><option value="3">3</option>
+            <option value="2">2</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="r_transfer"> Переводной</label>
+        <button id="btn-save-settings">Сохранить правила</button>
+      </div>
+    </div>
+  </div>
+  <div class="panel chat-panel">
+    <div id="room-chat" class="chat"></div>
+    <div class="row">
+      <input id="room-chat-input" maxlength="200" placeholder="Сообщение…" autocomplete="off">
+      <button id="btn-room-chat">Отправить</button>
+    </div>
+  </div>
+</section>
+
+<!-- ---------- игра ---------- -->
+<section id="screen-game" class="screen">
+  <div class="table-wrap">
+    <div id="opponents" class="opponents"></div>
+
+    <div class="board">
+      <div id="deck-box" class="deck-box"></div>
+      <div id="table-cards" class="table-cards"></div>
+      <div id="discard-box" class="discard-box"></div>
+    </div>
+
+    <div id="game-status" class="status"></div>
+    <div id="game-actions" class="actions"></div>
+    <div id="my-hand" class="hand"></div>
+  </div>
+
+  <aside class="side">
+    <div id="game-log" class="log"></div>
+    <div id="game-chat" class="chat"></div>
+    <div class="row">
+      <input id="game-chat-input" maxlength="200" placeholder="Сообщение…" autocomplete="off">
+      <button id="btn-game-chat">→</button>
+    </div>
+    <button id="btn-game-leave">Выйти из комнаты</button>
+  </aside>
+
+  <div id="result" class="result hidden">
+    <div class="result-box">
+      <h2 id="result-title"></h2>
+      <p id="result-text"></p>
+      <div class="row">
+        <button id="btn-again" class="primary">Новая партия</button>
+        <button id="btn-result-close">К столу</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
