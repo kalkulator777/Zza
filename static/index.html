@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZZA ARENA</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚔️</text></svg>">
+</head>
+<body>
+
+<div id="toast"></div>
+
+<!-- ================= МЕНЮ ================= -->
+<section id="menu" class="screen active">
+  <div class="wrap">
+    <header class="brand">
+      <h1>ZZA ARENA</h1>
+      <p class="sub">Файтинг 1×1 и 2×2 для локальной сети. Запустил — играешь.</p>
+    </header>
+
+    <div class="menu-grid">
+      <div class="card">
+        <label class="field">
+          <span>Твоё имя</span>
+          <input id="nick" maxlength="16" placeholder="Игрок" autocomplete="off">
+        </label>
+
+        <div class="row">
+          <label class="field grow">
+            <span>Режим</span>
+            <select id="m-mode">
+              <option value="1v1">1 на 1</option>
+              <option value="2v2">2 на 2</option>
+            </select>
+          </label>
+          <label class="field grow">
+            <span>Жизни</span>
+            <select id="m-stocks">
+              <option>1</option><option>2</option><option selected>3</option><option>5</option>
+            </select>
+          </label>
+        </div>
+        <label class="field">
+          <span>Арена</span>
+          <select id="m-arena"></select>
+        </label>
+
+        <button id="btn-create" class="big primary">Создать игру</button>
+        <p class="hint">Твой компьютер станет хостом. Коллеги увидят игру в списке автоматически.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Игры в сети</h2>
+          <span id="disco-state" class="tag">поиск…</span>
+        </div>
+        <div id="games" class="games"><div class="empty">Пока ничего не найдено</div></div>
+        <div class="row tight">
+          <input id="join-code" maxlength="40" placeholder="Код (ABCD) или 192.168.0.10:8777" autocomplete="off">
+          <button id="btn-join" class="primary">Войти</button>
+        </div>
+        <p class="hint">Если броадкаст в сети зарезан — просто введи адрес хоста.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Управление</h2></div>
+        <ul class="keys">
+          <li><b>A</b> <b>D</b> — движение</li>
+          <li><b>Space</b> / <b>W</b> — прыжок (двойной)</li>
+          <li><b>S</b> — быстрое падение, <b>S</b>+прыжок — вниз сквозь платформу</li>
+          <li><b>Мышь</b> — прицел и разворот</li>
+          <li><b>ЛКМ</b> — базовая атака</li>
+          <li><b>Q</b> / <b>E</b> — способности</li>
+          <li><b>R</b> — ультимейт (когда шкала полная)</li>
+          <li><b>Shift</b> — рывок (неуязвимость в кадрах рывка)</li>
+        </ul>
+        <button id="btn-heroes" class="ghost">Посмотреть героев</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ЛОББИ ================= -->
+<section id="lobby" class="screen">
+  <div class="wrap">
+    <header class="lobby-head">
+      <div>
+        <h2 id="l-name">Игра</h2>
+        <div class="codeline">код <b id="l-code">----</b>
+          <button id="btn-copy" class="mini">скопировать ссылку</button>
+          <span id="l-mode" class="tag"></span>
+        </div>
+      </div>
+      <button id="btn-leave" class="ghost">Выйти</button>
+    </header>
+
+    <div class="host-bar" id="host-bar">
+      <label class="field"><span>Режим</span>
+        <select id="l-mode-sel"><option value="1v1">1 на 1</option><option value="2v2">2 на 2</option></select>
+      </label>
+      <label class="field"><span>Арена</span><select id="l-arena"></select></label>
+      <label class="field"><span>Жизни</span>
+        <select id="l-stocks"><option>1</option><option>2</option><option>3</option><option>5</option></select>
+      </label>
+      <label class="field"><span>Сложность ботов</span>
+        <select id="l-botlvl"><option value="1">спокойная</option><option value="2" selected>обычная</option><option value="3">злая</option></select>
+      </label>
+      <button id="btn-bot" class="ghost">+ бот</button>
+    </div>
+
+    <div class="teams">
+      <div class="team team-a"><h3>Команда А</h3><div class="slots" id="team0"></div>
+        <button class="mini join-team" data-team="0">встать сюда</button></div>
+      <div class="vs">VS</div>
+      <div class="team team-b"><h3>Команда Б</h3><div class="slots" id="team1"></div>
+        <button class="mini join-team" data-team="1">встать сюда</button></div>
+    </div>
+
+    <h3 class="section-title">Герой</h3>
+    <div id="heroes" class="heroes"></div>
+
+    <div class="lobby-foot">
+      <button id="btn-ready" class="big">Готов</button>
+      <button id="btn-start" class="big primary">Начать бой</button>
+      <button id="btn-spec" class="ghost">Стать зрителем</button>
+    </div>
+
+    <div class="chat">
+      <div id="chat-log" class="chat-log"></div>
+      <input id="chat-in" placeholder="Сообщение…  (Enter)" maxlength="200" autocomplete="off">
+    </div>
+  </div>
+</section>
+
+<!-- ================= БОЙ ================= -->
+<section id="game" class="screen">
+  <canvas id="cv" width="1600" height="900"></canvas>
+  <div id="net" class="net"></div>
+  <div id="center-msg" class="center-msg"></div>
+  <div id="killfeed" class="killfeed"></div>
+  <button id="btn-quit" class="mini quit">выйти в лобби</button>
+</section>
+
+<!-- ================= МОДАЛКИ ================= -->
+<div id="modal" class="modal"><div class="modal-body"><button class="modal-x">×</button><div id="modal-content"></div></div></div>
+
+<script src="/static/js/data.js"></script>
+<script src="/static/js/net.js"></script>
+<script src="/static/js/input.js"></script>
+<script src="/static/js/render.js"></script>
+<script src="/static/js/ui.js"></script>
+<script src="/static/js/main.js"></script>
+</body>
+</html>
