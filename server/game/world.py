@@ -768,6 +768,15 @@ class World:
 
     # ------------------------------------------------------------- снапшот
     def snapshot(self):
+        """Состояние мира для клиента.
+
+        Формат должен совпадать с тем, что читает static/js/render.js. Здесь
+        только то, что клиент действительно рисует: поля ap (прогресс
+        способности) и hs (флаг хитстана) уезжали каждый тик и не читались
+        никем, а прицел ax/ay уезжал сразу за всех четверых, хотя линия
+        прицела рисуется только своя — её клиент берёт из своего же Input.
+        Вместе это было 12% снапшота.
+        """
         ps = []
         for pid in self.order:
             f = self.fighters[pid]
@@ -784,14 +793,11 @@ class World:
                 "st": max(0, f.stocks),
                 "u": round(f.ult, 1),
                 "a": (f.act.key if f.act else ("dash" if f.dash_t > 0 else "")),
-                "ap": round(f.act.t / f.act.dur, 2) if f.act else 0,
                 "al": 1 if f.alive else 0,
                 "rt": round(max(0.0, f.respawn_t), 1),
                 "iv": 1 if (f.iframes > 0 or f.has("invuln")) else 0,
-                "hs": 1 if f.hitstun > 0 else 0,
                 "g": 1 if f.on_ground else 0,
                 "cd": [round(f.cds["q"], 1), round(f.cds["e"], 1), round(f.dash_cd, 1)],
-                "ax": round(f.aim_x, 2), "ay": round(f.aim_y, 2),
             })
         objs = [{"i": p.id, "k": p.kind, "x": round(p.x, 1), "y": round(p.y, 1),
                  "r": round(p.r, 1), "t": p.team,

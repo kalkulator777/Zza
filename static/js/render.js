@@ -841,8 +841,11 @@ const Render = {
       c.beginPath();
       c.moveTo(x, y - H / 2 - 26); c.lineTo(x - 6, y - H / 2 - 35); c.lineTo(x + 6, y - H / 2 - 35);
       c.closePath(); c.fill();
+      // прицел берём свой, локальный: он и так лежит в Input, а в снапшоте
+      // ехал для всех четверых, хотя рисуется только для себя. Заодно линия
+      // перестала опаздывать на круг до сервера и обратно.
       c.globalAlpha = .35; c.strokeStyle = col; c.lineWidth = 2;
-      c.beginPath(); c.moveTo(x, y); c.lineTo(x + p.ax * 90, y + p.ay * 90); c.stroke();
+      c.beginPath(); c.moveTo(x, y); c.lineTo(x + Input.aim.x * 90, y + Input.aim.y * 90); c.stroke();
       c.globalAlpha = 1;
     }
   },
