@@ -181,10 +181,13 @@ button, input, select, textarea {
 .size-dot { background: var(--card-2); border-radius: 50%; cursor: pointer; border: 2px solid transparent; }
 .size-dot.active { border-color: var(--accent); background: #fff; }
 
-.chat-col { display: flex; flex-direction: column; gap: 8px; height: 100%; }
-.chat-col { min-height: 420px; }
+.chat-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 420px; }
 .chat-log {
-  flex: 1; min-height: 200px;
+  /* Высоту обязательно ограничивать экраном: без потолка колонка тянется вслед
+     за сообщениями, и overflow никогда не срабатывает — чат просто растёт вниз. */
+  flex: 1 1 0;
+  min-height: 180px;
+  max-height: calc(100vh - 250px);
   background: rgba(0, 0, 0, .16); border-radius: 14px; padding: 10px;
   overflow-y: auto; display: flex; flex-direction: column; gap: 5px;
   font-size: 14px;
