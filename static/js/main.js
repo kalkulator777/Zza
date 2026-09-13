@@ -116,6 +116,9 @@ function doJoin() {
   NET.send({ t: 'join', code: v.toUpperCase() });
 }
 document.getElementById('btn-heroes').onclick = () => UI.heroModal(CAT);
+const qsel = document.getElementById('m-quality');
+qsel.value = localStorage.getItem('zza.q') || 'auto';
+qsel.onchange = () => Render.setQuality(qsel.value);
 document.querySelector('.modal-x').onclick = () => UI.closeModal();
 document.getElementById('modal').addEventListener('click', e => {
   if (e.target.id === 'modal') UI.closeModal();
@@ -219,12 +222,15 @@ function handleAnnounce(s) {
 }
 
 /* ---------------- цикл ---------------- */
-let last = performance.now(), fps = 60, acc = 0;
+let last = performance.now(), acc = 0, netT = 0;
+const QNAME = { 2: '', 1: 'ср.', 0: 'низк.' };
 function loop(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
-  fps += ((1 / Math.max(0.001, dt)) - fps) * 0.05;
+  Render.fps += ((1 / Math.max(0.001, dt)) - Render.fps) * 0.05;
   if (UI.cur === 'game') {
-    const v = Render.view();
+    // берём интерполяцию прошлого кадра: она уже посчитана, а лишние 16 мс
+    // задержки прицела незаметны
+    const v = Render._view;
     if (v) {
       const me = v.p.find(p => p.i === MYPID);
       if (me) Input.updateAim(me.x, me.y);
@@ -232,8 +238,12 @@ function loop(now) {
     acc += dt;
     if (acc >= 1 / 60) { acc = 0; Input.flush(NET); }
     Render.frame(dt);
-    document.getElementById('net').textContent =
-      `${NET.ping} ms · ${Math.round(fps)} fps`;
+    netT += dt;
+    if (netT > 0.4) {
+      netT = 0;
+      document.getElementById('net').textContent =
+        `${NET.ping} ms · ${Math.round(Render.fps)} fps ${QNAME[Render.level]}`;
+    }
   }
   requestAnimationFrame(loop);
 }

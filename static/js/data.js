@@ -110,3 +110,31 @@ const ABICON = {
     c.closePath(); c.fill(); c.restore();
   }
 };
+
+/* Новый герой, которому ещё не нарисовали свой значок: собираем узнаваемую
+   фигуру из его id, чтобы хотя бы не путать героев между собой. */
+const _fallbackCache = {};
+function glyphFallback(id) {
+  if (_fallbackCache[id]) return _fallbackCache[id];
+  let h = 0;
+  for (let i = 0; i < (id || '').length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  const sides = 3 + (Math.abs(h) % 5);          // 3..7 углов
+  const rot = (Math.abs(h >> 3) % 12) / 12 * Math.PI;
+  const inner = (Math.abs(h >> 7) % 2) === 1;
+  const fn = (c, x, y, s, col) => {
+    c.save(); c.translate(x, y); c.rotate(rot);
+    c.strokeStyle = col; c.fillStyle = col; c.lineWidth = s * 0.1; c.lineJoin = 'round';
+    c.beginPath();
+    for (let i = 0; i < sides; i++) {
+      const a = -Math.PI / 2 + i * 2 * Math.PI / sides;
+      const px = Math.cos(a) * s * 0.46, py = Math.sin(a) * s * 0.46;
+      i ? c.lineTo(px, py) : c.moveTo(px, py);
+    }
+    c.closePath();
+    c.globalAlpha = 0.35; c.fill(); c.globalAlpha = 1; c.stroke();
+    if (inner) { c.beginPath(); c.arc(0, 0, s * 0.16, 0, 6.284); c.fill(); }
+    c.restore();
+  };
+  _fallbackCache[id] = fn;
+  return fn;
+}

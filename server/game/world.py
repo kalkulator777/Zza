@@ -48,6 +48,8 @@ class World:
         self.zones = []
         self.events = []
         self.shake = 0.0
+        self._solids_cache = None
+        self._solids_frame = -1
 
     # ------------------------------------------------------------------ utils
     def new_id(self):
@@ -266,10 +268,15 @@ class World:
 
     # ------------------------------------------------------------- физика
     def _solids(self):
+        """Твёрдая геометрия тика. Пересобирается раз за шаг, дальше — из кэша."""
+        if self._solids_frame == self.frame and self._solids_cache is not None:
+            return self._solids_cache
         out = [(p["x"], p["y"], p["w"], p["h"], p["oneway"]) for p in self.platforms]
         for s in self.structs:
             if s.solid and s.hp > 0:
                 out.append((s.x, s.y, s.w, s.h, False))
+        self._solids_cache = out
+        self._solids_frame = self.frame
         return out
 
     def _physics(self, f, solids):
@@ -453,6 +460,7 @@ class World:
         return None
 
     def _update_projectiles(self):
+        solids = self._solids()
         alive = []
         for p in self.projectiles:
             p.ttl -= C.DT
@@ -484,7 +492,7 @@ class World:
 
             if p.terrain:
                 hitwall = False
-                for (px, py, pw, ph, oneway) in self._solids():
+                for (px, py, pw, ph, oneway) in solids:
                     if oneway:
                         continue
                     if circle_rect(p.x, p.y, p.r, px, py, pw, ph):

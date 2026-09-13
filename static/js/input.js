@@ -49,8 +49,8 @@ const Input = {
     });
     canvas.addEventListener('mousemove', e => {
       const r = canvas.getBoundingClientRect();
-      this.mouse.x = (e.clientX - r.left) / r.width * canvas.width;
-      this.mouse.y = (e.clientY - r.top) / r.height * canvas.height;
+      this.mouse.x = (e.clientX - r.left) / r.width * Render.CW;
+      this.mouse.y = (e.clientY - r.top) / r.height * Render.CH;
     });
   },
 

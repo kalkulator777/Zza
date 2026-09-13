@@ -86,7 +86,7 @@ button:disabled{opacity:.4;cursor:not-allowed}
 .slot .me{color:var(--acc);font-size:11px}
 .slot .kick{opacity:.5}
 .section-title{font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--dim);margin:18px 0 8px}
-.heroes{display:grid;grid-template-columns:repeat(6,1fr);gap:9px}
+.heroes{display:grid;grid-template-columns:repeat(auto-fit,minmax(176px,1fr));gap:9px}
 .hero{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;cursor:pointer;
   transition:.12s;position:relative;overflow:hidden}
 .hero:hover{transform:translateY(-2px)}
@@ -116,8 +116,9 @@ button:disabled{opacity:.4;cursor:not-allowed}
 /* ---------- бой ---------- */
 #game{background:#05070c;display:none}
 #game.active{display:flex;align-items:center;justify-content:center}
-#cv{max-width:100vw;max-height:100vh;width:auto;height:auto;image-rendering:auto;
-  aspect-ratio:16/9;display:block}
+/* Внутреннее разрешение канваса меняется вместе с качеством, но на экране он
+   всегда занимает максимум места: размер задаём явно, а не по intrinsic size. */
+#cv{width:min(100vw,calc(100vh * 16 / 9));height:auto;aspect-ratio:16/9;display:block}
 .net{position:absolute;top:6px;right:10px;font-size:11px;color:#667}
 .center-msg{position:absolute;top:26%;left:0;right:0;text-align:center;font-size:64px;font-weight:800;
   letter-spacing:6px;pointer-events:none;text-shadow:0 6px 30px #000;opacity:0;transition:opacity .2s}
@@ -146,4 +147,4 @@ button:disabled{opacity:.4;cursor:not-allowed}
   box-shadow:0 8px 30px #0008}
 .toast.bad{border-color:#5a2330;color:#ff9aab}
 
-@media (max-width:1080px){.menu-grid{grid-template-columns:1fr}.heroes{grid-template-columns:repeat(3,1fr)}}
+@media (max-width:1080px){.menu-grid{grid-template-columns:1fr}}
