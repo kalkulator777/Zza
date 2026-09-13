@@ -1,0 +1,182 @@
+{
+  "_comment": "Бонусы — экземпляры поверх примитивов движка. Новый бонус это строчка здесь, а не новый код. Примитивы: self (эффект на себя), projectile (снаряд вперёд), trap (ловушка позади), blast (мгновенно по цели). Поле short — короткая метка для HUD; эмодзи не используем, шрифт с ними есть не на всех системах.",
+  "_kinds": {
+    "self": "накладывает effect на себя",
+    "projectile": "снаряд вперёд; speed, life, homing (0 — прямой)",
+    "trap": "предмет на дороге позади; radius, life",
+    "blast": "мгновенно по target: ahead | others | nearest | leader"
+  },
+  "_effect_fields": "accelMul, maxSpeedMul, steerMul, gripMul, spin, control (1 обычно, -1 наоборот, 0 без управления), duration в секундах",
+  "_weight": "[для лидера, для середины, для последнего] — резина: отстающим чаще дают сильное",
+  "items": [
+    {
+      "id": "boost",
+      "name": "Ускорение",
+      "color": "#ffd23f",
+      "kind": "self",
+      "effect": {
+        "accelMul": 2.3,
+        "maxSpeedMul": 1.5,
+        "duration": 2.2
+      },
+      "weight": [
+        3.0,
+        2.6,
+        1.6
+      ],
+      "short": "УСК"
+    },
+    {
+      "id": "turbo",
+      "name": "Турбо",
+      "color": "#ff7a29",
+      "kind": "self",
+      "effect": {
+        "accelMul": 3.2,
+        "maxSpeedMul": 1.9,
+        "gripMul": 1.3,
+        "duration": 3.0
+      },
+      "weight": [
+        0.0,
+        0.6,
+        2.4
+      ],
+      "short": "ТРБ"
+    },
+    {
+      "id": "shield",
+      "name": "Щит",
+      "color": "#4fc3f7",
+      "kind": "self",
+      "shield": true,
+      "effect": {
+        "duration": 9.0
+      },
+      "weight": [
+        2.2,
+        1.8,
+        1.2
+      ],
+      "short": "ЩИТ"
+    },
+    {
+      "id": "rocket",
+      "name": "Ракета",
+      "color": "#ff5252",
+      "kind": "projectile",
+      "speed": 760.0,
+      "life": 3.0,
+      "homing": 0.0,
+      "radius": 22.0,
+      "hit": {
+        "spin": 9.5,
+        "control": 0.0,
+        "maxSpeedMul": 0.3,
+        "duration": 1.2
+      },
+      "weight": [
+        2.4,
+        2.2,
+        1.4
+      ],
+      "short": "РКТ"
+    },
+    {
+      "id": "seeker",
+      "name": "Самонаводящаяся",
+      "color": "#e040fb",
+      "kind": "projectile",
+      "speed": 580.0,
+      "life": 5.5,
+      "homing": 3.4,
+      "radius": 24.0,
+      "hit": {
+        "spin": 8.0,
+        "control": 0.0,
+        "maxSpeedMul": 0.3,
+        "duration": 1.3
+      },
+      "weight": [
+        0.4,
+        1.4,
+        2.2
+      ],
+      "short": "НАВ"
+    },
+    {
+      "id": "oil",
+      "name": "Масло",
+      "color": "#424242",
+      "kind": "trap",
+      "radius": 36.0,
+      "life": 26.0,
+      "hit": {
+        "gripMul": 0.1,
+        "steerMul": 0.5,
+        "duration": 2.4
+      },
+      "weight": [
+        2.6,
+        2.0,
+        1.0
+      ],
+      "short": "МСЛ"
+    },
+    {
+      "id": "mine",
+      "name": "Мина",
+      "color": "#9e9e9e",
+      "kind": "trap",
+      "radius": 28.0,
+      "life": 32.0,
+      "hit": {
+        "spin": 11.0,
+        "control": 0.0,
+        "maxSpeedMul": 0.25,
+        "duration": 1.4
+      },
+      "weight": [
+        2.2,
+        1.8,
+        0.9
+      ],
+      "short": "МИН"
+    },
+    {
+      "id": "emp",
+      "name": "Разряд",
+      "color": "#7c4dff",
+      "kind": "blast",
+      "target": "ahead",
+      "hit": {
+        "maxSpeedMul": 0.42,
+        "steerMul": 0.6,
+        "duration": 3.2
+      },
+      "weight": [
+        0.0,
+        0.8,
+        2.6
+      ],
+      "short": "РЗР"
+    },
+    {
+      "id": "confuse",
+      "name": "Путаница",
+      "color": "#26c6da",
+      "kind": "blast",
+      "target": "others",
+      "hit": {
+        "control": -1.0,
+        "duration": 2.6
+      },
+      "weight": [
+        0.6,
+        1.2,
+        1.8
+      ],
+      "short": "ПУТ"
+    }
+  ]
+}

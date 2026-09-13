@@ -1,0 +1,70 @@
+{
+  "_comment": "Единый источник правды для физики. Читают И сервер (Python), И клиент (JS). Хост может править значения вживую (F4) и скачать этот файл заново.",
+  "version": 1,
+
+  "car": {
+    "maxSpeed": 430.0,
+    "accel": 540.0,
+    "brake": 880.0,
+    "reverseAccel": 260.0,
+    "maxReverse": 150.0,
+    "drag": 0.55,
+    "grip": 6.2,
+    "handbrakeGrip": 1.1,
+    "handbrakeSteerBonus": 1.45,
+    "steerRate": 3.15,
+    "steerFullSpeed": 95.0,
+    "steerFalloff": 0.0011,
+    "length": 34.0,
+    "width": 18.0,
+    "radius": 11.5,
+    "axleOffset": 9.0
+  },
+
+  "collision": {
+    "restitution": 0.42,
+    "separation": 0.7,
+    "spinKick": 2.6,
+    "speedLoss": 0.12,
+    "wallRestitution": 0.25,
+    "wallSpeedLoss": 0.45
+  },
+
+  "surfaces": {
+    "road":   { "grip": 1.0,  "drag": 1.0, "accel": 1.0,  "maxSpeed": 1.0 },
+    "grass":  { "grip": 0.72, "drag": 4.1, "accel": 0.45, "maxSpeed": 0.55 },
+    "sand":   { "grip": 0.55, "drag": 5.6, "accel": 0.35, "maxSpeed": 0.45 },
+    "ice":    { "grip": 0.16, "drag": 0.7, "accel": 0.75, "maxSpeed": 1.0 },
+    "boost":  { "grip": 1.15, "drag": 0.7, "accel": 1.95, "maxSpeed": 1.35 },
+    "wall":   { "grip": 1.0,  "drag": 1.0, "accel": 1.0,  "maxSpeed": 1.0 }
+  },
+
+  "track": {
+    "shoulder": 78.0,
+    "wallRestitution": 0.25
+  },
+
+  "respawn": {
+    "stuckSpeed": 26.0,
+    "stuckSeconds": 2.5,
+    "freezeSeconds": 0.9
+  },
+
+  "sim": {
+    "hz": 60,
+    "snapshotHz": 30,
+    "inputSendHz": 60,
+    "maxRollbackTicks": 24,
+    "blendErrorPx": 3.0,
+    "blendHardPx": 140.0,
+    "blendRate": 11.0
+  },
+
+  "camera": {
+    "worldHeight": 600.0,
+    "minWorldWidth": 850.0,
+    "maxWorldWidth": 1400.0,
+    "lookAhead": 0.28,
+    "smooth": 9.0
+  }
+}

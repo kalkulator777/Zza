@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>ZZA — гонки</title>
+<link rel="stylesheet" href="/css/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2310131a'/%3E%3Ctext x='16' y='23' font-size='20' font-weight='800' text-anchor='middle' fill='%23ffd23f'%3EZ%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- Подключение / ошибка. Пустой экран — худшее, что может увидеть игрок,
+     поэтому любая проблема с сетью показывается здесь текстом. -->
+<section id="screen-connect" class="screen active">
+  <div class="pane center">
+    <h1 class="logo">ZZA</h1>
+    <p id="connect-msg" class="muted">Подключаюсь к серверу…</p>
+    <div id="connect-detail" class="detail hidden"></div>
+    <button id="connect-retry" class="btn hidden">Попробовать снова</button>
+  </div>
+</section>
+
+<!-- Меню -->
+<section id="screen-menu" class="screen">
+  <div class="menu-wrap">
+    <header class="menu-head">
+      <h1 class="logo small">ZZA</h1>
+      <div class="who">
+        <label for="name-input">Имя</label>
+        <input id="name-input" maxlength="18" autocomplete="off" spellcheck="false">
+      </div>
+    </header>
+
+    <div class="menu-grid">
+      <div class="card">
+        <h2>Играть</h2>
+        <button id="btn-create" class="btn big">Создать лобби</button>
+        <button id="btn-solo" class="btn big ghost">Заезд на время</button>
+        <div class="joinbox">
+          <input id="join-code" placeholder="КОД" maxlength="4" autocomplete="off"
+                 spellcheck="false" class="code-input">
+          <button id="btn-join-code" class="btn">Войти по коду</button>
+        </div>
+      </div>
+
+      <div class="card grow">
+        <h2>Лобби в сети <button id="btn-refresh" class="link">обновить</button></h2>
+        <div id="lobby-list" class="list"></div>
+      </div>
+    </div>
+
+    <footer class="menu-foot">
+      <span class="muted" id="server-hint"></span>
+      <span class="muted">F3 — диагностика · F11 — во весь экран</span>
+    </footer>
+  </div>
+</section>
+
+<!-- Создание лобби / настройки -->
+<dialog id="dlg-create">
+  <form method="dialog" class="pane">
+    <h2 id="dlg-title">Создать лобби</h2>
+    <label>Название<input id="opt-name" maxlength="28" autocomplete="off"></label>
+    <label>Трасса<select id="opt-track"></select></label>
+    <div id="opt-track-info" class="muted small"></div>
+    <div class="row">
+      <label>Кругов<input id="opt-laps" type="number" min="1" max="20"></label>
+      <label>Игроков<input id="opt-max" type="number" min="2" max="6"></label>
+    </div>
+    <div id="opt-duration" class="muted small"></div>
+    <label class="check"><input id="opt-powerups" type="checkbox" checked> Бонусы и оружие</label>
+    <label class="check"><input id="opt-collisions" type="checkbox" checked> Столкновения машин</label>
+    <label>Пароль <span class="muted small">(необязательно)</span>
+      <input id="opt-pass" maxlength="24" autocomplete="off"></label>
+    <div class="row end">
+      <button value="cancel" class="btn ghost">Отмена</button>
+      <button value="ok" id="dlg-ok" class="btn">Создать</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- Лобби -->
+<section id="screen-lobby" class="screen">
+  <div class="menu-wrap">
+    <header class="menu-head">
+      <div>
+        <h2 id="lobby-name">Лобби</h2>
+        <div class="muted">Код <b id="lobby-code" class="code"></b> — назовите его тем, кто хочет зайти</div>
+      </div>
+      <button id="btn-leave" class="btn ghost">Выйти</button>
+    </header>
+
+    <div class="menu-grid">
+      <div class="card">
+        <h2>Игроки <span id="lobby-count" class="muted"></span></h2>
+        <div id="player-list" class="list"></div>
+        <div id="lobby-settings" class="settings muted small"></div>
+        <div class="row">
+          <button id="btn-settings" class="btn ghost hidden">Настройки</button>
+          <button id="btn-ready" class="btn">Готов</button>
+          <button id="btn-start" class="btn primary hidden">Начать заезд</button>
+        </div>
+        <div id="start-hint" class="muted small"></div>
+      </div>
+
+      <div class="card grow">
+        <h2>Чат</h2>
+        <div id="chat-log" class="list chat"></div>
+        <form id="chat-form" class="row">
+          <input id="chat-input" maxlength="160" placeholder="Сообщение" autocomplete="off">
+          <button class="btn">→</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Заезд -->
+<section id="screen-race" class="screen">
+  <canvas id="cv"></canvas>
+
+  <div id="hud" class="hud">
+    <div class="hud-left">
+      <div class="hud-pos"><b id="hud-place">1</b><span id="hud-place-of">/1</span></div>
+      <div class="hud-lap">круг <b id="hud-lap">1</b><span id="hud-laps">/3</span></div>
+    </div>
+    <div class="hud-mid">
+      <div id="hud-time" class="hud-time">0:00.0</div>
+      <div id="hud-best" class="muted small"></div>
+    </div>
+    <div class="hud-right">
+      <div class="item-wrap">
+        <div id="hud-item" class="item empty"><span id="hud-item-icon"></span></div>
+        <div id="hud-item-name" class="item-name"></div>
+      </div>
+      <div id="hud-speed" class="hud-speed">0</div>
+    </div>
+  </div>
+
+  <div id="standings" class="standings"></div>
+  <div id="countdown" class="countdown hidden"></div>
+  <div id="toast" class="toast hidden"></div>
+  <div id="spectate" class="spectate hidden">Вы смотрите заезд. Играть сможете со следующего.</div>
+
+  <div id="race-menu" class="race-menu hidden">
+    <div class="pane center">
+      <h2>Пауза</h2>
+      <button id="btn-resume" class="btn">Продолжить</button>
+      <button id="btn-quit" class="btn ghost">Выйти из заезда</button>
+      <p class="muted small">Esc — закрыть · R — вернуться на трассу</p>
+    </div>
+  </div>
+</section>
+
+<!-- Результаты -->
+<section id="screen-results" class="screen">
+  <div class="menu-wrap">
+    <div class="card">
+      <h2 id="res-title">Результаты</h2>
+      <div id="res-table" class="list"></div>
+      <div class="row">
+        <button id="btn-rematch" class="btn primary hidden">Ещё раз</button>
+        <button id="btn-to-lobby" class="btn">В лобби</button>
+        <button id="btn-to-menu" class="btn ghost">В меню</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Лучшие круги на трассе</h2>
+      <div id="res-records" class="list"></div>
+    </div>
+  </div>
+</section>
+
+<!-- Диагностика (F3) — одна фотография этого оверлея заменяет замерочную поездку -->
+<div id="diag" class="diag hidden"></div>
+
+<!-- Живая подстройка физики (F4), только у хозяина лобби -->
+<div id="tuner" class="tuner hidden">
+  <div class="tuner-head">
+    <b>Настройка физики</b>
+    <span class="muted small">видят все в заезде</span>
+    <button id="tuner-close" class="link">закрыть</button>
+  </div>
+  <div id="tuner-body"></div>
+  <div class="row">
+    <button id="tuner-save" class="btn">Скачать physics.json</button>
+    <button id="tuner-reset" class="btn ghost">Сбросить</button>
+  </div>
+</div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>
