@@ -26,6 +26,7 @@
 
 import argparse
 import json
+import random
 import statistics as st
 import time
 
@@ -260,6 +261,11 @@ def one_trial(page, timeout=1.5):
       P.t0 = P.tsend = P.tsnap = P.tframe = 0; P.dq = P.ds = null;
       P.base = Render._view.p.find(p => p.i === MYPID).x; P.st = 1;
     }""")
+    # Момент нажатия нужно расфазировать с сеткой тиков сервера: без этого
+    # ожидание готовности само подстраивается под приход снапшотов, нажатие
+    # каждый раз попадает в одну и ту же фазу тика, и слагаемое dq выходит
+    # завышенным. Случайная пауза возвращает равномерное попадание в тик.
+    time.sleep(random.uniform(0.0, 0.0334))
     page.keyboard.down("d")
     t_end = time.time() + timeout
     res = None

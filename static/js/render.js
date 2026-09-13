@@ -8,9 +8,25 @@
  */
 const Render = {
   S: 0.78, CW: 1600, CH: 900, WCX: 800, WCY: 480,
-  DELAY: 90,
   cv: null, ctx: null, arena: null, players: {}, heroes: {}, myPid: null,
   buf: [], parts: [], beams: [], shake: 0, t: 0, aimLine: null,
+
+  /* ---- время: часы сервера и буфер интерполяции ----
+     Снапшот несёт номер кадра мира, значит знает своё время симуляции
+     (f * SIMDT). Разница между приходом пакета и этим временем — задержка
+     доставки; её минимум за окно даёт сдвиг часов, а разброс над минимумом —
+     джиттер. Рисуем мир в момент now - lead, где lead = сдвиг + буфер, а буфер
+     держим ровно таким, чтобы всегда была пара снапшотов вокруг этого момента.
+     Раньше здесь стояла константа 90 мс и интерполяция шла по времени прихода
+     пакетов — то есть сетевой джиттер попадал прямо в анимацию. */
+  SIMDT: 1000 / 60,
+  DELAY_MIN: 8, DELAY_MAX: 260, DELAY_MARGIN: 6,
+  AHEAD_CAP: 0.07,        // на сколько секунд вперёд можно продлевать своего бойца
+  GRAV: 2100,             // C.GRAVITY, для продления полёта
+  selfAhead: true,        // рисовать своего бойца по свежему снапшоту, а не из буфера
+  delay: 90, lead: 0, _leadTarget: 0, _leadOk: false,
+  _win: [], _lastSim: -1, _starved: false,
+  _frames: 0, _starvedN: 0,   // счётчики для замеров: доля кадров без свежих данных
 
   // качество: 2 — высокое, 1 — среднее, 0 — низкое
   qmode: 'auto', level: 2, rscale: 1,
@@ -66,6 +82,7 @@ const Render = {
     this.buf = []; this.parts = []; this.beams = []; this.shake = 0;
     this._arenaLayer = null;
     this._bg = null;
+    this.resetClock();
   },
 
   w2s(x, y) { return { x: (x - this.WCX) * this.S + this.CW / 2, y: (y - this.WCY) * this.S + this.CH / 2 }; },
@@ -74,11 +91,65 @@ const Render = {
   },
 
   push(snap) {
-    snap._ct = performance.now();
+    const now = performance.now();
+    snap._ct = now;
+    const sim = snap.f * this.SIMDT;
+    snap._st = sim;
+    if (sim < this._lastSim - 500) this.resetClock();   // новый матч — кадры с нуля
+    const gap = this._lastSim >= 0 ? Math.max(this.SIMDT, sim - this._lastSim) : this.SIMDT * 2;
+    this._lastSim = sim;
+    this._win.push(now - sim, gap, now);
+    while (this._win.length > 9 && now - this._win[2] > 2500) this._win.splice(0, 3);
+    this._retime();
     this.buf.push(snap);
     if (this.buf.length > 24) this.buf.shift();
     this.shake = Math.max(this.shake, snap.sk || 0);
     (snap.e || []).forEach(e => this.onEvent(e, snap));
+  },
+
+  resetClock() {
+    this._win.length = 0;
+    this._lastSim = -1;
+    this._leadOk = false;
+    this._selfSrc = null;
+    this._errX = 0; this._errY = 0;
+  },
+
+  /* Пересчёт буфера по окну последних приходов.
+     Чтобы под момент отрисовки всегда была пара снапшотов, буфер должен
+     покрывать самый большой разрыв между ними плюс разброс доставки. */
+  _jit: [],
+  _retime() {
+    const w = this._win;
+    let off = Infinity, gap = 0;
+    for (let i = 0; i < w.length; i += 3) {
+      if (w[i] < off) off = w[i];
+      if (w[i + 1] > gap) gap = w[i + 1];
+    }
+    // разброс берём по 95-му перцентилю, а не по максимуму: одна опоздавшая
+    // посылка не должна на две секунды раздувать буфер всем остальным.
+    // Если всё же не хватит — сработает голодание и lead быстро подрастёт.
+    const j = this._jit;
+    j.length = 0;
+    for (let i = 0; i < w.length; i += 3) j.push(w[i] - off);
+    j.sort((x, y) => x - y);
+    const jit = j.length ? j[Math.min(j.length - 1, Math.floor(j.length * 0.95))] : 0;
+    this._jitMs = jit;
+    this.delay = Math.max(this.DELAY_MIN,
+                          Math.min(this.DELAY_MAX, gap + jit + this.DELAY_MARGIN));
+    this._leadTarget = off + this.delay;
+    if (!this._leadOk) { this.lead = this._leadTarget; this._leadOk = true; }
+  },
+
+  /* Двигаем lead к цели ограниченной скоростью: скачок буфера — это скачок
+     картинки. Вверх идём быстро (не хватает данных — мир замирает),
+     вниз медленно (лишний запас никому не мешает). */
+  _stepLead(dt) {
+    const diff = this._leadTarget - this.lead;
+    if (!diff) return;
+    const rate = diff > 0 ? (this._starved ? 0.6 : 0.25) : 0.05;
+    const step = rate * dt * 1000;
+    this.lead += Math.abs(diff) <= step ? diff : (diff > 0 ? step : -step);
   },
 
   latest() { return this.buf.length ? this.buf[this.buf.length - 1] : null; },
@@ -91,30 +162,120 @@ const Render = {
     return this._view;
   },
 
+  _vp: [], _vo: [], _vpp: [], _vop: [], _v0: { s: null, p: null, o: null }, _empty: [],
+
   _interp() {
     const n = this.buf.length;
     if (!n) return null;
-    const rt = performance.now() - this.DELAY;
-    let a = this.buf[n - 1], b = null;
+    const rt = performance.now() - this.lead;
+    let a = null, b = null;
     for (let i = n - 1; i > 0; i--) {
-      if (this.buf[i - 1]._ct <= rt && this.buf[i]._ct >= rt) { a = this.buf[i - 1]; b = this.buf[i]; break; }
+      if (this.buf[i - 1]._st <= rt && this.buf[i]._st >= rt) { a = this.buf[i - 1]; b = this.buf[i]; break; }
     }
-    if (!b) return { s: a, p: a.p, o: a.o };
-    const k = Math.max(0, Math.min(1, (rt - a._ct) / Math.max(1, b._ct - a._ct)));
-    const pa = {};
-    a.p.forEach(x => pa[x.i] = x);
-    const p = b.p.map(y => {
-      const x = pa[y.i];
-      if (!x) return y;
-      return Object.assign({}, y, { x: x.x + (y.x - x.x) * k, y: x.y + (y.y - x.y) * k });
-    });
-    const oa = {};
-    (a.o || []).forEach(x => oa[x.i] = x);
-    const o = (b.o || []).map(y => {
-      const x = oa[y.i];
-      return x ? Object.assign({}, y, { x: x.x + (y.x - x.x) * k, y: x.y + (y.y - x.y) * k }) : y;
-    });
-    return { s: b, p, o };
+    this._frames++;
+    const v = this._v0;
+    if (!b) {
+      const last = this.buf[n - 1];
+      this._starved = rt > last._st;
+      if (this._starved) this._starvedN++;
+      const src = this._starved ? last : this.buf[0];
+      // и здесь отдаём свои массивы, а не массивы снапшота: в них потом
+      // подменяется свой боец, а снапшот должен остаться нетронутым
+      v.s = src;
+      v.p = this._blend(this._vp, this._vpp, null, src.p, 0);
+      v.o = this._blend(this._vo, this._vop, null, src.o, 0);
+      return v;
+    }
+    this._starved = false;
+    const k = Math.max(0, Math.min(1, (rt - a._st) / Math.max(1, b._st - a._st)));
+    v.s = b;
+    v.p = this._blend(this._vp, this._vpp, a.p, b.p, k);
+    v.o = this._blend(this._vo, this._vop, a.o, b.o, k);
+    return v;
+  },
+
+  /* Смешивание двух кадров с переиспользованием объектов: раньше здесь каждый
+     кадр рождалось по объекту на бойца и снаряд плюс два словаря, и сборщик
+     мусора время от времени дёргал картинку. */
+  _blend(out, pool, ap, bp, k) {
+    out.length = 0;
+    if (!bp) return out;
+    for (let i = 0; i < bp.length; i++) {
+      const y = bp[i];
+      let x = null;
+      if (ap) {
+        for (let j = 0; j < ap.length; j++) if (ap[j].i === y.i) { x = ap[j]; break; }
+      }
+      if (!x) { out.push(y); continue; }
+      let d = pool[i];
+      if (!d) d = pool[i] = {};
+      for (const key in y) d[key] = y[key];
+      d.x = x.x + (y.x - x.x) * k;
+      d.y = x.y + (y.y - x.y) * k;
+      out.push(d);
+    }
+    return out;
+  },
+
+  /* ---------- свой боец без буфера ----------
+     Остальных рисуем из буфера — про чужие намерения гадать нельзя. А своего
+     можно вести по самому свежему снапшоту, продлевая последнюю известную
+     скорость на время доставки: это снимает буфер из задержки собственного
+     движения, но оставляет сервер единственным, кто решает, где мы на самом
+     деле. Расхождение между продлением и правдой гасим за ~70 мс, чтобы
+     коррекция не выглядела рывком. */
+  _ex1: { x: 0, y: 0 }, _ex2: { x: 0, y: 0 },
+  _selfSrc: null, _selfSt: 0, _errX: 0, _errY: 0,
+
+  _extrap(p, st, nowSim, o) {
+    let t = (nowSim - st) / 1000;
+    if (!(t > 0)) t = 0;
+    else if (t > this.AHEAD_CAP) t = this.AHEAD_CAP;
+    o.x = p.x + p.vx * t;
+    o.y = p.y + p.vy * t;
+    if (!p.g) o.y += 0.5 * this.GRAV * t * t;
+    return o;
+  },
+
+  _selfAhead(v, dt) {
+    if (!this.selfAhead || this.myPid === null || !v) return;
+    const last = this.buf[this.buf.length - 1];
+    if (!last) return;
+    let src = null;
+    for (let i = 0; i < last.p.length; i++) {
+      if (last.p[i].i === this.myPid) { src = last.p[i]; break; }
+    }
+    if (!src || !src.al) { this._selfSrc = null; return; }
+    let idx = -1;
+    for (let i = 0; i < v.p.length; i++) if (v.p[i].i === this.myPid) { idx = i; break; }
+    if (idx < 0) return;
+
+    const nowSim = performance.now() - (this.lead - this.delay);
+    const nt = this._extrap(src, last._st, nowSim, this._ex1);
+    if (this._selfSrc && this._selfSrc !== src) {
+      // сменился источник правды: копим разрыв, чтобы картинка не прыгнула
+      const ot = this._extrap(this._selfSrc, this._selfSt, nowSim, this._ex2);
+      this._errX += ot.x - nt.x;
+      this._errY += ot.y - nt.y;
+    }
+    this._selfSrc = src;
+    this._selfSt = last._st;
+    // респаун, телепорт, вылет за карту — это не невязка, это новая правда
+    if (Math.abs(this._errX) > 150 || Math.abs(this._errY) > 150) { this._errX = 0; this._errY = 0; }
+    const kd = Math.exp(-dt / 0.07);
+    this._errX *= kd;
+    this._errY *= kd;
+    // Насколько доверять продлению. Чем неровнее приходят пакеты, тем хуже мы
+    // знаем, к какому моменту относится последний снапшот, и тем сильнее
+    // продление дрожит. На ровной сети идём вперёд целиком, на рваной
+    // сползаем обратно к буферной картинке — там всё равно нечего угадывать.
+    const k = Math.max(0.25, Math.min(1, 1 - this._jitMs / 60));
+    const cur = v.p[idx];
+    const d = this._selfObj || (this._selfObj = {});
+    for (const key in cur) d[key] = cur[key];
+    d.x = cur.x + (nt.x + this._errX - cur.x) * k;
+    d.y = cur.y + (nt.y + this._errY - cur.y) * k;
+    v.p[idx] = d;
   },
 
   /* ---------- частицы ---------- */
@@ -291,7 +452,9 @@ const Render = {
     this.t += dt;
     this.autoQuality(dt);
     this.step(dt);
+    this._stepLead(dt);
     const v = this.view();
+    this._selfAhead(v, dt);
     const q = this.rscale;
 
     if (!this._bg) this.buildBg();

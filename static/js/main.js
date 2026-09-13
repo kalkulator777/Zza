@@ -19,6 +19,7 @@ document.getElementById('nick').addEventListener('change', () => {
 });
 
 Input.bind(cv);
+Input.net = NET;   // чтобы нажатие могло уйти прямо из обработчика события
 
 NET.on('welcome', m => {
   MYPID = m.pid;
@@ -235,14 +236,19 @@ function loop(now) {
       const me = v.p.find(p => p.i === MYPID);
       if (me) Input.updateAim(me.x, me.y);
     }
+    // Нажатия уходят сразу из обработчиков (Input.kick), здесь остаётся
+    // равномерная досылка прицела. Накопитель теперь не обнуляется, а
+    // уменьшается на шаг: со сбросом в ноль кадр с dt чуть меньше 1/60
+    // пропускал отправку, и ввод шёл рывками по 40 Гц вместо 60.
     acc += dt;
-    if (acc >= 1 / 60) { acc = 0; Input.flush(NET); }
+    if (acc >= 1 / 60) { acc -= 1 / 60; Input.flush(NET); }
+    if (acc > 0.1) acc = 0.1;
     Render.frame(dt);
     netT += dt;
     if (netT > 0.4) {
       netT = 0;
       document.getElementById('net').textContent =
-        `${NET.ping} ms · ${Math.round(Render.fps)} fps ${QNAME[Render.level]}`;
+        `${NET.ping} ms · ${Math.round(Render.fps)} fps ${QNAME[Render.level]} · буфер ${Math.round(Render.delay)} мс`;
     }
   }
   requestAnimationFrame(loop);

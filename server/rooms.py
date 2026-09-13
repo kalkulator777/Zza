@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Комнаты: лобби, подбор героев, игровой цикл."""
 
+import json
 import os
 import random
 import string
@@ -67,8 +68,7 @@ class Room:
         self.world = None
         self.bots = {}
         self.loop = None
-        self._tick_acc = 0.0
-        self._last = 0.0
+        self._next = 0.0
         self._snap_c = 0
         self._probe_dq = None
         self._probe_t0 = 0.0
@@ -118,9 +118,12 @@ class Room:
             p.conn.send(msg)
 
     def broadcast(self, msg, skip=None):
+        # один json.dumps на всех, а не на каждого: снапшот уходит 30-60 раз
+        # в секунду сразу четверым, и сериализовать его четырежды незачем
+        raw = json.dumps(msg, ensure_ascii=False)
         for p in list(self.players.values()):
             if p.conn and p.pid != skip:
-                p.conn.send(msg)
+                p.conn.send_raw(raw)
 
     def push_lobby(self):
         self.broadcast(self.lobby_state())
@@ -344,9 +347,8 @@ class Room:
 
     def start_loop(self):
         self.stop_loop()
-        self._last = time.perf_counter()
-        self._tick_acc = 0.0
-        self.loop = IOLoop.current().add_timeout(time.time() + C.DT, self._tick)
+        self._next = IOLoop.current().time() + C.DT
+        self.loop = IOLoop.current().add_timeout(self._next, self._tick)
 
     def stop_loop(self):
         if self.loop is not None:
@@ -357,24 +359,32 @@ class Room:
             self.loop = None
 
     def _tick(self):
+        """Тик по абсолютной сетке времени.
+
+        Раньше здесь был будильник на 0.85*DT с накопителем: он просыпался
+        чаще, чем нужно, и делал шаг, только когда накопитель дорастал до DT.
+        Сетка от этого плыла — соседние тики отстояли то на 14, то на 28 мс,
+        и снапшоты уходили рывками (медиана 31 мс, p90 46 мс на лупбэке).
+        Клиенту приходилось держать буфер под худший разрыв. Теперь у каждого
+        тика есть свой момент в будущем, и мы просто не даём ему уехать.
+        """
         if self.state != "match" or self.world is None:
             self.loop = None
             return
-        now = time.perf_counter()
-        dt = min(0.25, now - self._last)
-        self._last = now
-        self._tick_acc += dt
+        io = IOLoop.current()
+        now = io.time()
         steps = 0
-        while self._tick_acc >= C.DT and steps < 6:
-            self._tick_acc -= C.DT
+        while now >= self._next and steps < 6:
+            self._next += C.DT
             steps += 1
             self._step_once()
             if self.state != "match":
-                break
-        if self.state == "match":
-            self.loop = IOLoop.current().add_timeout(time.time() + C.DT * 0.85, self._tick)
-        else:
-            self.loop = None
+                self.loop = None
+                return
+        if now >= self._next:
+            # отстали безнадёжно (машина висела) — не догоняем, переставляем сетку
+            self._next = now + C.DT
+        self.loop = io.add_timeout(self._next, self._tick)
 
     def _step_once(self):
         w = self.world

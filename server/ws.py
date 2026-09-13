@@ -26,8 +26,12 @@ class GameSocket(WebSocketHandler):
         self.send({"t": "welcome", "pid": self.pid, **self.mgr.catalog()})
 
     def send(self, msg):
+        self.send_raw(json.dumps(msg, ensure_ascii=False))
+
+    def send_raw(self, raw):
+        """Уже сериализованный JSON: широковещательные сообщения готовятся один раз."""
         try:
-            self.write_message(json.dumps(msg, ensure_ascii=False))
+            self.write_message(raw)
         except Exception:
             pass
 

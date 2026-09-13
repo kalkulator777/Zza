@@ -4,6 +4,16 @@ const BIT = { LEFT: 1, RIGHT: 2, JUMP: 4, DOWN: 8, BASIC: 16, Q: 32, E: 64, R: 1
 const Input = {
   held: 0, pressed: 0, sentHeld: -1, aim: { x: 1, y: 0 },
   mouse: { x: 0, y: 0 }, enabled: false, canvas: null,
+  net: null,
+
+  /* Нажатие уходит на сервер сразу, не дожидаясь кадра.
+     Раньше ввод копился до rAF-цикла и терял на этом 10-12 мс в среднем —
+     а при неудачном совпадении дробей и все 33: цикл сравнивал накопитель
+     с 1/60 и при dt чуть меньше кадра пропускал отправку. Прицел по-прежнему
+     шлётся из кадра: он непрерывный, и лишние 16 мс на нём не видны. */
+  kick() {
+    if (this.enabled && this.net) this.flush(this.net);
+  },
 
   bind(canvas) {
     this.canvas = canvas;
@@ -28,12 +38,16 @@ const Input = {
       e.preventDefault();
       if (!(this.held & b)) this.pressed |= b;
       this.held |= b;
+      this.kick();
     });
     addEventListener('keyup', e => {
       const b = map(e); if (!b) return;
-      e.preventDefault(); this.held &= ~b;
+      e.preventDefault();
+      if (!(this.held & b)) return;
+      this.held &= ~b;
+      this.kick();
     });
-    addEventListener('blur', () => { this.held = 0; });
+    addEventListener('blur', () => { this.held = 0; this.kick(); });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
     canvas.addEventListener('mousedown', e => {
       if (!this.enabled) return;
@@ -42,10 +56,13 @@ const Input = {
       if (!b) return;
       if (!(this.held & b)) this.pressed |= b;
       this.held |= b;
+      this.kick();
     });
     addEventListener('mouseup', e => {
       const b = e.button === 0 ? BIT.BASIC : (e.button === 2 ? BIT.Q : 0);
-      if (b) this.held &= ~b;
+      if (!b || !(this.held & b)) return;
+      this.held &= ~b;
+      this.kick();
     });
     canvas.addEventListener('mousemove', e => {
       const r = canvas.getBoundingClientRect();
@@ -66,6 +83,7 @@ const Input = {
 
   flush(net) {
     if (!this.enabled) return;
+    this.net = net;
     const p = this.pressed; this.pressed = 0;
     net.send({ t: 'i', k: this.held, p, ax: +this.aim.x.toFixed(3), ay: +this.aim.y.toFixed(3) });
   }
