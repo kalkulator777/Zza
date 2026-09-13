@@ -120,6 +120,17 @@ document.getElementById('btn-heroes').onclick = () => UI.heroModal(CAT);
 const qsel = document.getElementById('m-quality');
 qsel.value = localStorage.getItem('zza.q') || 'auto';
 qsel.onchange = () => Render.setQuality(qsel.value);
+
+/* Свой боец рисуется по свежему снапшоту, остальные — из буфера интерполяции.
+   Это отзывчивее, но своё положение и положение соперника на экране
+   разъезжаются на величину буфера. Кому мешает — возвращает как было. */
+const asel = document.getElementById('m-selfahead');
+asel.value = localStorage.getItem('zza.selfahead') || '1';
+Render.selfAhead = asel.value === '1';
+asel.onchange = () => {
+  localStorage.setItem('zza.selfahead', asel.value);
+  Render.selfAhead = asel.value === '1';
+};
 document.querySelector('.modal-x').onclick = () => UI.closeModal();
 document.getElementById('modal').addEventListener('click', e => {
   if (e.target.id === 'modal') UI.closeModal();
