@@ -17,7 +17,7 @@ from .game.world import World
 
 # Замер сквозной задержки: с ZZA_PROBE=1 сервер вкладывает в снапшот два числа —
 # сколько ввод пролежал в очереди до тика и сколько тик ждал отправки снапшота.
-# Нужно только для tools/latency.py, в обычной игре выключено.
+# Нужно только для tools/measure.py latency, в обычной игре выключено.
 PROBE = os.environ.get("ZZA_PROBE") == "1"
 
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"

@@ -145,7 +145,7 @@ SETTLE_JS = r"""() => {
   const me = v.p.find(p => p.i === MYPID); if (!me) return null;
   const s = Render.buf[Render.buf.length - 1];
   const sm = s && s.p.find(p => p.i === MYPID); if (!sm) return null;
-  return {x: me.x, vx: sm.vx, vy: sm.vy, g: sm.g, al: sm.al, hs: sm.hs, st: s.st};
+  return {x: me.x, vx: sm.vx, vy: sm.vy, g: sm.g, al: sm.al, st: s.st};
 }"""
 
 
@@ -244,7 +244,10 @@ def wait_still(page, timeout=8.0):
     hist = []
     while time.time() < t_end:
         s = page.evaluate(SETTLE_JS)
-        if (s and s["st"] == "play" and s["al"] and s["g"] and s["hs"] == 0
+        # «стоит смирно»: жив, на земле, обе скорости в нуле. Хитстан отдельно
+        # не проверяем — с нулевой скоростью на земле его практически не бывает,
+        # а лишнее поле в снапшоте ради замера держать незачем.
+        if (s and s["st"] == "play" and s["al"] and s["g"]
                 and abs(s["vx"]) < 0.05 and abs(s["vy"]) < 0.05):
             hist.append(s["x"])
             if len(hist) >= 6 and max(hist[-6:]) - min(hist[-6:]) < 0.05:

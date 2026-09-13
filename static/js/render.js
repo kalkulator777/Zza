@@ -165,7 +165,7 @@ const Render = {
     return this._view;
   },
 
-  _vp: [], _vo: [], _vpp: [], _vop: [], _v0: { s: null, p: null, o: null }, _empty: [],
+  _vp: [], _vo: [], _vpp: [], _vop: [], _v0: { s: null, p: null, o: null },
 
   _interp() {
     const n = this.buf.length;

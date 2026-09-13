@@ -2,7 +2,7 @@
 const BIT = { LEFT: 1, RIGHT: 2, JUMP: 4, DOWN: 8, BASIC: 16, Q: 32, E: 64, R: 128, DASH: 256 };
 
 const Input = {
-  held: 0, pressed: 0, sentHeld: -1, aim: { x: 1, y: 0 },
+  held: 0, pressed: 0, aim: { x: 1, y: 0 },
   mouse: { x: 0, y: 0 }, enabled: false, canvas: null,
   net: null,
 
@@ -36,7 +36,8 @@ const Input = {
       const b = map(e);
       if (!b) return;
       e.preventDefault();
-      if (!(this.held & b)) this.pressed |= b;
+      if (this.held & b) return;   // автоповтор ОС: нового тут нет, слать нечего
+      this.pressed |= b;
       this.held |= b;
       this.kick();
     });
@@ -47,7 +48,7 @@ const Input = {
       this.held &= ~b;
       this.kick();
     });
-    addEventListener('blur', () => { this.held = 0; this.kick(); });
+    addEventListener('blur', () => { if (this.held) { this.held = 0; this.kick(); } });
     canvas.addEventListener('contextmenu', e => e.preventDefault());
     canvas.addEventListener('mousedown', e => {
       if (!this.enabled) return;
