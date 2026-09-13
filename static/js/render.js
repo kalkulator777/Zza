@@ -32,6 +32,7 @@ const Render = {
   qmode: 'auto', level: 2, rscale: 1,
   PART_CAP: [140, 260, 600],
   _bg: null, _arenaLayer: null,
+  _hudCards: {}, _hudBar: null, _hudBarKey: '', _hudTime: null, _hudTimeKey: '',
   _view: null, _viewT: -1,
   fps: 60, _autoT: 0, _autoStep: 0,
 
@@ -62,6 +63,7 @@ const Render = {
     }
     this._bg = null;
     this._arenaLayer = null;
+    this.dropHudLayers();
   },
 
   /* Авто-режим: если машина не тянет, тихо снижаем качество. Обратно не
@@ -82,6 +84,7 @@ const Render = {
     this.buf = []; this.parts = []; this.beams = []; this.shake = 0;
     this._arenaLayer = null;
     this._bg = null;
+    this.dropHudLayers();
     this.resetClock();
   },
 
@@ -430,6 +433,84 @@ const Render = {
     this._bg = cv;
   },
 
+  /* Пустой слой в логических координатах: пиксели заводим под текущее
+     внутреннее разрешение, а рисуем и ставим слой в тех же единицах, что и
+     всё остальное. Нужен для кусков HUD, которые сами по себе не меняются. */
+  _layer(w, h) {
+    const q = this.rscale;
+    const cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(w * q));
+    cv.height = Math.max(1, Math.round(h * q));
+    cv.getContext('2d').scale(q, q);
+    return cv;
+  },
+
+  dropHudLayers() {
+    this._hudCards = {};
+    this._hudBar = null; this._hudBarKey = '';
+    this._hudTime = null; this._hudTimeKey = '';
+    this._sprites = {};
+    this._labels = {};
+  },
+
+  /* Тело бойца: тень, корпус, обводка, затемнение низа, забрало и значок
+     героя. Всё это зависит только от героя, команды и того, куда он смотрит,
+     а рисовалось заново каждый кадр для каждого бойца — пять заливок по
+     контуру плюс векторный значок. Держим по спрайту на каждый разворот.
+     Прозрачность неуязвимости накладывается при отрисовке, поэтому тень
+     печём с её собственными 0.3, а корпус — непрозрачным. */
+  FS_W: 52, FS_H: 90, FS_OX: 26, FS_OY: 38,
+
+  fighterSprite(info, hero, tc, face) {
+    const key = info.hero + '|' + (info.team || 0) + '|' + face + '|' + this.rscale;
+    const got = this._sprites[key];
+    if (got) return got;
+    const W = 44, H = 72;
+    const cv = this._layer(this.FS_W, this.FS_H);
+    const c = cv.getContext('2d');
+    const x = this.FS_OX, y = this.FS_OY;
+    const col = hero.color || '#fff';
+
+    c.globalAlpha = .3;
+    c.fillStyle = '#000';
+    c.beginPath(); c.ellipse(x, y + H / 2 + 4, W * .5, 6, 0, 0, 6.283); c.fill();
+    c.globalAlpha = 1;
+
+    c.fillStyle = col;
+    this.rr(c, x - W / 2, y - H / 2, W, H, 11); c.fill();
+    c.strokeStyle = tc; c.lineWidth = 3; c.stroke();
+    c.fillStyle = 'rgba(0,0,0,.26)';
+    this.rr(c, x - W / 2 + 3, y + 6, W - 6, H / 2 - 9, 7); c.fill();
+
+    c.fillStyle = 'rgba(10,12,20,.85)';
+    this.rr(c, x - W / 2 + (face > 0 ? 14 : 4), y - H / 2 + 10, 26, 12, 5); c.fill();
+    c.fillStyle = tc;
+    c.fillRect(x + (face > 0 ? 14 : -16), y - H / 2 + 13, 5, 6);
+
+    const gl = GLYPH[info.hero] || glyphFallback(info.hero);
+    gl(c, x, y + 10, 30, 'rgba(12,14,22,.9)');
+    this._sprites[key] = cv;
+    return cv;
+  },
+
+  /* Имя над головой тоже не меняется весь матч, а стоило смены шрифта и
+     раскладки текста на каждого бойца в каждом кадре. */
+  LB_W: 220, LB_H: 26, LB_BASE: 19,
+
+  nameLabel(info, me) {
+    const key = (info.name || '') + '|' + (me ? 1 : 0) + '|' + this.rscale;
+    const got = this._labels[key];
+    if (got) return got;
+    const cv = this._layer(this.LB_W, this.LB_H);
+    const c = cv.getContext('2d');
+    c.textAlign = 'center';
+    c.font = '600 16px "Segoe UI",sans-serif';
+    c.fillStyle = me ? '#fff' : 'rgba(220,228,245,.85)';
+    c.fillText(info.name || '', this.LB_W / 2, this.LB_BASE);
+    this._labels[key] = cv;
+    return cv;
+  },
+
   buildArenaLayer() {
     const q = this.rscale;
     const cv = document.createElement('canvas');
@@ -688,26 +769,11 @@ const Render = {
     const me = p.i === this.myPid;
     const alpha = p.iv ? .45 + .35 * Math.sin(this.t * 26) : 1;
 
-    c.globalAlpha = .3 * alpha;
-    c.fillStyle = '#000';
-    c.beginPath(); c.ellipse(x, y + H / 2 + 4, W * .5, 6, 0, 0, 6.283); c.fill();
-
-    c.globalAlpha = alpha;
-    c.fillStyle = col;
-    this.rr(c, x - W / 2, y - H / 2, W, H, 11); c.fill();
-    c.strokeStyle = tc; c.lineWidth = 3; c.stroke();
-    // затемнение низа вместо градиента — заметно дешевле, выглядит так же
-    c.fillStyle = 'rgba(0,0,0,.26)';
-    this.rr(c, x - W / 2 + 3, y + 6, W - 6, H / 2 - 9, 7); c.fill();
-
-    c.fillStyle = 'rgba(10,12,20,.85)';
-    this.rr(c, x - W / 2 + (p.f > 0 ? 14 : 4), y - H / 2 + 10, 26, 12, 5); c.fill();
-    c.fillStyle = tc;
-    c.fillRect(x + (p.f > 0 ? 14 : -16), y - H / 2 + 13, 5, 6);
-
-    const gl = GLYPH[info.hero] || glyphFallback(info.hero);
-    gl(c, x, y + 10, 30, 'rgba(12,14,22,.9)');
-    c.globalAlpha = 1;
+    // тень, корпус, забрало и значок — одним готовым спрайтом
+    if (alpha !== 1) c.globalAlpha = alpha;
+    c.drawImage(this.fighterSprite(info, hero, tc, p.f > 0 ? 1 : -1),
+                x - this.FS_OX, y - this.FS_OY, this.FS_W, this.FS_H);
+    if (alpha !== 1) c.globalAlpha = 1;
 
     if (p.sh > 0) {
       c.strokeStyle = 'rgba(140,215,255,.9)'; c.lineWidth = 3;
@@ -759,10 +825,8 @@ const Render = {
       }
     }
 
-    c.textAlign = 'center';
-    c.font = '600 16px "Segoe UI",sans-serif';
-    c.fillStyle = me ? '#fff' : 'rgba(220,228,245,.85)';
-    c.fillText(info.name || '', x, y - H / 2 - 18);
+    c.drawImage(this.nameLabel(info, me), x - this.LB_W / 2,
+                y - H / 2 - 18 - this.LB_BASE, this.LB_W, this.LB_H);
     const bw = 66, hpk = Math.max(0, p.hp / (hero.hp || 100));
     c.fillStyle = 'rgba(0,0,0,.6)';
     c.fillRect(x - bw / 2, y - H / 2 - 13, bw, 6);
@@ -850,12 +914,9 @@ const Render = {
     byTeam[0].forEach((p, i) => this.card(c, 22, 22 + i * 66, p, 1));
     byTeam[1].forEach((p, i) => this.card(c, this.CW - 22 - 320, 22 + i * 66, p, -1));
 
-    c.textAlign = 'center';
-    c.font = '700 22px "Segoe UI",sans-serif';
-    c.fillStyle = 'rgba(230,235,245,.8)';
     const tl = Math.max(0, s.tl || 0);
-    c.fillText(`${String(Math.floor(tl / 60)).padStart(2, '0')}:${String(Math.floor(tl % 60)).padStart(2, '0')}`,
-               this.CW / 2, 40);
+    const txt = `${String(Math.floor(tl / 60)).padStart(2, '0')}:${String(Math.floor(tl % 60)).padStart(2, '0')}`;
+    c.drawImage(this.timeLayer(txt), this.CW / 2 - 50, 16, 100, 32);
 
     const mine = v.p.find(p => p.i === this.myPid);
     if (mine) {
@@ -864,37 +925,73 @@ const Render = {
     }
   },
 
+  /* Секундомер меняется раз в секунду — незачем набирать текст каждый кадр. */
+  timeLayer(txt) {
+    const key = txt + '|' + this.rscale;
+    if (this._hudTime && this._hudTimeKey === key) return this._hudTime;
+    const cv = this._layer(100, 32);
+    const c = cv.getContext('2d');
+    c.textAlign = 'center';
+    c.font = '700 22px "Segoe UI",sans-serif';
+    c.fillStyle = 'rgba(230,235,245,.8)';
+    c.fillText(txt, 50, 24);
+    this._hudTime = cv;
+    this._hudTimeKey = key;
+    return cv;
+  },
+
+  /* Подложка карточки: рамка, значок героя и имя. Всё это не меняется весь
+     матч, а стоило дорого — векторный значок и две смены шрифта на карточку
+     каждый кадр. Теперь это один drawImage. */
+  cardBase(p, dir) {
+    const info = this.players[p.i] || {};
+    const hero = this.heroes[info.hero] || {};
+    // запасные жизни меняются несколько раз за матч — их тоже можно запечь,
+    // просто добавив в ключ
+    const key = [info.hero, info.name, info.team, info.bot ? 1 : 0, dir, p.st, this.rscale].join('|');
+    const e = this._hudCards[p.i];
+    if (e && e.key === key) return e.cv;
+    const tc = TEAM_COL[info.team || 0];
+    const cv = this._layer(320, 56);
+    const c = cv.getContext('2d');
+    c.fillStyle = 'rgba(10,13,22,.62)';
+    this.rr(c, 0, 0, 320, 56, 10); c.fill();
+    c.strokeStyle = hexA(tc, .5); c.lineWidth = 1.5; c.stroke();
+    const gl = GLYPH[info.hero] || glyphFallback(info.hero);
+    gl(c, dir > 0 ? 30 : 290, 28, 30, hero.color || '#fff');
+    c.textAlign = 'left';
+    c.font = '600 14px "Segoe UI",sans-serif';
+    c.fillStyle = '#dfe6f5';
+    c.fillText((info.name || '') + (info.bot ? ' ·бот' : ''), dir > 0 ? 56 : 22, 17);
+    const bx = dir > 0 ? 56 : 22, w = 210;
+    c.fillStyle = 'rgba(0,0,0,.55)'; this.rr(c, bx, 24, w, 11, 5); c.fill();
+    c.fillRect(bx, 38, w, 5);
+    c.fillStyle = tc;
+    for (let i = 0; i < p.st; i++) {
+      c.beginPath(); c.arc(bx + w + 14 + i * 13, 29, 4.5, 0, 6.283); c.fill();
+    }
+    this._hudCards[p.i] = { key, cv };
+    return cv;
+  },
+
   card(c, x, y, p, dir) {
     const info = this.players[p.i] || {};
     const hero = this.heroes[info.hero] || {};
     const tc = TEAM_COL[info.team || 0];
-    c.fillStyle = 'rgba(10,13,22,.62)';
-    this.rr(c, x, y, 320, 56, 10); c.fill();
-    c.strokeStyle = hexA(tc, .5); c.lineWidth = 1.5; c.stroke();
-    const gl = GLYPH[info.hero] || glyphFallback(info.hero);
-    gl(c, dir > 0 ? x + 30 : x + 290, y + 28, 30, hero.color || '#fff');
+    c.drawImage(this.cardBase(p, dir), x, y, 320, 56);
     const bx = dir > 0 ? x + 56 : x + 22;
-    c.textAlign = 'left';
-    c.font = '600 14px "Segoe UI",sans-serif';
-    c.fillStyle = '#dfe6f5';
-    c.fillText((info.name || '') + (info.bot ? ' ·бот' : ''), bx, y + 17);
     const w = 210, hpk = Math.max(0, p.hp / (hero.hp || 100));
-    c.fillStyle = 'rgba(0,0,0,.55)'; this.rr(c, bx, y + 24, w, 11, 5); c.fill();
     c.fillStyle = hpk > .35 ? tc : '#ff4d6d'; this.rr(c, bx, y + 24, w * hpk, 11, 5); c.fill();
     if (p.sh > 0) {
       c.fillStyle = 'rgba(200,240,255,.95)';
       this.rr(c, bx, y + 24, w * Math.min(1, p.sh / 40), 11, 5); c.fill();
     }
+    c.textAlign = 'left';
     c.font = '700 11px "Segoe UI",sans-serif';
     c.fillStyle = 'rgba(255,255,255,.85)';
     c.fillText(Math.ceil(p.hp) + (p.sh > 0 ? ' +' + Math.ceil(p.sh) : ''), bx + 4, y + 33);
-    c.fillStyle = 'rgba(0,0,0,.55)'; c.fillRect(bx, y + 38, w, 5);
     c.fillStyle = p.u >= 100 ? '#ffd166' : '#8ab4ff';
     c.fillRect(bx, y + 38, w * Math.min(1, p.u / 100), 5);
-    c.fillStyle = tc;
-    for (let i = 0; i < p.st; i++) {
-      c.beginPath(); c.arc(bx + w + 14 + i * 13, y + 29, 4.5, 0, 6.283); c.fill();
-    }
     if (!p.al) {
       c.fillStyle = 'rgba(0,0,0,.55)';
       this.rr(c, x, y, 320, 56, 10); c.fill();
@@ -905,29 +1002,70 @@ const Render = {
     }
   },
 
+  /* Панель способностей: рамки, значки и подписи клавиш. Меняется только
+     когда способность становится готова или наоборот — то есть несколько раз
+     за бой, а не шестьдесят раз в секунду. Заливки отката и цифры остаются
+     динамическими и рисуются поверх. */
+  SB_KEYS: ['basic', 'q', 'e', 'r'],
+  SB_W: 74, SB_GAP: 10,
+
+  selfBarBase(hero, ready) {
+    const bw = this.SB_W, gap = this.SB_GAP;
+    const key = (hero.id || '') + '|' + ready.join('') + '|' + this.rscale;
+    if (this._hudBar && this._hudBarKey === key) return this._hudBar;
+    const cv = this._layer(5 * bw + 4 * gap, bw);
+    const c = cv.getContext('2d');
+    let x = 0;
+    for (let i = 0; i < 4; i++) {
+      const k = this.SB_KEYS[i];
+      c.fillStyle = 'rgba(10,13,22,.72)';
+      this.rr(c, x, 0, bw, bw, 12); c.fill();
+      c.strokeStyle = ready[i] ? (hero.color || '#fff') : 'rgba(120,130,155,.5)';
+      c.lineWidth = ready[i] ? 2.5 : 1.5;
+      c.stroke();
+      c.globalAlpha = ready[i] ? 1 : .35;
+      ABICON[k](c, x + bw / 2, bw / 2 - 4, 32, hero.color || '#fff');
+      c.globalAlpha = 1;
+      c.fillStyle = 'rgba(230,236,250,.9)';
+      c.textAlign = 'center';
+      c.font = '700 11px "Segoe UI",sans-serif';
+      c.fillText(KEYLABEL[k], x + bw / 2, bw - 6);
+      x += bw + gap;
+    }
+    c.fillStyle = 'rgba(10,13,22,.72)';
+    this.rr(c, x, 0, bw, bw, 12); c.fill();
+    c.strokeStyle = ready[4] ? '#9fd8ff' : 'rgba(120,130,155,.5)';
+    c.lineWidth = ready[4] ? 2.5 : 1.5;
+    c.stroke();
+    c.fillStyle = ready[4] ? '#9fd8ff' : 'rgba(150,160,185,.5)';
+    c.textAlign = 'center';
+    c.font = '800 26px "Segoe UI",sans-serif';
+    c.fillText('»', x + bw / 2, bw / 2 + 8);
+    c.font = '700 11px "Segoe UI",sans-serif';
+    c.fillStyle = 'rgba(230,236,250,.9)';
+    c.fillText('SHIFT', x + bw / 2, bw - 6);
+    this._hudBar = cv;
+    this._hudBarKey = key;
+    return cv;
+  },
+
   selfBar(c, p) {
     const info = this.players[p.i] || {};
     const hero = this.heroes[info.hero] || {};
-    const keys = ['basic', 'q', 'e', 'r'];
-    const cds = { basic: 0, q: p.cd[0], e: p.cd[1], r: 0 };
     const abs = hero.abilities || [];
-    const bw = 74, gap = 10, n = keys.length + 1;
-    const total = n * bw + (n - 1) * gap;
-    let x = this.CW / 2 - total / 2;
+    const bw = this.SB_W, gap = this.SB_GAP;
+    const cds = [0, p.cd[0], p.cd[1], 0];
+    const dcd = p.cd[2];
+    const ready = [true, p.cd[0] <= 0, p.cd[1] <= 0, p.u >= 100, dcd <= 0];
+    const total = 5 * bw + 4 * gap;
+    const x0 = this.CW / 2 - total / 2;
     const y = this.CH - 104;
-    keys.forEach(k => {
-      const ab = abs.find(a => a.key === k) || {};
-      const cd = cds[k], maxcd = ab.cd || 1;
-      const ready = k === 'r' ? p.u >= 100 : cd <= 0;
-      c.fillStyle = 'rgba(10,13,22,.72)';
-      this.rr(c, x, y, bw, bw, 12); c.fill();
-      c.strokeStyle = ready ? (hero.color || '#fff') : 'rgba(120,130,155,.5)';
-      c.lineWidth = ready ? 2.5 : 1.5;
-      c.stroke();
-      c.globalAlpha = ready ? 1 : .35;
-      ABICON[k](c, x + bw / 2, y + bw / 2 - 4, 32, hero.color || '#fff');
-      c.globalAlpha = 1;
-      if (!ready) {
+    c.drawImage(this.selfBarBase(hero, ready), x0, y, total, bw);
+
+    let x = x0;
+    for (let i = 0; i < 4; i++) {
+      const k = this.SB_KEYS[i];
+      if (!ready[i]) {
         if (k === 'r') {
           c.fillStyle = 'rgba(0,0,0,.55)';
           this.rr(c, x, y + bw * (p.u / 100), bw, bw * (1 - p.u / 100), 12); c.fill();
@@ -935,32 +1073,21 @@ const Render = {
           c.font = '700 15px "Segoe UI",sans-serif';
           c.fillText(Math.floor(p.u) + '%', x + bw / 2, y + bw - 12);
         } else {
+          const ab = abs.find(a => a.key === k) || {};
           c.fillStyle = 'rgba(0,0,0,.6)';
-          this.rr(c, x, y, bw, bw * Math.min(1, cd / maxcd), 12); c.fill();
+          this.rr(c, x, y, bw, bw * Math.min(1, cds[i] / (ab.cd || 1)), 12); c.fill();
           c.fillStyle = '#fff'; c.textAlign = 'center';
           c.font = '800 22px "Segoe UI",sans-serif';
-          c.fillText(cd.toFixed(1), x + bw / 2, y + bw / 2 + 8);
+          c.fillText(cds[i].toFixed(1), x + bw / 2, y + bw / 2 + 8);
         }
+        // подпись клавиши уехала в подложку, а заливка отката её закрывает —
+        // возвращаем её поверх, но только для закрытых клеток
+        c.fillStyle = 'rgba(230,236,250,.9)';
+        c.font = '700 11px "Segoe UI",sans-serif';
+        c.fillText(KEYLABEL[k], x + bw / 2, y + bw - 6);
       }
-      c.fillStyle = 'rgba(230,236,250,.9)';
-      c.textAlign = 'center';
-      c.font = '700 11px "Segoe UI",sans-serif';
-      c.fillText(KEYLABEL[k], x + bw / 2, y + bw - 6);
       x += bw + gap;
-    });
-    const dcd = p.cd[2];
-    c.fillStyle = 'rgba(10,13,22,.72)';
-    this.rr(c, x, y, bw, bw, 12); c.fill();
-    c.strokeStyle = dcd <= 0 ? '#9fd8ff' : 'rgba(120,130,155,.5)';
-    c.lineWidth = dcd <= 0 ? 2.5 : 1.5;
-    c.stroke();
-    c.fillStyle = dcd <= 0 ? '#9fd8ff' : 'rgba(150,160,185,.5)';
-    c.textAlign = 'center';
-    c.font = '800 26px "Segoe UI",sans-serif';
-    c.fillText('»', x + bw / 2, y + bw / 2 + 8);
-    c.font = '700 11px "Segoe UI",sans-serif';
-    c.fillStyle = 'rgba(230,236,250,.9)';
-    c.fillText('SHIFT', x + bw / 2, y + bw - 6);
+    }
     if (dcd > 0) {
       c.fillStyle = 'rgba(0,0,0,.6)';
       this.rr(c, x, y, bw, bw * Math.min(1, dcd / 2.2), 12); c.fill();
