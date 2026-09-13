@@ -25,7 +25,7 @@ const Render = {
   GRAV: 2100,             // C.GRAVITY, для продления полёта
   selfAhead: true,        // рисовать своего бойца по свежему снапшоту, а не из буфера
   delay: 90, lead: 0, _leadTarget: 0, _leadOk: false,
-  _win: [], _lastSim: -1, _starved: false,
+  _win: [], _lastSim: -1, _starved: false, _retimeT: -1e9, _jitMs: 0,
   _frames: 0, _starvedN: 0,   // счётчики для замеров: доля кадров без свежих данных
 
   // качество: 2 — высокое, 1 — среднее, 0 — низкое
@@ -101,9 +101,19 @@ const Render = {
     if (sim < this._lastSim - 500) this.resetClock();   // новый матч — кадры с нуля
     const gap = this._lastSim >= 0 ? Math.max(this.SIMDT, sim - this._lastSim) : this.SIMDT * 2;
     this._lastSim = sim;
-    this._win.push(now - sim, gap, now);
-    while (this._win.length > 9 && now - this._win[2] > 2500) this._win.splice(0, 3);
-    this._retime();
+    const w = this._win;
+    w.push(now - sim, gap, now);
+    // выбрасываем всё, что старше окна, одним движением, а не по записи
+    let drop = 0;
+    while (drop + 3 < w.length && now - w[drop + 2] > 2500) drop += 3;
+    if (drop) w.splice(0, drop);
+    // Пересчёт буфера стоит прохода по окну и сортировки, а сам буфер меняется
+    // медленно — десять раз в секунду с запасом хватает. Резкое ухудшение
+    // ловится не здесь, а по голоданию, оно поднимает lead сразу.
+    if (!this._leadOk || now - this._retimeT > 120) {
+      this._retimeT = now;
+      this._retime();
+    }
     this.buf.push(snap);
     if (this.buf.length > 24) this.buf.shift();
     this.shake = Math.max(this.shake, snap.sk || 0);
@@ -114,6 +124,7 @@ const Render = {
     this._win.length = 0;
     this._lastSim = -1;
     this._leadOk = false;
+    this._retimeT = -1e9;
     this._selfSrc = null;
     this._errX = 0; this._errY = 0;
   },
