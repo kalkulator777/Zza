@@ -118,8 +118,35 @@ button, input, select, textarea {
 .spacer { flex: 1; }
 
 .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr) 300px; gap: 12px; align-items: stretch; }
-@media (max-width: 1100px) { .layout { grid-template-columns: 190px minmax(0, 1fr); } .chat-col { grid-column: 1 / -1; } }
-@media (max-width: 780px) { .layout { grid-template-columns: 1fr; } }
+.layout > * { min-width: 0; min-height: 0; }
+
+/* Игровой экран занимает ровно окно и ни пикселем больше: колонки прокручиваются
+   внутри себя. Без жёсткой высоты чат утягивает страницу вниз — особенно на узких
+   экранах, где он переезжает в отдельный ряд под холстом. */
+#view-game .layout { height: calc(100vh - 84px); grid-template-rows: minmax(0, 1fr); }
+#view-game .layout > .panel:not(.chat-col) { overflow-y: auto; }
+
+/* Три колонки держим как можно дольше: стоит чату уехать в ряд под холстом,
+   как экрана начинает не хватать по высоте. */
+@media (max-width: 1200px) {
+  .layout { grid-template-columns: 180px minmax(0, 1fr) 250px; }
+  /* на узких экранах поджимаем поля, иначе ники не влезают в карточку */
+  .layout > .panel { padding: 12px; }
+  .player { gap: 7px; padding: 7px 8px; }
+}
+@media (max-width: 880px) {
+  .layout { grid-template-columns: 170px minmax(0, 1fr); }
+  .chat-col { grid-column: 1 / -1; }
+  #view-game .layout { grid-template-rows: minmax(0, 1fr) minmax(110px, 28vh); }
+  /* холст делит высоту с чатом, поэтому потолок ниже обычного */
+  .canvas-box { max-width: calc((72vh - 300px) * 4 / 3); }
+}
+@media (max-width: 700px) {
+  .layout { grid-template-columns: 1fr; }
+  #view-game .layout { height: auto; grid-template-rows: none; }
+  .canvas-box { max-width: calc((100vh - 290px) * 4 / 3); }
+  .chat-log { max-height: 40vh; }
+}
 
 .players { display: flex; flex-direction: column; gap: 8px; }
 .player {
@@ -181,13 +208,13 @@ button, input, select, textarea {
 .size-dot { background: var(--card-2); border-radius: 50%; cursor: pointer; border: 2px solid transparent; }
 .size-dot.active { border-color: var(--accent); background: #fff; }
 
-.chat-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 420px; }
+.chat-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; overflow: hidden; }
 .chat-log {
-  /* Высоту обязательно ограничивать экраном: без потолка колонка тянется вслед
-     за сообщениями, и overflow никогда не срабатывает — чат просто растёт вниз. */
+  /* Лента съедает всю свободную высоту колонки и прокручивается внутри себя.
+     min-height: 0 обязателен: иначе flex-элемент отказывается сжиматься. */
   flex: 1 1 0;
-  min-height: 180px;
-  max-height: calc(100vh - 250px);
+  min-height: 0;
+  max-height: calc(100vh - 120px);
   background: rgba(0, 0, 0, .16); border-radius: 14px; padding: 10px;
   overflow-y: auto; display: flex; flex-direction: column; gap: 5px;
   font-size: 14px;
