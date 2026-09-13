@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Комнаты: лобби, подбор героев, игровой цикл."""
 
+import os
 import random
 import string
 import time
@@ -13,6 +14,11 @@ from .game.arena import ARENA_LIST
 from .game.bots import Bot
 from .game.world import World
 
+# Замер сквозной задержки: с ZZA_PROBE=1 сервер вкладывает в снапшот два числа —
+# сколько ввод пролежал в очереди до тика и сколько тик ждал отправки снапшота.
+# Нужно только для tools/latency.py, в обычной игре выключено.
+PROBE = os.environ.get("ZZA_PROBE") == "1"
+
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 MODES = {"1v1": 2, "2v2": 4}
 BOT_NAMES = ["Болт", "Шестерня", "Ржавый", "Тумблер", "Кувалда", "Искра", "Обрез", "Пружина"]
@@ -20,7 +26,8 @@ BOT_NAMES = ["Болт", "Шестерня", "Ржавый", "Тумблер", "
 
 class Player:
     __slots__ = ("pid", "name", "team", "hero", "ready", "conn", "is_bot",
-                 "bot_level", "bot", "held", "pending", "spectator", "last_seen")
+                 "bot_level", "bot", "held", "pending", "spectator", "last_seen",
+                 "probe_t")
 
     def __init__(self, pid, name, conn=None, is_bot=False, bot_level=2):
         self.pid = pid
@@ -36,6 +43,7 @@ class Player:
         self.pending = 0
         self.spectator = False
         self.last_seen = time.time()
+        self.probe_t = 0.0
 
     def info(self):
         return {"pid": self.pid, "name": self.name, "team": self.team,
@@ -62,6 +70,8 @@ class Room:
         self._tick_acc = 0.0
         self._last = 0.0
         self._snap_c = 0
+        self._probe_dq = None
+        self._probe_t0 = 0.0
         self.chat = []
         self.result = None
         self.created = time.time()
@@ -368,6 +378,7 @@ class Room:
 
     def _step_once(self):
         w = self.world
+        t_step = time.perf_counter() if PROBE else 0.0
         for pid, p in self.players.items():
             f = w.fighters.get(pid)
             if f is None:
@@ -379,11 +390,20 @@ class Room:
             else:
                 f.inp = p.held | p.pending
                 p.pending = 0
+                if PROBE and p.probe_t:
+                    self._probe_dq = (t_step - p.probe_t) * 1000.0
+                    self._probe_t0 = t_step
+                    p.probe_t = 0.0
         w.step()
         self._snap_c += 1
         if self._snap_c >= C.SNAP_EVERY or w.events:
             self._snap_c = 0
-            self.broadcast(w.snapshot())
+            snap = w.snapshot()
+            if PROBE and self._probe_dq is not None:
+                snap["_dq"] = round(self._probe_dq, 3)
+                snap["_ds"] = round((time.perf_counter() - self._probe_t0) * 1000.0, 3)
+                self._probe_dq = None
+            self.broadcast(snap)
         if w.state == C.ST_OVER and w.state_t <= 0:
             self.finish()
 
@@ -422,7 +442,10 @@ class Room:
         p = self.players.get(pid)
         if p is None:
             return
-        p.held = int(held) & 0x3FF
+        k = int(held) & 0x3FF
+        if PROBE and k != p.held and not p.probe_t:
+            p.probe_t = time.perf_counter()
+        p.held = k
         p.pending |= int(pressed) & 0x3FF
         p.last_seen = time.time()
         if self.world:
