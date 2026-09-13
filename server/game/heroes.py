@@ -97,22 +97,35 @@ def rezak_basic(w, f, a):
     step = f.combo % 3
     if a.t == 0:
         f.combo = (f.combo + 1) % 3
-        f.vx += 90 * f.face
+        f.vx += 100 * f.face
     if a.t == 3:
         if step == 2:
-            w.spawn_hitbox(f, 50, 0, 78, 66, 13, 560, 34, ttl=3, tag="blade")
-            w.fx("slash", f.cx + 50 * f.face, f.cy, d=f.face, s=1.4)
+            w.spawn_hitbox(f, 56, 0, 94, 70, 12, 570, 34, ttl=3, tag="blade")
+            w.fx("slash", f.cx + 56 * f.face, f.cy, d=f.face, s=1.4)
         else:
-            w.spawn_hitbox(f, 44, -4 + step * 10, 66, 58, 7, 190, 14 + step * 6, ttl=3, tag="blade")
-            w.fx("slash", f.cx + 44 * f.face, f.cy, d=f.face, s=1.0)
+            w.spawn_hitbox(f, 50, -4 + step * 10, 80, 60, 5, 190, 14 + step * 6, ttl=3, tag="blade")
+            w.fx("slash", f.cx + 50 * f.face, f.cy, d=f.face, s=1.0)
+
+
+def _rezak_q_hit(w, src, t):
+    """Попал рывком — вернулся прыжок и часть отката: можно сразу заходить снова."""
+    src.jumps = max(src.jumps, 1)
+    src.cds["q"] = min(src.cds["q"], 4.0)
 
 
 def rezak_q(w, f, a):
     if a.t == 0:
-        f.vx = 1000 * f.face
-        f.vy = 0.0
+        ax, ay = aim(f)
+        ay = max(-0.78, min(0.55, ay))          # вверх — почти свободно, вниз — чуть-чуть
+        n = math.hypot(ax, ay) or 1.0
+        ax, ay = ax / n, ay / n
+        f.face = 1 if ax >= 0 else -1
+        f.vx = 1010 * ax
+        f.vy = 1010 * ay
         f.iframes = max(f.iframes, 0.26)
-        w.spawn_hitbox(f, 0, 0, 92, 72, 15, 300, 40, ttl=17, follow=True, tag="blade")
+        f.jumps = max(f.jumps, 1)
+        w.spawn_hitbox(f, 0, 0, 96, 74, 8, 290, 40, ttl=17, follow=True,
+                       on_hit=_rezak_q_hit, tag="blade")
         w.fx("dashslash", f.cx, f.cy, d=f.face)
     if a.t < 13:
         f.mem["nograv"] = True
@@ -121,15 +134,15 @@ def rezak_q(w, f, a):
 
 
 def rezak_e(w, f, a):
-    if a.t in (3, 14, 25):
-        last = a.t == 25
-        w.spawn_hitbox_at(f, f.cx, f.cy, 230, 150,
-                          8 if not last else 11,
-                          240 if not last else 470,
+    if a.t in (2, 12, 22):
+        last = a.t == 22
+        w.spawn_hitbox_at(f, f.cx, f.cy, 250, 158,
+                          5 if not last else 8,
+                          230 if not last else 430,
                           0, ttl=3, radial=True, tag="blade")
         w.fx("whirl", f.cx, f.cy, s=1.0 if not last else 1.5)
     if not f.on_ground:
-        f.vy = min(f.vy, 120.0)
+        f.vy = min(f.vy, 110.0)
 
 
 def rezak_r(w, f, a):
@@ -157,21 +170,28 @@ def rezak_r(w, f, a):
 
 
 def rezak_deal(w, f, t, dmg, tag):
+    """Каждое попадание — щит и рывок скорости. Резак живёт, пока давит."""
+    if tag not in ("burn", "fire", "blizzard"):
+        f.shield = min(12.0, f.shield + 1.5)
+        f.add_effect("haste", 1.5, 0.10)
     if t.hp / t.max_hp < 0.4:
-        return dmg * 1.16
+        return dmg * 1.12
     return dmg
 
 
 REZAK = Hero(
     "rezak", "Резак", "Ассасин", "#ff4d6d", "#ffa8b8",
-    "Быстрый, хрупкий, живёт на добиваниях.",
-    hp=100, weight=0.9, speed=1.12, jumps=2, difficulty=2,
-    passive="Добивание", passive_desc="+16% урона по целям ниже 40% HP.",
+    "Быстрый, живёт на попаданиях: не бьёт — умирает.",
+    hp=108, weight=0.98, speed=1.12, jumps=2, difficulty=2,
+    passive="Кровь на лезвии",
+    passive_desc="Попадание: щит +1.5 (до 12) и +10% скорости на 1.5 с. +12% урона по целям ниже 40% HP.",
     on_deal=rezak_deal,
     abilities=[
-        Ability("basic", "Серия", "Комбо из трёх ударов, третий отбрасывает.", 0.26, 0.26, rezak_basic, move=0.55),
-        Ability("q", "Рывок-разрез", "Рывок сквозь врагов с неуязвимостью, 15 урона.", 6.0, 0.34, rezak_q),
-        Ability("e", "Вихрь", "Три волны вокруг себя, последняя подбрасывает.", 8.5, 0.52, rezak_e, move=0.4),
+        Ability("basic", "Серия", "Комбо из трёх ударов, третий выбивает за край.", 0.27, 0.27, rezak_basic, move=0.55),
+        Ability("q", "Рывок-разрез", "Рывок по прицелу с неуязвимостью. Попал — вернулся прыжок и часть отката.",
+                6.5, 0.34, rezak_q, face_lock=False),
+        Ability("e", "Вихрь", "Три волны вокруг себя, последняя подбрасывает.", 9.5, 0.42, rezak_e,
+                move=0.55, armor=0.15),
         Ability("r", "Охота", "4 телепорт-удара по ближайшему врагу. Неуязвимость.", 0.6, 1.02, rezak_r),
     ],
 )
@@ -180,7 +200,7 @@ REZAK = Hero(
 # ================================================================== БУНКЕР
 def bunker_basic(w, f, a):
     if a.t == 6:
-        w.spawn_hitbox(f, 52, 0, 84, 74, 17, 340, 22, ttl=4, tag="bash")
+        w.spawn_hitbox(f, 52, 0, 92, 80, 22, 350, 22, ttl=4, tag="bash")
         w.fx("bash", f.cx + 52 * f.face, f.cy, d=f.face)
     if a.t < 6:
         f.vx *= 0.9
@@ -191,14 +211,18 @@ def bunker_q(w, f, a):
     f.mem["guard"] = 1
     if a.t == 0:
         w.fx("guard", f.cx, f.cy, d=f.face)
+        f.mem["guard_left"] = 4
     if a.t % 10 == 0:
         w.fx("guardtick", f.cx + 30 * f.face, f.cy, d=f.face)
-    # сбиваем вражеские снаряды перед собой
+    # сбиваем вражеские снаряды перед собой, но не больше трёх за барьер
     for p in list(w.projectiles):
+        if f.mem.get("guard_left", 0) <= 0:
+            break
         if p.team == f.team:
             continue
         if abs(p.y - f.cy) < 56 and 0 < (p.x - f.cx) * f.face < 72:
             w.projectiles.remove(p)
+            f.mem["guard_left"] -= 1
             w.fx("shieldhit", p.x, p.y)
 
 
@@ -210,7 +234,7 @@ def bunker_e(w, f, a):
         return
     if a.t == 11:
         f.vx = 1080 * f.face
-        w.spawn_hitbox(f, 12, 0, 96, 78, 23, 680, 36, ttl=26, follow=True,
+        w.spawn_hitbox(f, 12, 0, 102, 82, 32, 720, 36, ttl=26, follow=True,
                        on_hit=lambda ww, src, t: t.add_effect("stun", 0.5),
                        tag="ram")
         w.fx("ram", f.cx, f.cy, d=f.face)
@@ -236,21 +260,21 @@ def bunker_r(w, f, a):
 
 
 def bunker_tick(w, f):
-    if f.no_dmg_t > 4.0 and f.hp < f.max_hp:
-        w.heal(f, 9.0 * C.DT)
+    if f.no_dmg_t > 3.5 and f.hp < f.max_hp:
+        w.heal(f, 12.0 * C.DT)
 
 
 BUNKER = Hero(
     "bunker", "Бункер", "Танк", "#f4a259", "#ffd7a8",
     "Медленный кирпич, который держит линию.",
-    hp=182, weight=1.5, speed=0.92, jumps=2, grav=1.05, difficulty=1,
-    passive="Ремонт", passive_desc="Через 4 с без урона восстанавливает 9 HP/с.",
+    hp=194, weight=1.5, speed=0.96, jumps=2, grav=1.05, difficulty=1,
+    passive="Ремонт", passive_desc="Через 3.5 с без урона восстанавливает 12 HP/с.",
     on_tick=bunker_tick,
     abilities=[
-        Ability("basic", "Удар щитом", "Тяжёлый удар с отбросом.", 0.38, 0.4, bunker_basic, move=0.6),
-        Ability("q", "Барьер", "2.4 с: −65% урона, сбивает снаряды спереди, можно идти.", 9.0, 2.4,
+        Ability("basic", "Удар щитом", "Тяжёлый удар с отбросом.", 0.40, 0.4, bunker_basic, move=0.6),
+        Ability("q", "Барьер", "2.4 с: −65% урона, гасит до 4 снарядов спереди, можно идти.", 8.5, 2.4,
                 bunker_q, move=0.7, face_lock=False, armor=0.6),
-        Ability("e", "Таран", "Разбег и рывок: 23 урона, оглушение 0.5 с.", 10.0, 0.75, bunker_e, armor=0.5),
+        Ability("e", "Таран", "Разбег и рывок: 32 урона, оглушение 0.5 с.", 10.0, 0.75, bunker_e, armor=0.5),
         Ability("r", "Купол", "Зона на 6.5 с: союзникам −50% урона, врагам −30% скорости.", 0.6, 0.5, bunker_r, move=0.3),
     ],
 )
@@ -264,7 +288,7 @@ def igla_basic(w, f, a):
         f.mem["shot_t"] = w.time
         boost = gap > 2.0
         w.spawn_proj(f, "bolt", ax * 1300, ay * 1300,
-                     9 * (1.7 if boost else 1.0), 130 * (1.8 if boost else 1.0),
+                     10 * (1.7 if boost else 1.0), 135 * (1.8 if boost else 1.0),
                      1.4, r=7, ox=30, oy=-4)
         if boost:
             w.fx("crit", f.cx + 30 * f.face, f.cy)
@@ -279,7 +303,7 @@ def igla_q(w, f, a):
     if (not hold and a.t > 6) or a.t >= a.dur - 1:
         ax, ay = aim(f)
         sp = 1500 + 900 * power
-        w.spawn_proj(f, "slug", ax * sp, ay * sp, 18 + 36 * power,
+        w.spawn_proj(f, "slug", ax * sp, ay * sp, 28 + 38 * power,
                      260 + 520 * power, 1.6, r=9 + 6 * power, ox=30, oy=-4,
                      pierce=3 if power > 0.65 else 1)
         w.fx("bang", f.cx + 30 * f.face, f.cy, m=round(power, 2))
@@ -299,7 +323,7 @@ def igla_e(w, f, a):
         f.jumps = max(f.jumps, 1)
 
         def mine_tick(ww, s):
-            if s.t < 0.35:
+            if s.t < 0.25:
                 return
             for o in ww.fighters.values():
                 if not o.alive or o.team == s.team:
@@ -309,12 +333,12 @@ def igla_e(w, f, a):
                     return
 
         def mine_end(ww, s):
-            if s.t < 0.35:
+            if s.t < 0.25:
                 return
             owner = ww.fighters.get(s.owner)
             if owner is None:
                 return
-            ww.spawn_hitbox_at(owner, s.cx, s.cy, 190, 170, 27, 660, 0,
+            ww.spawn_hitbox_at(owner, s.cx, s.cy, 215, 195, 37, 700, 0,
                                ttl=3, radial=True, tag="mine")
             ww.fx("boom", s.cx, s.cy, r=95)
         w.spawn_struct(f, "mine", f.cx, f.y + C.FH, 30, 16, 22, 15.0,
@@ -330,7 +354,7 @@ def igla_r(w, f, a):
         w.fx("beamaim", f.cx, f.cy, dx=round(ax, 3), dy=round(ay, 3))
         return
     if a.t == 42:
-        w.spawn_proj(f, "beam", ax * 5200, ay * 5200, 58, 760, 0.55,
+        w.spawn_proj(f, "beam", ax * 5200, ay * 5200, 64, 760, 0.55,
                      r=16, ox=26, oy=-4, pierce=99, terrain=False)
         w.fx("beam", f.cx, f.cy, dx=round(ax, 3), dy=round(ay, 3))
         w.shake = min(20.0, w.shake + 9.0)
@@ -339,14 +363,14 @@ def igla_r(w, f, a):
 IGLA = Hero(
     "igla", "Игла", "Снайпер", "#5bc8ff", "#c7ecff",
     "Бьёт больно и издалека, но рассыпается в ближнем бою.",
-    hp=94, weight=0.85, speed=1.05, jumps=2, difficulty=3,
+    hp=116, weight=0.95, speed=1.05, jumps=2, difficulty=3,
     passive="Первый выстрел", passive_desc="Выстрел после 2 с паузы: ×1.7 урона и отброса.",
     abilities=[
-        Ability("basic", "Болт", "Быстрый дальний выстрел.", 0.36, 0.2, igla_basic, move=0.7, face_lock=False),
-        Ability("q", "Заряд", "Держи Q: до 54 урона, пробивает насквозь.", 6.5, 1.5,
+        Ability("basic", "Болт", "Быстрый дальний выстрел.", 0.32, 0.2, igla_basic, move=0.7, face_lock=False),
+        Ability("q", "Заряд", "Держи Q: до 66 урона, пробивает насквозь.", 6.0, 1.5,
                 igla_q, move=0.25, face_lock=False),
-        Ability("e", "Отскок", "Прыжок назад, на месте остаётся мина.", 9.0, 0.4, igla_e, move=0.3),
-        Ability("r", "Луч", "0.7 с наводки, затем луч через всю арену: 58 урона.", 0.6, 1.2,
+        Ability("e", "Отскок", "Прыжок назад, на месте остаётся мина.", 8.0, 0.4, igla_e, move=0.3),
+        Ability("r", "Луч", "0.7 с наводки, затем луч через всю арену: 64 урона.", 0.6, 1.2,
                 igla_r, move=0.2, face_lock=False),
     ],
 )
@@ -356,7 +380,7 @@ IGLA = Hero(
 def vyuga_basic(w, f, a):
     if a.t == 2:
         ax, ay = aim(f)
-        w.spawn_proj(f, "ice", ax * 950, ay * 950 - 60, 8, 150, 1.6, r=9,
+        w.spawn_proj(f, "ice", ax * 950, ay * 950 - 60, 9, 150, 1.6, r=9,
                      ox=28, oy=-4, grav=340,
                      on_hit=lambda ww, p, t: t.add_effect("slow", 2.0, 0.3) if t else None)
 
@@ -371,7 +395,8 @@ def vyuga_q(w, f, a):
 
 def vyuga_e(w, f, a):
     if a.t == 8:
-        w.spawn_hitbox(f, 105, 0, 200, 120, 16, 170, 20, ttl=4,
+        f.effects.pop("burn", None)     # собственный холод сбивает с неё пламя
+        w.spawn_hitbox(f, 112, 0, 206, 122, 17, 170, 20, ttl=4,
                        on_hit=lambda ww, src, t: t.add_effect("freeze", 0.95),
                        tag="frost")
         w.fx("cone", f.cx, f.cy, d=f.face)
@@ -391,7 +416,7 @@ def vyuga_r(w, f, a):
             owner = ww.fighters.get(z.owner)
             for o in ww.fighters.values():
                 if o.alive and o.team != z.team and ww.in_zone(z, o):
-                    ww.damage(owner, o, 8, 60, 90, fx="frosthit", tag="blizzard")
+                    ww.damage(owner, o, 10, 70, 90, fx="frosthit", tag="blizzard")
                     o.add_effect("slow", 1.0, 0.45)
             ww.fx("snow", z.x, z.y, r=z.r)
         w.spawn_zone(f, "blizzard", x, y, 265, 5.5, on_tick=tick)
@@ -399,23 +424,23 @@ def vyuga_r(w, f, a):
 
 def vyuga_deal(w, f, t, dmg, tag):
     if t.has("slow") or t.has("freeze"):
-        return dmg * 1.2
+        return dmg * 1.26
     return dmg
 
 
 VYUGA = Hero(
     "vyuga", "Вьюга", "Контроль", "#8ad7c8", "#d9fff7",
     "Никого не убивает быстро — просто не даёт двигаться.",
-    hp=100, weight=1.0, speed=1.0, jumps=2, difficulty=2,
-    passive="Хрупкость", passive_desc="+20% урона по замедленным и замороженным.",
+    hp=106, weight=1.0, speed=1.0, jumps=2, difficulty=2,
+    passive="Хрупкость", passive_desc="+26% урона по замедленным и замороженным.",
     on_deal=vyuga_deal,
     abilities=[
-        Ability("basic", "Ледяная стрела", "8 урона и замедление на 2 с.", 0.48, 0.24,
+        Ability("basic", "Ледяная стрела", "9 урона и замедление на 2 с.", 0.44, 0.24,
                 vyuga_basic, move=0.7, face_lock=False),
         Ability("q", "Ледяная стена", "Стена на 6 с: держит снаряды, на ней можно стоять.", 8.5, 0.35,
                 vyuga_q, move=0.4, face_lock=False),
-        Ability("e", "Стужа", "Конус: 16 урона и заморозка на 0.95 с.", 11.0, 0.55, vyuga_e, move=0.2),
-        Ability("r", "Метель", "Зона на 5.5 с: 8 урона каждые 0.5 с и сильное замедление.", 0.6, 0.6,
+        Ability("e", "Стужа", "Конус: 17 урона и заморозка на 0.95 с. Гасит горение на себе.", 10.5, 0.55, vyuga_e, move=0.2),
+        Ability("r", "Метель", "Зона на 5.5 с: 10 урона каждые 0.5 с и сильное замедление.", 0.6, 0.6,
                 vyuga_r, move=0.3, face_lock=False),
     ],
 )
@@ -428,12 +453,12 @@ def gayka_basic(w, f, a):
         f.mem["wrench"] = n
         big = n % 4 == 0
         if big:
-            w.spawn_hitbox(f, 48, 0, 76, 68, 22, 520, 32, ttl=3,
+            w.spawn_hitbox(f, 48, 0, 82, 72, 29, 550, 32, ttl=3,
                            on_hit=lambda ww, src, t: t.add_effect("stun", 0.35),
                            tag="wrench")
             w.fx("sparks", f.cx + 48 * f.face, f.cy, s=1.6)
         else:
-            w.spawn_hitbox(f, 46, 0, 70, 64, 12, 270, 26, ttl=3, tag="wrench")
+            w.spawn_hitbox(f, 46, 0, 78, 70, 15, 280, 26, ttl=3, tag="wrench")
             w.fx("sparks", f.cx + 46 * f.face, f.cy, s=1.0)
 
 
@@ -453,11 +478,11 @@ def _turret_tick(w, s):
     s.data["aim"] = ang
     if s.data["cool"] > 0:
         return
-    s.data["cool"] = 0.62
+    s.data["cool"] = 0.44
     dx, dy = best.cx - s.cx, best.cy - s.cy - 8
     d = math.hypot(dx, dy) or 1.0
     p = w.spawn_proj(owner or best, "bolt2", dx / d * 1000, dy / d * 1000,
-                     7, 110, 1.1, r=6)
+                     9, 115, 1.1, r=6)
     p.x, p.y = s.cx, s.cy - 6
     p.team = s.team
 
@@ -468,7 +493,7 @@ def gayka_q(w, f, a):
             if s.owner == f.pid and s.kind == "turret":
                 s.ttl = 0.0
         x, y = f.cx + 44 * f.face, f.y + C.FH
-        w.spawn_struct(f, "turret", x, y, 36, 42, 48, 13.0,
+        w.spawn_struct(f, "turret", x, y, 36, 42, 64, 14.0,
                        data={"tick": _turret_tick, "aim": 0.0})
 
 
@@ -497,7 +522,7 @@ def _hook_hit(w, p, t):
 def gayka_e(w, f, a):
     if a.t == 3:
         ax, ay = aim(f)
-        w.spawn_proj(f, "hook", ax * 1300, ay * 1300, 8, 0, 0.45, r=9,
+        w.spawn_proj(f, "hook", ax * 1300, ay * 1300, 13, 0, 0.45, r=9,
                      ox=26, oy=-4, on_hit=_hook_hit)
     if a.t < 3:
         f.vx *= 0.85
@@ -512,7 +537,7 @@ def gayka_r(w, f, a):
             owner = ww.fighters.get(z.owner)
             if owner is None:
                 return
-            ww.spawn_hitbox_at(owner, z.x, z.y, 330, 300, 58, 820, 0,
+            ww.spawn_hitbox_at(owner, z.x, z.y, 340, 310, 64, 860, 0,
                                ttl=3, radial=True, tag="orbital")
             ww.fx("boom", z.x, z.y, r=165)
             ww.shake = min(24.0, ww.shake + 14.0)
@@ -522,14 +547,14 @@ def gayka_r(w, f, a):
 GAYKA = Hero(
     "gayka", "Гайка", "Инженер", "#ffd166", "#fff0b8",
     "Ставит железо, дёргает за крюк и роняет небо на голову.",
-    hp=112, weight=1.1, speed=1.05, jumps=2, difficulty=3,
+    hp=118, weight=1.1, speed=1.05, jumps=2, difficulty=3,
     passive="Перегрузка", passive_desc="Каждый 4-й удар ключом: ×2 урона и оглушение.",
     abilities=[
         Ability("basic", "Ключ", "Ближний удар. Каждый 4-й — усиленный.", 0.38, 0.3, gayka_basic, move=0.6),
-        Ability("q", "Турель", "Турель на 13 с: 7 урона каждые 0.6 с. Только одна.", 10.0, 0.45, gayka_q, move=0.35),
+        Ability("q", "Турель", "Турель на 14 с: 9 урона каждые 0.44 с. Только одна.", 10.0, 0.45, gayka_q, move=0.35),
         Ability("e", "Крюк", "Во врага — притягивает его. В стену — притягивает себя.", 8.0, 0.55,
                 gayka_e, move=0.25, face_lock=False),
-        Ability("r", "Орбитальный удар", "Метка, через 1.7 с — 58 урона и мощный подброс.", 0.6, 0.5,
+        Ability("r", "Орбитальный удар", "Метка, через 1.7 с — 64 урона и мощный подброс.", 0.6, 0.5,
                 gayka_r, move=0.3, face_lock=False),
     ],
 )
@@ -539,7 +564,7 @@ GAYKA = Hero(
 def puls_basic(w, f, a):
     if a.t == 2:
         ax, ay = aim(f)
-        w.spawn_proj(f, "orb", ax * 900, ay * 900 - 50, 8, 160, 1.7, r=10,
+        w.spawn_proj(f, "orb", ax * 900, ay * 900 - 50, 10, 170, 1.7, r=10,
                      ox=28, oy=-4, grav=170, heal=13)
 
 
@@ -552,15 +577,19 @@ def puls_q(w, f, a):
                 return
             z.tick = 0.0
             for o in ww.fighters.values():
-                if o.alive and o.team == z.team and ww.in_zone(z, o):
-                    ww.heal(o, 3.5)
+                if not (o.alive and o.team == z.team and ww.in_zone(z, o)):
+                    continue
+                if ww.time - o.mem.get("field_t", -9.0) < 0.45:
+                    continue            # поля не складываются
+                o.mem["field_t"] = ww.time
+                ww.heal(o, 3.8)
             ww.fx("pulse", z.x, z.y, r=z.r)
-        w.spawn_zone(f, "field", x, y, 155, 5.5, on_tick=tick)
+        w.spawn_zone(f, "field", x, y, 158, 4.0, on_tick=tick)
 
 
 def puls_e(w, f, a):
     if a.t == 3:
-        w.spawn_hitbox_at(f, f.cx, f.cy, 300, 240, 8, 420, 0, ttl=3,
+        w.spawn_hitbox_at(f, f.cx, f.cy, 310, 250, 10, 470, 0, ttl=3,
                           radial=True, tag="push")
         for o in w.allies_of(f):
             if (o.cx - f.cx) ** 2 + (o.cy - f.cy) ** 2 < 170 ** 2:
@@ -581,7 +610,7 @@ def puls_r(w, f, a):
         for o in w.allies_of(f):
             if (o.cx - f.cx) ** 2 + (o.cy - f.cy) ** 2 > 430 ** 2:
                 continue
-            w.heal(o, 40, f)
+            w.heal(o, 34, f)
             o.add_effect("invuln", 1.0)
             for bad in ("slow", "freeze", "stun", "burn"):
                 o.effects.pop(bad, None)
@@ -591,7 +620,7 @@ def puls_r(w, f, a):
 
 def puls_deal(w, f, t, dmg, tag):
     if tag != "burn":
-        w.heal(f, dmg * 0.14)
+        w.heal(f, dmg * 0.10)
     return dmg
 
 
@@ -599,22 +628,378 @@ PULS = Hero(
     "puls", "Пульс", "Поддержка", "#b58cff", "#e6d9ff",
     "Один держит команду на ногах. В соло — терпимо, в 2х2 — обязателен.",
     hp=106, weight=1.0, speed=1.08, jumps=2, difficulty=2,
-    passive="Симбиоз", passive_desc="Лечит себя на 14% от нанесённого урона.",
+    passive="Симбиоз", passive_desc="Лечит себя на 10% от нанесённого урона.",
     on_deal=puls_deal,
     abilities=[
-        Ability("basic", "Сгусток", "8 урона врагу или 13 лечения союзнику.", 0.44, 0.25,
+        Ability("basic", "Сгусток", "10 урона врагу или 13 лечения союзнику.", 0.42, 0.25,
                 puls_basic, move=0.7, face_lock=False),
-        Ability("q", "Поле", "Зона на 5.5 с: союзникам +7 HP/с.", 12.0, 0.5, puls_q, move=0.4, face_lock=False),
-        Ability("e", "Толчок", "Отбрасывает врагов и сбивает снаряды, союзникам щит 22.", 12.5, 0.4,
+        Ability("q", "Поле", "Зона на 4 с: союзникам +7.6 HP/с. Два поля не складываются.", 10.5, 0.5, puls_q, move=0.4, face_lock=False),
+        Ability("e", "Толчок", "Отбрасывает врагов и сбивает снаряды, союзникам щит 22.", 11.5, 0.4,
                 puls_e, move=0.35),
-        Ability("r", "Второе дыхание", "Союзникам рядом: +40 HP, чистка эффектов, неуязвимость 1 с.",
+        Ability("r", "Второе дыхание", "Союзникам рядом: +34 HP, чистка эффектов, неуязвимость 1 с.",
                 0.6, 0.7, puls_r, move=0.3),
     ],
 )
 
 
-HEROES = {h.id: h for h in (REZAK, BUNKER, IGLA, VYUGA, GAYKA, PULS)}
-HERO_ORDER = ["rezak", "bunker", "igla", "vyuga", "gayka", "puls"]
+# ==================================================================== ГОРН
+def _burn(t, dur, dps, src):
+    t.add_effect("burn", dur, dps, src=src)
+
+
+def _fire_zone(w, owner, x, y, r, ttl, dps, burn_dps, burn_dur, weak=0.0):
+    def tick(ww, z):
+        if z.tick < 0.5:
+            return
+        z.tick = 0.0
+        o_ = ww.fighters.get(z.owner)
+        for o in ww.fighters.values():
+            if not o.alive or o.team == z.team or not ww.in_zone(z, o):
+                continue
+            ww.damage(o_, o, dps, 0, 0, fx="burn", tag="fire")
+            _burn(o, burn_dur, burn_dps, z.owner)
+            if weak > 0:
+                o.add_effect("weak", 1.2, weak)
+        ww.fx("burn", z.x, z.y, r=z.r)
+    return w.spawn_zone(owner, "fire", x, y, r, ttl, on_tick=tick)
+
+
+def gorn_basic(w, f, a):
+    if a.t == 2:
+        ax, ay = aim(f)
+        w.spawn_proj(f, "bolt", ax * 1020, ay * 1020 - 40, 6, 120, 1.3, r=9,
+                     ox=28, oy=-4, grav=260,
+                     on_hit=lambda ww, p, t: _burn(t, 2.0, 4.2, p.owner) if t else None)
+
+
+def gorn_q(w, f, a):
+    if a.t == 3:
+        ax, ay = aim(f)
+
+        def land(ww, p, t):
+            owner = ww.fighters.get(p.owner)
+            if owner is None:
+                return
+            _fire_zone(ww, owner, p.x, p.y, 128, 5.0, 3.6, 4.0, 1.8)
+            ww.fx("boom", p.x, p.y, r=80)
+        w.spawn_proj(f, "orb", ax * 880, ay * 880 - 150, 9, 110, 2.4, r=12,
+                     ox=26, oy=-6, grav=880, on_hit=land)
+    if a.t < 3:
+        f.vx *= 0.88
+
+
+def gorn_e(w, f, a):
+    if a.t == 0:
+        w.fx("windup", f.cx, f.cy, d=f.face)
+        f.vx *= 0.7
+    if a.t == 5:
+        w.spawn_hitbox(f, 128, 0, 244, 136, 13, 420, 26, ttl=4, fx="burn",
+                       on_hit=lambda ww, src, t: _burn(t, 2.0, 5.0, src.pid),
+                       tag="flame")
+        w.fx("cone", f.cx, f.cy, d=f.face)
+        # реактивная отдача: отбрасывает Горна назад — это же и его возврат на арену
+        f.vx = -640 * f.face
+        f.vy = min(f.vy, 0.0) - 330
+        f.jumps = max(f.jumps, 1)
+
+
+def gorn_r(w, f, a):
+    if a.t == 0:
+        x, y = clamp_point(f, 360)
+        w.fx("ultflash", f.cx, f.cy, c=f.hero.color)
+        z = _fire_zone(w, f, x, y, 232, 4.5, 4.5, 5.0, 1.8, weak=0.25)
+
+        def end(ww, zz):
+            owner = ww.fighters.get(zz.owner)
+            if owner is None:
+                return
+            ww.spawn_hitbox_at(owner, zz.x, zz.y, 300, 280, 28, 620, 0,
+                               ttl=3, radial=True, tag="fire")
+            ww.fx("boom", zz.x, zz.y, r=150)
+            ww.shake = min(24.0, ww.shake + 12.0)
+        z.on_end = end
+
+
+def gorn_tick(w, f):
+    n = sum(1 for o in w.enemies_of(f) if o.has("burn"))
+    if n:
+        f.add_effect("dmg_up", 0.2, min(0.14, 0.07 * n))
+        w.heal(f, 0.8 * n * C.DT)
+
+
+GORN = Hero(
+    "gorn", "Горн", "Поджигатель", "#e8482c", "#ffb08a",
+    "Не убивает сразу — убивает потом. Под ним бесполезно лечиться.",
+    hp=122, weight=1.12, speed=0.98, jumps=2, difficulty=2,
+    passive="Раскалённый",
+    passive_desc="За каждого горящего врага: +7% урона (до 14%) и +0.8 HP/с. Горящие лечатся вдвое хуже.",
+    on_tick=gorn_tick,
+    abilities=[
+        Ability("basic", "Уголёк", "6 урона и поджог: 4.2 урона в секунду на 2 с.", 0.46, 0.24,
+                gorn_basic, move=0.7, face_lock=False),
+        Ability("q", "Напалм", "Навесной заряд: лужа огня на 5 с, поджигает всех внутри.", 7.0, 0.35,
+                gorn_q, move=0.35, face_lock=False),
+        Ability("e", "Выхлоп", "Струя пламени: 13 урона и поджог. Горна отбрасывает назад.", 8.5, 0.45,
+                gorn_e, move=0.3),
+        Ability("r", "Домна", "Зона на 4.5 с: 4.5 урона каждые 0.5 с, поджог и −25% урона врагам. "
+                "В конце — взрыв на 28.", 0.6, 0.55, gorn_r, move=0.3, face_lock=False),
+    ],
+)
+
+
+# ================================================================= ЗЕРКАЛО
+def zerkalo_basic(w, f, a):
+    if a.t == 3:
+        w.spawn_hitbox(f, 60, -6, 88, 52, 6, 170, 12, ttl=3, tag="rapier")
+        w.fx("slash", f.cx + 60 * f.face, f.cy - 6, d=f.face, s=0.9)
+    if a.t == 11:
+        w.spawn_hitbox(f, 68, 4, 94, 58, 9, 300, 20, ttl=3, tag="rapier")
+        w.fx("slash", f.cx + 68 * f.face, f.cy + 4, d=f.face, s=1.2)
+
+
+def zerkalo_q(w, f, a):
+    if a.t == 0:
+        f.mem["parry"] = 1
+        w.fx("guard", f.cx, f.cy, d=f.face)
+    if a.t % 7 == 0 and a.t < 17:
+        w.fx("guardtick", f.cx + 26 * f.face, f.cy, d=f.face)
+    f.vx *= 0.88
+    if a.t >= 17:
+        f.mem.pop("parry", None)
+
+
+def _clinch(w, src, t):
+    sx, sy = src.x, src.y
+    src.x, src.y = t.x, t.y
+    t.x, t.y = sx, sy
+    t.vx *= 0.25
+    t.hitstun = max(t.hitstun, 0.3)
+    t.act = None
+    t.add_effect("weak", 3.0, 0.35)
+    src.face = 1 if t.cx >= src.cx else -1
+    w.fx("pull", t.cx, t.cy)
+    w.fx("pull", src.cx, src.cy)
+
+
+def zerkalo_e(w, f, a):
+    if a.t < 4:
+        f.vx *= 0.85
+    if a.t == 4:
+        w.spawn_hitbox(f, 48, 0, 92, 80, 9, 0, 0, ttl=4, on_hit=_clinch, tag="clinch")
+        w.fx("bash", f.cx + 48 * f.face, f.cy, d=f.face)
+
+
+def zerkalo_r(w, f, a):
+    if a.t == 0:
+        w.fx("ultflash", f.cx, f.cy, c=f.hero.color)
+        f.mem["reflect"] = w.time + 3.6
+        f.add_effect("dr", 3.6, 0.5)
+        f.shield = max(f.shield, 26.0)
+    if a.t % 9 == 0:
+        w.fx("guard", f.cx, f.cy, d=f.face)
+
+
+def zerkalo_spawn(w, f):
+    f.mem.pop("parry", None)
+    f.mem.pop("reflect", None)
+
+
+def zerkalo_take(w, f, src, dmg, tag):
+    # 1) парирование: съедает удар и возвращает рипост с оглушением
+    if f.mem.get("parry") and src is not None and dmg >= 5.0 and tag != "burn":
+        f.mem.pop("parry", None)
+        f.face = 1 if src.cx >= f.cx else -1
+        f.iframes = max(f.iframes, 0.14)
+        f.add_effect("dmg_up", 2.5, 0.3)
+        f.ult = min(C.ULT_MAX, f.ult + 14.0)
+        w.heal(f, min(18.0, dmg * 0.6))
+        w.spawn_hitbox(f, 64, 0, 128, 84, 13, 440, 24, ttl=4,
+                       on_hit=lambda ww, s, t: t.add_effect("stun", 0.45),
+                       tag="riposte")
+        w.fx("sparks", f.cx + 44 * f.face, f.cy, s=1.8)
+        w.fx("guardtick", f.cx, f.cy, d=f.face)
+        return 0.0
+    # 2) ульта: часть урона улетает обратно самонаводящимся снарядом
+    if f.mem.get("reflect", 0.0) > w.time and src is not None and dmg >= 3.0:
+        dx, dy = src.cx - f.cx, src.cy - f.cy
+        d = math.hypot(dx, dy) or 1.0
+        w.spawn_proj(f, "bolt2", dx / d * 1150, dy / d * 1150,
+                     dmg * 0.65, 160, 1.4, r=8, homing=2.4)
+        w.fx("shieldhit", f.cx, f.cy)
+    # 3) пассивка: тяжёлый удар заводит Зеркало, мелкий чип — нет
+    if dmg >= 12.0:
+        f.add_effect("dmg_up", 2.0, 0.35)
+    return dmg
+
+
+ZERKALO = Hero(
+    "zerkalo", "Зеркало", "Контратака", "#aebfd4", "#eef3f9",
+    "Чем сильнее по нему бьют, тем больнее он отвечает.",
+    hp=106, weight=1.10, speed=1.03, jumps=2, difficulty=3,
+    passive="Контртемп",
+    passive_desc="Удар в 12+ урона даёт Зеркалу +35% урона на 2 с. Мелкий чип не считается.",
+    on_take=zerkalo_take, on_spawn=zerkalo_spawn,
+    abilities=[
+        Ability("basic", "Двойка", "Два быстрых укола рапирой с хорошим вылетом.", 0.38, 0.26,
+                zerkalo_basic, move=0.6),
+        Ability("q", "Парирование", "0.28 с: следующий серьёзный удар поглощается, "
+                "в ответ — 13 урона, оглушение 0.45 с и лечение.", 8.5, 0.42,
+                zerkalo_q, move=0.3, face_lock=False, armor=1.0),
+        Ability("e", "Клинч", "Меняется местами с врагом: 9 урона и −35% его урона на 3 с.",
+                8.0, 0.4, zerkalo_e, move=0.35),
+        Ability("r", "Отражение", "3.6 с: −50% входящего урона, часть летит обратно в атакующего.",
+                0.6, 0.45, zerkalo_r, move=0.5),
+    ],
+)
+
+
+# =================================================================== ЯКОРЬ
+def yakor_basic(w, f, a):
+    if a.t == 5:
+        if f.on_ground:
+            # низкий пологий замах: гонит врага вбок, к краю
+            w.spawn_hitbox(f, 54, -2, 94, 78, 19, 440, 14, ttl=3, tag="maul")
+        else:
+            # в воздухе — вниз. Под краем арены это смертельно
+            w.spawn_hitbox(f, 48, 18, 84, 78, 16, 420, -56, ttl=3, tag="maul")
+        w.fx("bash", f.cx + 52 * f.face, f.cy, d=f.face)
+    if a.t < 5:
+        f.vx *= 0.9
+
+
+def yakor_q(w, f, a):
+    if a.t == 3:
+        x, y = clamp_point(f, 300)
+
+        def tick(ww, z):
+            for o in ww.fighters.values():
+                if not o.alive:
+                    continue
+                own = o.pid == z.owner
+                if o.team == z.team and not own:
+                    continue
+                if own and o.on_ground:
+                    continue            # себя тянет только в воздухе — это возврат на арену
+                dx, dy = z.x - o.cx, z.y - o.cy
+                d = math.hypot(dx, dy) or 1.0
+                if d > z.r * 1.4:
+                    continue
+                pull = 1050.0 if own else 1850.0
+                o.vx += dx / d * pull * C.DT
+                o.vy += dy / d * pull * C.DT
+                if not own:
+                    o.add_effect("slow", 0.3, 0.22)
+            if z.tick >= 0.3:
+                z.tick = 0.0
+                owner = ww.fighters.get(z.owner)
+                for o in ww.fighters.values():
+                    if o.alive and o.team != z.team and ww.in_zone(z, o):
+                        ww.damage(owner, o, 4, 0, 0, fx="shock", tag="gravity")
+                ww.fx("pull", z.x, z.y, r=z.r)
+        w.spawn_zone(f, "well", x, y, 178, 1.7, on_tick=tick)
+    if a.t < 3:
+        f.vx *= 0.9
+
+
+def _slam_hit(w, src, t):
+    dx, dy = src.cx - t.cx, src.cy - t.cy
+    d = math.hypot(dx, dy) or 1.0
+    t.vx = dx / d * 540
+    t.vy = -250
+    t.on_ground = False
+    t.hitstun = max(t.hitstun, 0.32)
+    t.act = None
+    t.add_effect("weak", 3.0, 0.3)
+    t.add_effect("slow", 1.6, 0.3)
+    w.fx("pull", t.cx, t.cy)
+
+
+def yakor_e(w, f, a):
+    if a.t == 0:
+        f.vy = -300
+        f.vx *= 0.5
+        w.fx("windup", f.cx, f.cy, d=f.face)
+    if a.t == 8:
+        f.mem["slam"] = 1
+    if a.t >= 8 and f.mem.get("slam"):
+        f.vy = max(f.vy, 1500.0)
+        if f.on_ground or a.t >= a.dur - 2:
+            f.mem.pop("slam", None)
+            w.spawn_hitbox_at(f, f.cx, f.y + C.FH, 355, 205, 24, 0, 0, ttl=3,
+                              on_hit=_slam_hit, fx="shock", tag="slam")
+            w.fx("boom", f.cx, f.y + C.FH, r=150)
+            w.shake = min(18.0, w.shake + 7.0)
+            f.add_effect("anchor", 3.0)
+            f.act = None
+
+
+def yakor_r(w, f, a):
+    if a.t == 0:
+        x, y = clamp_point(f, 380)
+        w.fx("ultflash", f.cx, f.cy, c=f.hero.color)
+
+        def tick(ww, z):
+            owner = ww.fighters.get(z.owner)
+            for o in ww.fighters.values():
+                if not o.alive or o.team == z.team:
+                    continue
+                dx, dy = z.x - o.cx, z.y - o.cy
+                d = math.hypot(dx, dy) or 1.0
+                if d > z.r * 1.5:
+                    continue
+                o.vx += dx / d * 2000 * C.DT
+                o.vy += dy / d * 2000 * C.DT
+                o.add_effect("slow", 0.3, 0.35)
+                o.add_effect("weak", 0.6, 0.3)
+            if z.tick >= 0.3:
+                z.tick = 0.0
+                for o in ww.fighters.values():
+                    if o.alive and o.team != z.team and ww.in_zone(z, o):
+                        ww.damage(owner, o, 4, 0, 0, fx="shock", tag="gravity")
+                ww.fx("pull", z.x, z.y, r=z.r)
+
+        def end(ww, z):
+            owner = ww.fighters.get(z.owner)
+            if owner is None:
+                return
+            ww.spawn_hitbox_at(owner, z.x, z.y, 340, 320, 24, 880, 0,
+                               ttl=3, radial=True, tag="gravity")
+            ww.fx("boom", z.x, z.y, r=170)
+            ww.shake = min(24.0, ww.shake + 13.0)
+        w.spawn_zone(f, "well", x, y, 258, 3.2, on_tick=tick, on_end=end)
+
+
+def yakor_tick(w, f):
+    if f.on_ground:
+        f.add_effect("anchor", 0.12)
+
+
+YAKOR = Hero(
+    "yakor", "Якорь", "Гравитация", "#4361ee", "#a8b8ff",
+    "Стоя на земле — не сдвинуть. В воздухе — обычный мешок.",
+    hp=138, weight=1.18, speed=0.95, jumps=2, grav=1.12, difficulty=2,
+    passive="Балласт",
+    passive_desc="Пока стоит на земле — −65% получаемого отброса. В воздухе пассивка не работает.",
+    on_tick=yakor_tick,
+    abilities=[
+        Ability("basic", "Грузило", "На земле бьёт вбок, в воздухе — вниз. "
+                "Удар сверху сбивает под арену.", 0.40, 0.3, yakor_basic, move=0.55),
+        Ability("q", "Воронка", "Колодец на 1.7 с: тянет врагов к центру и бьёт по 4 каждые 0.3 с. "
+                "Самого Якоря в воздухе тоже — так он возвращается.", 8.0, 0.4,
+                yakor_q, move=0.4, face_lock=False),
+        Ability("e", "Обвал", "Падение с ударной волной: 24 урона, стягивает врагов к себе, "
+                "−30% их урона на 3 с.", 9.0, 0.9, yakor_e, move=0.25, armor=0.4),
+        Ability("r", "Сингулярность", "Колодец на 3.2 с: тянет и бьёт по 4 каждые 0.3 с, "
+                "в конце схлопывается на 24 с мощным отбросом.", 0.6, 0.5,
+                yakor_r, move=0.3, face_lock=False),
+    ],
+)
+
+
+HEROES = {h.id: h for h in (REZAK, BUNKER, IGLA, VYUGA, GAYKA, PULS,
+                            GORN, ZERKALO, YAKOR)}
+HERO_ORDER = ["rezak", "bunker", "igla", "vyuga", "gayka", "puls",
+               "gorn", "zerkalo", "yakor"]
 
 
 def get(hid):

@@ -59,6 +59,52 @@ const GLYPH = {
     c.beginPath(); c.arc(0, 0, s * 0.12, 0, 6.284); c.stroke();
     c.restore();
   },
+  gorn(c, x, y, s, col) {                      // язык пламени
+    c.save(); c.translate(x, y); c.fillStyle = col; c.strokeStyle = col;
+    c.lineWidth = s * 0.08; c.lineJoin = 'round';
+    c.beginPath();
+    c.moveTo(0, -s * 0.5);
+    c.quadraticCurveTo(s * 0.34, -s * 0.06, s * 0.22, s * 0.2);
+    c.quadraticCurveTo(s * 0.14, s * 0.46, -s * 0.06, s * 0.48);
+    c.quadraticCurveTo(-s * 0.34, s * 0.42, -s * 0.28, s * 0.08);
+    c.quadraticCurveTo(-s * 0.24, -s * 0.16, -s * 0.04, -s * 0.24);
+    c.quadraticCurveTo(-s * 0.14, -s * 0.02, 0, -s * 0.5);
+    c.closePath(); c.fill();
+    c.globalAlpha = 0.5;
+    c.beginPath();
+    c.moveTo(0, s * 0.44);
+    c.quadraticCurveTo(-s * 0.16, s * 0.12, 0, -s * 0.1);
+    c.quadraticCurveTo(s * 0.16, s * 0.14, 0, s * 0.44);
+    c.closePath();
+    c.fillStyle = '#fff'; c.fill();
+    c.restore();
+  },
+  zerkalo(c, x, y, s, col) {                   // клинок и его отражение
+    c.save(); c.translate(x, y); c.fillStyle = col; c.strokeStyle = col;
+    c.lineWidth = s * 0.09; c.lineJoin = 'round';
+    c.beginPath();
+    c.moveTo(0, -s * 0.5); c.lineTo(s * 0.3, s * 0.02); c.lineTo(-s * 0.3, s * 0.02);
+    c.closePath(); c.fill();
+    c.globalAlpha = 0.45;
+    c.beginPath();
+    c.moveTo(0, s * 0.5); c.lineTo(s * 0.3, s * 0.06); c.lineTo(-s * 0.3, s * 0.06);
+    c.closePath(); c.stroke();
+    c.globalAlpha = 1;
+    c.lineWidth = s * 0.07;
+    c.beginPath(); c.moveTo(-s * 0.44, s * 0.04); c.lineTo(s * 0.44, s * 0.04); c.stroke();
+    c.restore();
+  },
+  yakor(c, x, y, s, col) {                     // якорь
+    c.save(); c.translate(x, y); c.strokeStyle = col; c.fillStyle = col;
+    c.lineWidth = s * 0.11; c.lineCap = 'round'; c.lineJoin = 'round';
+    c.beginPath(); c.arc(0, -s * 0.36, s * 0.13, 0, 6.284); c.stroke();
+    c.beginPath();
+    c.moveTo(0, -s * 0.23); c.lineTo(0, s * 0.34);
+    c.moveTo(-s * 0.3, -s * 0.1); c.lineTo(s * 0.3, -s * 0.1);
+    c.stroke();
+    c.beginPath(); c.arc(0, s * 0.12, s * 0.36, 0.35, Math.PI - 0.35); c.stroke();
+    c.restore();
+  },
   puls(c, x, y, s, col) {
     c.save(); c.translate(x, y); c.strokeStyle = col; c.fillStyle = col; c.lineWidth = s * 0.14;
     c.lineCap = 'round';

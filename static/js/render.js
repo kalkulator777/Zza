@@ -150,7 +150,17 @@ const Render = {
         this.num(e.x, e.y - 30, '-' + Math.round(e.m), '#bff0ff');
         break;
       case 'burn':
-        if (Math.random() < 0.3) this.spark(e.x, e.y, '#ff9a5b', 2, 90, 0.4);
+        if (e.r) {
+          const n = this.level === 0 ? 2 : 5;
+          for (let i = 0; i < n; i++) {
+            const a = Math.random() * 6.283, r = Math.sqrt(Math.random()) * e.r;
+            this.add({ k: 'p', x: e.x + Math.cos(a) * r, y: e.y + Math.sin(a) * r,
+                       vx: 0, vy: -90 - Math.random() * 70, c: '#ffab5b',
+                       l: 0.7, m: 0.7, r: 2.5 });
+          }
+        } else if (Math.random() < 0.4) {
+          this.spark(e.x, e.y, '#ff9a5b', 2, 90, 0.4);
+        }
         break;
       case 'heal':
         this.num(e.x, e.y - 34, '+' + Math.round(e.m), '#6ee7a0');
@@ -356,9 +366,53 @@ const Render = {
   },
 
   drawZones(c, zs) {
-    const COL = { dome: '#f4a259', blizzard: '#bff0ff', field: '#6ee7a0', mark: '#ff5b6e' };
+    const COL = { dome: '#f4a259', blizzard: '#bff0ff', field: '#6ee7a0',
+                  mark: '#ff5b6e', fire: '#ff7a3c', well: '#5b79ff' };
     zs.forEach(z => {
       const col = COL[z.k] || '#c9d4ff';
+      if (z.k === 'fire') {
+        // лужа огня: заливка плюс языки пламени по краю
+        c.globalAlpha = .17 + .05 * Math.sin(this.t * 9);
+        c.fillStyle = col;
+        c.beginPath(); c.arc(z.x, z.y, z.r, 0, 6.283); c.fill();
+        c.globalAlpha = .22;
+        c.beginPath(); c.arc(z.x, z.y, z.r * 0.6, 0, 6.283); c.fill();
+        c.globalAlpha = .8;
+        c.strokeStyle = '#ffb15b';
+        c.lineWidth = 5;
+        c.lineCap = 'round';
+        const n = this.level === 0 ? 8 : 14;
+        c.beginPath();
+        for (let i = 0; i < n; i++) {
+          const a = i / n * 6.283 + this.t * 0.5;
+          const h = z.r * (0.94 + 0.22 * Math.sin(this.t * 7 + i * 1.7));
+          c.moveTo(z.x + Math.cos(a) * z.r * 0.66, z.y + Math.sin(a) * z.r * 0.66);
+          c.lineTo(z.x + Math.cos(a) * h, z.y + Math.sin(a) * h);
+        }
+        c.stroke();
+        c.lineCap = 'butt';
+        c.globalAlpha = 1;
+        return;
+      }
+      if (z.k === 'well') {
+        // гравитационный колодец: кольца стягиваются к центру
+        c.globalAlpha = .16;
+        c.fillStyle = col;
+        c.beginPath(); c.arc(z.x, z.y, z.r, 0, 6.283); c.fill();
+        c.globalAlpha = .7;
+        c.strokeStyle = '#9db0ff';
+        c.lineWidth = 2;
+        for (let i = 0; i < 3; i++) {
+          const k = ((this.t * 0.8 + i / 3) % 1);
+          c.globalAlpha = .7 * k;
+          c.beginPath(); c.arc(z.x, z.y, z.r * (1 - k) + 6, 0, 6.283); c.stroke();
+        }
+        c.globalAlpha = .9;
+        c.fillStyle = '#cdd8ff';
+        c.beginPath(); c.arc(z.x, z.y, 6, 0, 6.283); c.fill();
+        c.globalAlpha = 1;
+        return;
+      }
       if (z.k === 'mark') {
         c.strokeStyle = col;
         c.lineWidth = 4;
@@ -518,6 +572,23 @@ const Render = {
       if (ef.includes('dr')) {
         c.strokeStyle = 'rgba(244,162,89,.8)'; c.lineWidth = 2;
         c.beginPath(); c.arc(x, y, 40, 0, 6.283); c.stroke();
+      }
+      if (ef.includes('anchor')) {
+        // «пригвождён к земле»: скобы под ногами
+        c.strokeStyle = 'rgba(120,150,255,.9)'; c.lineWidth = 3;
+        c.beginPath();
+        c.moveTo(x - W / 2 - 6, y + H / 2 + 2); c.lineTo(x + W / 2 + 6, y + H / 2 + 2);
+        c.moveTo(x - W / 2 + 2, y + H / 2 + 2); c.lineTo(x - W / 2 - 4, y + H / 2 - 8);
+        c.moveTo(x + W / 2 - 2, y + H / 2 + 2); c.lineTo(x + W / 2 + 4, y + H / 2 - 8);
+        c.stroke();
+      }
+      if (ef.includes('weak')) {
+        // ослаблен: серая стрелка вниз над головой
+        c.fillStyle = 'rgba(160,168,190,.95)';
+        c.beginPath();
+        c.moveTo(x + 26, y - H / 2 - 6); c.lineTo(x + 34, y - H / 2 - 16);
+        c.lineTo(x + 18, y - H / 2 - 16);
+        c.closePath(); c.fill();
       }
       if (ef.includes('slow')) {
         c.fillStyle = 'rgba(140,215,255,.18)';
