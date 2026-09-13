@@ -228,6 +228,8 @@ class World:
     def heal(self, target, amount, src=None):
         if not target.alive:
             return 0.0
+        if target.has("burn"):
+            amount *= 0.5         # горящего вылечить вдвое труднее
         before = target.hp
         target.hp = min(target.max_hp, target.hp + amount)
         got = target.hp - before
@@ -418,7 +420,9 @@ class World:
         f.speed_mul = 1.0
         f.dmg_mul = 1.0
         dead = []
-        for name, e in f.effects.items():
+        # list(): burn внутри вызывает damage(), а хуки героев могут навесить
+        # новый эффект прямо посреди обхода
+        for name, e in list(f.effects.items()):
             e["t"] -= C.DT
             if e["t"] <= 0:
                 dead.append(name)
@@ -437,7 +441,13 @@ class World:
             elif name == "invuln":
                 f.iframes = max(f.iframes, C.DT * 2)
             elif name == "burn":
-                self.damage(self.fighters.get(e.get("src")), f, m * C.DT, fx="burn")
+                # копим урон и выдаём порциями: иначе 60 вызовов damage + 60 fx в секунду
+                acc = e.get("acc", 0.0) + m * C.DT
+                if acc >= 1.0 or e["t"] <= C.DT:
+                    self.damage(self.fighters.get(e.get("src")), f, acc,
+                                fx="burn", tag="burn")
+                    acc = 0.0
+                e["acc"] = acc
             elif name == "regen":
                 self.heal(f, m * C.DT)
         for name in dead:
