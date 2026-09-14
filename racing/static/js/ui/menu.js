@@ -150,6 +150,55 @@ export function itemIconSvg(itemId, size, fill) {
         + ITEM_PATHS[def.id] + '</svg>';
 }
 
+// --- время суток комнаты ----------------------------------------------------
+//
+// Это НАСТРОЙКА КОМНАТЫ (settings.time_of_day), а не личная галочка графики:
+// её видят все игроки. Личное переопределение живёт отдельно, в блоке
+// настроек графики (`racing.gfx.timeofday`, значение `auto` = «как в комнате»).
+//
+// Список и подписи держатся здесь одним местом: их берёт и форма создания
+// комнаты, и панель настроек лобби. Погода, когда приедет, ляжет рядом
+// такой же тройкой (значения, подписи, иконка).
+
+export const ROOM_TIMES_OF_DAY = ['day', 'dusk', 'night'];
+
+export const ROOM_TOD_LABELS = { day: 'День', dusk: 'Закат', night: 'Ночь' };
+
+const ROOM_TOD_DESC = {
+    day: 'Солнце высоко, всё видно',
+    dusk: 'Низкое солнце и длинные тени',
+    night: 'Фары, фонари и окна',
+};
+
+/** Подпись времени суток; неизвестное значение показываем как есть. */
+export function timeOfDayLabel(tod) {
+    return ROOM_TOD_LABELS[tod] || tod || '';
+}
+
+// Рисунок иконки: один и тот же контур обводится дважды — тёмным «карандашом»
+// и цветом, как у силуэта трассы, чтобы кнопки стояли в одном стиле.
+const TOD_ART = {
+    day: '<circle cx="34" cy="27" r="8"/>'
+        + '<path d="M34 10v4M34 40v4M13 27h4M51 27h4M20 13l3 3M45 38l3 3M48 13l-3 3M23 38l-3 3"/>',
+    dusk: '<path d="M10 41h48"/><path d="M21 41a13 13 0 0 1 26 0"/>'
+        + '<path d="M34 13v5M14 22l4 4M54 22l-4 4"/>',
+    night: '<path d="M39 13a15 15 0 1 0 13 24A17 17 0 0 1 39 13z"/>'
+        + '<path d="M19 18v.01M15 30v.01M25 38v.01"/>',
+};
+
+const TOD_COLORS = { day: '#ffc53d', dusk: '#ff8a3d', night: '#7aa7ff' };
+
+/** Иконка времени суток в том же кадре 68x56, что и силуэт трассы. */
+export function timeOfDayIconSvg(tod, size) {
+    const art = TOD_ART[tod] || TOD_ART.day;
+    const color = TOD_COLORS[tod] || TOD_COLORS.day;
+    return '<svg viewBox="0 0 68 56" width="' + size + '" height="' + (size * 56 / 68)
+        + '" fill="none" stroke-linecap="round" stroke-linejoin="round">'
+        + '<g stroke="#080a12" stroke-width="10">' + art + '</g>'
+        + '<g stroke="' + color + '" stroke-width="5">' + art + '</g>'
+        + '</svg>';
+}
+
 /** Силуэт трассы для карточки выбора: три разных контура по теме. */
 export function trackIconSvg(theme, size) {
     const paths = {
@@ -211,9 +260,12 @@ const STATE_LABELS = {
 };
 
 // Настройки комнаты по умолчанию — ровно схема из раздела 9.
+// time_of_day здесь только заглушка: настоящее умолчание приходит из
+// описания выбранной карты (welcome.content.tracks[].time_of_day).
 function defaultRoomSettings() {
     return {
         track: 'office',
+        time_of_day: ROOM_TIMES_OF_DAY[0],
         laps: 3,
         max_players: 8,
         items_enabled: true,
@@ -579,6 +631,30 @@ export class MenuScreen {
         trackField.appendChild(this.trackCards);
         grid.appendChild(trackField);
 
+        // Время суток: настройка комнаты, стоит сразу под выбором карты,
+        // потому что умолчание берётся именно из карты.
+        const todField = el('div', 'field form-wide');
+        todField.appendChild(el('div', 'label', 'Время суток'));
+        this.todCards = el('div', 'track-cards');
+        this.todButtons = [];
+        for (let i = 0; i < ROOM_TIMES_OF_DAY.length; i++) {
+            const tod = ROOM_TIMES_OF_DAY[i];
+            const card = el('button', 'track-card');
+            card.type = 'button';
+            const art = el('div');
+            art.innerHTML = timeOfDayIconSvg(tod, 68);
+            card.appendChild(art);
+            card.appendChild(el('div', 't-name', ROOM_TOD_LABELS[tod]));
+            card.appendChild(el('div', 't-desc', ROOM_TOD_DESC[tod]));
+            card.addEventListener('click', () => this._selectTimeOfDay(tod));
+            this.todCards.appendChild(card);
+            this.todButtons.push({ id: tod, node: card });
+        }
+        todField.appendChild(this.todCards);
+        this.todHint = el('div', 'gfx-hint');
+        todField.appendChild(this.todHint);
+        grid.appendChild(todField);
+
         // Круги
         const lapsField = el('div', 'field');
         lapsField.appendChild(el('div', 'label', 'Кругов'));
@@ -736,8 +812,10 @@ export class MenuScreen {
         }
         if (tracks.length && !this._hasTrack(this.draft.track)) {
             this.draft.track = tracks[0].id;
+            this.draft.time_of_day = this._trackTimeOfDay(this.draft.track);
         }
         this._syncTrackCards();
+        this._syncTimeOfDay();
     }
 
     _hasTrack(id) {
@@ -747,8 +825,46 @@ export class MenuScreen {
     }
 
     _selectTrack(id) {
+        // Правило то же, что на сервере (см. validate_settings): время суток,
+        // равное предложению ПРЕДЫДУЩЕЙ карты, ехало за картой — пусть едет
+        // и за новой. Выбранное руками (отличное от предложения) остаётся.
+        if (this.draft.time_of_day === this._trackTimeOfDay(this.draft.track)) {
+            this.draft.time_of_day = this._trackTimeOfDay(id);
+        }
         this.draft.track = id;
         this._syncTrackCards();
+        this._syncTimeOfDay();
+    }
+
+    /** Время суток, предложенное описанием карты (welcome.content.tracks[]). */
+    _trackTimeOfDay(id) {
+        const tracks = (this.content && this.content.tracks) || [];
+        for (let i = 0; i < tracks.length; i++) {
+            if (tracks[i].id === id) {
+                const tod = tracks[i].time_of_day;
+                if (ROOM_TIMES_OF_DAY.indexOf(tod) >= 0) return tod;
+            }
+        }
+        return ROOM_TIMES_OF_DAY[0];
+    }
+
+    _selectTimeOfDay(tod) {
+        this.draft.time_of_day = tod;
+        this._syncTimeOfDay();
+    }
+
+    _syncTimeOfDay() {
+        if (!this.todButtons) return;
+        const chosen = this.draft.time_of_day;
+        for (let i = 0; i < this.todButtons.length; i++) {
+            const entry = this.todButtons[i];
+            entry.node.classList.toggle('is-active', entry.id === chosen);
+        }
+        // Выбор руками не перетирается сменой карты, поэтому расхождение
+        // с предложением карты показываем прямо здесь, а не молчим о нём.
+        const proposed = this._trackTimeOfDay(this.draft.track);
+        this.todHint.textContent = proposed === chosen
+            ? '' : 'Карта предлагает: ' + ROOM_TOD_LABELS[proposed];
     }
 
     _syncTrackCards() {
@@ -786,12 +902,15 @@ export class MenuScreen {
             const tracks = (this.content && this.content.tracks) || [];
             if (tracks.length) this.draft.track = tracks[0].id;
         }
+        // Форма открывается с умолчанием выбранной карты — как и в лобби.
+        this.draft.time_of_day = this._trackTimeOfDay(this.draft.track);
         this.roomNameInput.value = 'Комната: ' + this.getName();
         this.lapsStepper.set(this.draft.laps);
         this.maxStepper.set(this.draft.max_players);
         this.collisionsInput.checked = this.draft.collisions;
         this.mirrorInput.checked = this.draft.mirror;
         this._syncTrackCards();
+        this._syncTimeOfDay();
         this._syncItemChecks();
         this.modalBack.hidden = false;
         this.roomNameInput.focus();
@@ -807,6 +926,7 @@ export class MenuScreen {
         // Отправляем ровно схему раздела 9: лишних полей быть не должно.
         const settings = {
             track: this.draft.track,
+            time_of_day: this.draft.time_of_day,
             laps: this.draft.laps,
             max_players: this.draft.max_players,
             items_enabled: this.draft.items_enabled,

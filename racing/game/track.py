@@ -54,6 +54,11 @@ GRID_LANE_MAX = 3.4        # м, дальше от оси не отходим д
 
 ITEM_ROW_SPREAD = 0.72     # доля половины ширины, по которой раскидан ряд боксов
 
+# Время суток, предложенное описанием трассы (§12.16). Это ТОЛЬКО умолчание:
+# настоящее время суток выбирается в лобби и живёт в настройках комнаты.
+TIMES_OF_DAY = ('day', 'dusk', 'night')
+DEFAULT_TIME_OF_DAY = TIMES_OF_DAY[0]
+
 # Круг засчитывается по floor(progress / length) в момент пересечения линии.
 # progress в этот момент только что перешагнул кратное длине круга, и запас
 # в микрометр снимает вопрос о единице в последнем разряде.
@@ -138,6 +143,9 @@ class Track(object):
         self.desc = data.get('desc', '')
         self.difficulty = int(data.get('difficulty', 1))
         self.theme = data.get('theme', 'city')
+        # Умолчание времени суток из описания карты: лобби предлагает его при
+        # выборе трассы, а выбранное значение приезжает в настройках комнаты.
+        self.time_of_day = data.get('time_of_day', DEFAULT_TIME_OF_DAY)
         self.decor_seed = int(data.get('decor_seed', 0))
         self.width = float(data['width'])
         self.mirror = bool(mirror)
@@ -556,6 +564,9 @@ class Track(object):
                 'id': self.id,
                 'name': self.name,
                 'theme': self.theme,
+                # Умолчание окружения карты: рендер берёт его, только если
+                # комната по какой-то причине ничего не выбрала (§12.16).
+                'time_of_day': self.time_of_day,
                 'length': self.length,
                 'sample_step': self._step,
                 'count': self._n,
@@ -757,6 +768,10 @@ def _validate(data):
     for p in control:
         if not isinstance(p, (list, tuple)) or len(p) != 2:
             raise ValueError('control: точка должна быть парой [x, z], а не %r' % (p,))
+    tod = data.get('time_of_day', DEFAULT_TIME_OF_DAY)
+    if tod not in TIMES_OF_DAY:
+        raise ValueError('time_of_day: ожидалось одно из %s, получено %r'
+                         % ('/'.join(TIMES_OF_DAY), tod))
     width = float(data['width'])
     if width < 5.0 or width > 40.0:
         raise ValueError('width: ожидалась полная ширина 5..40 м, получено %r' % width)
@@ -801,6 +816,7 @@ def catalog(tracks_dir: str) -> list:
             'desc': track.desc,
             'difficulty': track.difficulty,
             'theme': track.theme,
+            'time_of_day': track.time_of_day,
             'preview': track.preview_path(),
         })
     out.sort(key=lambda item: (item['difficulty'], item['id']))

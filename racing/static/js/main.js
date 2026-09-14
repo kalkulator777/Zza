@@ -295,6 +295,13 @@ function onRoom(msg) {
         hud.setPause('running', '');
     }
     if (msg.settings && msg.settings.laps) app.lapsTotal = msg.settings.laps | 0;
+    // Окружение гонки (время суток, дальше — погода) живёт в настройках
+    // комнаты. Рендер принимает их ОДНИМ плоским объектом и молча пропускает
+    // всё лишнее (§12.16), поэтому отдаём настройки целиком: когда приедет
+    // weather, эту строку править не придётся. Сообщаем об изменении сразу
+    // в лобби — чтобы выбранное было видно, не дожидаясь старта, и чтобы
+    // гонка собралась с ним с первого кадра.
+    if (msg.settings) renderer.setEnvironment(msg.settings);
 
     if (state === 'LOBBY') {
         teardownRace();
@@ -334,7 +341,11 @@ function onRaceInit(msg) {
 
     // net.js уже построил Track из этого же сообщения — отдаём рендеру его же
     // экземпляр, чтобы геометрия не считалась дважды.
-    renderer.createRace(net.track || msg.track, players, { localSlot: app.localSlot });
+    // env — настройки комнаты целиком (см. onRoom): рендер возьмёт из них
+    // время суток, а личная галочка `racing.gfx.timeofday` (кроме `auto`)
+    // перебьёт комнату уже внутри рендера.
+    renderer.createRace(net.track || msg.track, players,
+        { localSlot: app.localSlot, env: msg.settings });
     app.raceBuilt = true;
 
     hud.setupRace(msg, app.localSlot);

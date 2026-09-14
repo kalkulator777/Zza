@@ -148,23 +148,13 @@ export function normalizeEnvironment(src, fallback) {
  * Время суток, предложенное описанием трассы.
  *
  * Это ТОЛЬКО значение по умолчанию: настоящее время суток выбирается в лобби
- * и приходит в настройках комнаты. Поле ищется там, где оно может лежать,
- * когда серверная часть его пробросит: в объекте трассы из race_init
- * (`track.time_of_day`) или в клиентском Track (`track.timeOfDay`).
- *
- * ВРЕМЕННАЯ ПОДПОРКА. `Track.to_client()` (контракт 12.1) поля `time_of_day`
- * НЕ передаёт, а game/track.py принадлежит другому исполнителю. Пока поле не
- * пробросят, умолчание берётся из таблицы ниже по идентификатору трассы —
- * ровно те же значения, что лежат в content/tracks/*.json. Как только
- * to_client() начнёт отдавать поле, таблица перестанет на что-либо влиять:
- * она проверяется последней.
+ * и приходит в настройках комнаты. Поле ищется там, где оно лежит: в объекте
+ * трассы из race_init (`track.time_of_day`, контракт 12.1) или в клиентском
+ * Track (`track.timeOfDay`).
  */
-const TRACK_TOD_FALLBACK = { avenue: 'night' };
-
 export function trackDefaultEnvironment(track) {
     if (!track) return ENV_DEFAULT;
     let tod = track.time_of_day !== undefined ? track.time_of_day : track.timeOfDay;
-    if (TIMES_OF_DAY.indexOf(tod) < 0) tod = TRACK_TOD_FALLBACK[track.id];
     if (TIMES_OF_DAY.indexOf(tod) < 0) tod = 'day';
     let weather = track.weather;
     if (WEATHERS.indexOf(weather) < 0) weather = 'clear';

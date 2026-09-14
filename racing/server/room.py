@@ -76,6 +76,22 @@ class SettingsError(Exception):
         self.message = message
 
 
+# --- окружение гонки ---------------------------------------------------------
+
+def track_environment(track):
+    """Умолчание окружения, которое предлагает описание трассы (§12.16).
+
+    Поля перечислены в config.ENV_FIELDS: время суток сейчас, погода следующим
+    этапом. Мусор в описании карты сюда не пролезет — значение вне списка
+    заменяется первым допустимым.
+    """
+    env = {}
+    for name, allowed, _code, _label in config.ENV_FIELDS:
+        value = getattr(track, name, None)
+        env[name] = value if value in allowed else allowed[0]
+    return env
+
+
 # --- каталог контента --------------------------------------------------------
 
 class ContentLibrary(object):
@@ -98,6 +114,7 @@ class ContentLibrary(object):
         self.colors = list(config.COLORS)
         self.issues = []             # что не загрузилось — печатается при старте
         self._geometry = {}          # (track_id, mirror) -> Track
+        self._track_env = {}         # track_id -> умолчание окружения (§12.16)
         self.welcome_content = {'tracks': [], 'cars': [], 'colors': self.colors}
 
     def load(self):
@@ -137,16 +154,21 @@ class ContentLibrary(object):
                 continue
             self._geometry[(track.id, False)] = track
             self._geometry[(track.id, True)] = mirrored
+            self._track_env[track.id] = track_environment(track)
             ids.append(track.id)
             # Поле preview из схемы welcome убрано (§12.6): файлов-картинок
             # в проекте нет, силуэт трассы интерфейс рисует сам по теме.
-            catalog.append({
+            entry = {
                 'id': track.id,
                 'name': track.name,
                 'desc': track.desc,
                 'difficulty': track.difficulty,
                 'theme': track.theme,
-            })
+            }
+            # Умолчание окружения карты: лобби предлагает его при выборе
+            # трассы (§12.16). Поля берутся таблицей, погода приедет сюда сама.
+            entry.update(self._track_env[track.id])
+            catalog.append(entry)
         catalog.sort(key=lambda item: (item['difficulty'], item['id']))
         self.tracks = catalog
         self.track_ids = tuple(item['id'] for item in catalog)
@@ -244,6 +266,18 @@ class ContentLibrary(object):
         """Готовая геометрия трассы из кэша или None, если такой трассы нет."""
         return self._geometry.get((track_id, bool(mirror)))
 
+    def environment(self, track_id):
+        """Окружение, предложенное описанием трассы (§12.16).
+
+        Это только умолчание для настроек комнаты: выбирает время суток лобби.
+        Для неизвестной трассы возвращается первый вариант каждого поля —
+        сервер обязан отвечать осмысленно даже на мусор.
+        """
+        env = self._track_env.get(track_id)
+        if env is None:
+            return {name: allowed[0] for name, allowed, _c, _l in config.ENV_FIELDS}
+        return dict(env)
+
     def default_track_id(self):
         return self.track_ids[0] if self.track_ids else ''
 
@@ -255,6 +289,7 @@ class ContentLibrary(object):
         settings = dict(config.DEFAULT_SETTINGS)
         settings['items'] = list(config.DEFAULT_SETTINGS['items'])
         settings['track'] = self.default_track_id()
+        settings.update(self.environment(settings['track']))
         return settings
 
 
@@ -284,6 +319,39 @@ def validate_settings(raw, content, base=None, min_players=1):
         raise SettingsError('bad_track', 'на сервере нет ни одной трассы')
     if out['track'] not in content.track_ids:
         raise SettingsError('bad_track', 'нет такой трассы')
+
+    # --- окружение: время суток и (задел) погода (§12.16) -------------------
+    #
+    # Поля окружения проверяются одним циклом по config.ENV_FIELDS, поэтому
+    # погода добавится строкой в таблице, а не правкой этого кода.
+    #
+    # Умолчание у каждого поля своё на каждой карте, и при смене карты оно
+    # должно измениться само. Но ручной выбор перетирать нельзя, а отличить
+    # его от «значения, которое просто ехало за картой» можно без лишнего
+    # состояния: значение, равное предложению ПРЕДЫДУЩЕЙ карты, шло за ней —
+    # пусть идёт и за новой. Всё остальное выбрано человеком и остаётся как
+    # есть. Клиент присылает настройки целиком, поэтому правило применяется
+    # и к полю, пришедшему в raw: иначе смена карты никогда бы не двигала
+    # время суток.
+    prev_track = base.get('track') if base else None
+    new_env = content.environment(out['track'])
+    prev_env = content.environment(prev_track) if prev_track else None
+    track_changed = prev_track is not None and prev_track != out['track']
+    for name, allowed, code, label in config.ENV_FIELDS:
+        if name in raw:
+            value = raw[name]
+            if not isinstance(value, str) or value not in allowed:
+                raise SettingsError(code, '%s: ожидается одно из %s'
+                                    % (label, ', '.join(allowed)))
+        elif base is None:
+            # Новая комната и поля в запросе нет: берём умолчание выбранной
+            # карты, а не то, что лежит в общих умолчаниях сервера.
+            value = new_env[name]
+        else:
+            value = out.get(name)
+        if track_changed and value == prev_env[name]:
+            value = new_env[name]
+        out[name] = value if value in allowed else new_env[name]
 
     if 'laps' in raw:
         laps = raw['laps']
