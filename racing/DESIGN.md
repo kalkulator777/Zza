@@ -291,6 +291,9 @@ u8   box_mask_len
 
 Точные схемы полей каждого события — в разделе 9.
 
+**Раздел 9 — источник истины по схемам.** Он синхронизирован с приложением 12;
+при любом расхождении между ними прав раздел 9.
+
 ---
 
 ## 6. Физика
@@ -656,21 +659,24 @@ LOBBY -> COUNTDOWN -> RACING -> RESULTS -> LOBBY
 ### Схемы JSON-событий
 
 ```jsonc
-// welcome
-{"t":"welcome","slot_token":"...","is_host":true,"server_name":"Комп Васи",
- "content":{"tracks":[{"id","name","desc","difficulty","theme","preview"}],
-            "cars":[{"id","name","desc","bars"}],
+// welcome — приходит один раз, сразу после hello.
+// slot почти всегда null: слот выдаётся только при входе в комнату (см. room.you).
+{"t":"welcome","slot":null,"slot_token":"...","is_host":true,"server_name":"Комп Васи",
+ "content":{"tracks":[{"id","name","desc","difficulty","theme"}],
+            "cars":[{"id","name","desc","bars","style","stats","shape"}],
             "colors":["#e5484d", ...]}}
 
 // rooms
 {"t":"rooms","rooms":[{"id","name","track","laps","players","max_players","state"}],
  "servers":[{"name","url","players","rooms"}]}
 
-// room
-{"t":"room","id":"...","name":"...","owner_slot":0,"state":"LOBBY",
+// room — приходит при входе и при любом изменении лобби.
+// you — собственный слот получателя, всегда число 0..7. Владелец: you === owner_slot.
+// Событие сериализуется под каждого получателя отдельно, потому что you у всех разное.
+{"t":"room","id":"...","name":"...","owner_slot":0,"you":3,"state":"LOBBY",
  "settings":{...},
  "players":[{"slot","name","car","color","ready","spectator","ping"}],
- "chat":[{"slot","name","text","ts"}]}
+ "chat":[{"slot","name","text","ts"}]}      // slot < 0 — системное сообщение
 
 // race_init
 {"t":"race_init","track":{...to_client()...},"laps":3,
@@ -1179,3 +1185,25 @@ for player in room.players:
 Замерено: `nearest_index` 1,0–1,1 мкс с хорошей подсказкой, 7,2–8,1 мкс
 при потерянной; `surface` 1,6 мкс. На тик при восьми машинах около 20 мкс.
 Геометрия трассы строится 6–7 мс и кэшируется.
+
+### 12.8. Как клиент узнаёт свой слот
+
+Слот — это **место в конкретной комнате**, а не личность игрока: он выдаётся
+при входе, меняется при переходе в другую комнату и освобождается при выходе.
+Поэтому:
+
+```
+welcome      -> slot === null (почти всегда): запомнить slot_token и is_host
+room (любое) -> setLocalSlot(msg.you); владелец = (msg.you === msg.owner_slot)
+leave_room   -> setLocalSlot(null): цвет освобождён
+```
+
+`you` приходит в **каждом** событии `room`, поэтому ловить какое-то особенное
+«первое» событие не нужно, и после перехода в другую комнату значение
+обновится само.
+
+**Завершение гонки.** Штатный путь — `sim.is_over()`. `FINISH_GRACE` (45 с
+после финиша лидера) и `RACE_TIMEOUT` (10 минут) остаются страховкой.
+Все три пути протестированы: комната останавливает цикл тиков, рассылает
+`results` всем, переходит в `RESULTS`, затем автоматически в `LOBBY`
+со снятой готовностью.
