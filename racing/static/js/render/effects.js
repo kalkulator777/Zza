@@ -44,7 +44,7 @@
  */
 
 import * as THREE from 'three';
-import { MeshBuilder, solidify, mergeGeometries, toColor, disposeObject } from './geomutil.js';
+import { MeshBuilder, solidify, mergeGeometries, toColor, disposeObject, fadeAdditiveFog } from './geomutil.js';
 import {
     FLAG_OFFTRACK,
     FLAG_DRIFTING,
@@ -567,6 +567,8 @@ export class Effects {
             forceSinglePass: true
         });
         this.lampMat.name = 'fxLamp';
+        // аддитивный ореол в тумане гаснет в чёрное, а не подкрашивает воздух
+        fadeAdditiveFog(this.lampMat, 'fxLamp');
         this.lampMesh = makeInstanced(makeParticleQuad(), this.lampMat, LAMP_CAP, 'fxLampMesh');
         this.lampMesh.renderOrder = 7;
         this.group.add(this.lampMesh);
@@ -688,8 +690,10 @@ export class Effects {
     setNight(k) {
         const n = k > 0 ? (k > 1.5 ? 1.5 : k) : 0;
         this.nightK = n;
-        this.headSize = 1.0 + n * 1.35;   // ореол фары заметно крупнее
-        this.headGain = 1.0 + n * 0.55;
+        // Ореол фары ночью крупнее и ярче, но в меру: он не должен забивать
+        // сам кузов и пятно света на асфальте — светит дорога, а не блик.
+        this.headSize = 1.0 + n * 0.9;
+        this.headGain = 1.0 + n * 0.38;
         this.tailSize = 1.0 + n * 0.45;
         this.tailGain = 1.0 + n * 0.5;
         this.boostGain = 1.0 + n * 0.35;

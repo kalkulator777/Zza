@@ -76,7 +76,8 @@ import {
     bakeProximityAO,
     disposeObject,
     countTriangles,
-    SphereAccum
+    SphereAccum,
+    fadeAdditiveFog
 } from './geomutil.js';
 import { readTrack, createTerrainSampler } from './trackmesh.js';
 
@@ -103,6 +104,16 @@ const THEME_DENSITY = { city: 1.0, mountain: 0.82, industrial: 1.0 };
 
 /** Целевая длина корзины вдоль дуги, м. */
 const BUCKET_LENGTH = 45.0;
+
+/**
+ * Запас к радиусу ограничивающей сферы экземпляра, м.
+ *
+ * Деревья, флаги и толпа гнутся в ВЕРШИННОМ шейдере, и геометрия об этом не
+ * знает: её ограничивающая сфера посчитана по покоящимся вершинам. Размах
+ * качания — сантиметры, но объект у самой кромки кадра не должен мигать
+ * из-за них. Полметра запаса стоят долей процента лишних инстансов.
+ */
+const INSTANCE_MARGIN = 0.5;
 
 // ---------------------------------------------------------------------------
 // Окружение: время суток и (задел) погода
@@ -242,7 +253,8 @@ function makeDusk(day, night) {
         fog: mixHex(mixHex(day.fog, night.fog, t), '#b06a42', 0.34),
         ambient: {
             color: mixHex(mixHex(day.ambient.color, night.ambient.color, t), '#b07a58', 0.3),
-            intensity: lerp(day.ambient.intensity, night.ambient.intensity, t)
+            // земля темнеет медленнее неба: иначе на закате асфальт уже ночной
+            intensity: lerp(day.ambient.intensity, night.ambient.intensity, 0.44)
         },
         dir: {
             // солнце у самого горизонта: длинные косые тени в вершинном свете
@@ -1016,8 +1028,9 @@ function addInstanced(ctx, name, geometry, placements, opts) {
         set.sphere[so] = sph.center.x;
         set.sphere[so + 1] = sph.center.y;
         set.sphere[so + 2] = sph.center.z;
-        set.sphere[so + 3] = sph.radius;
-        if (b < bucketCount) accums[b].add(sph.center.x, sph.center.y, sph.center.z, sph.radius);
+        const r = sph.radius + INSTANCE_MARGIN;
+        set.sphere[so + 3] = r;
+        if (b < bucketCount) accums[b].add(sph.center.x, sph.center.y, sph.center.z, r);
 
         if (p.color && set.srcC && !o.ignoreColor) {
             toColor(p.color, col);
@@ -2152,6 +2165,7 @@ function glowMaterial(ctx) {
             forceSinglePass: true
         });
         m.name = 'sceneryGlow';
+        fadeAdditiveFog(m, 'sceneryGlow');
         ctx.glowMat = m;
         ctx.materials.push(m);
     }
@@ -2161,7 +2175,14 @@ function glowMaterial(ctx) {
 /** Общий неосвещаемый материал самосветящихся поверхностей (окна, щиты). */
 function emitMaterial(ctx) {
     if (!ctx.emitMat) {
-        const m = new THREE.MeshBasicMaterial({ vertexColors: true, fog: true });
+        // DoubleSide здесь ничего не стоит: материал непрозрачный, второго
+        // прохода не будет (12.11 — про прозрачные), зато окно на любой
+        // грани коробки гарантированно видно, как бы ни легла его намотка
+        const m = new THREE.MeshBasicMaterial({
+            vertexColors: true,
+            fog: true,
+            side: THREE.DoubleSide
+        });
         m.name = 'sceneryEmissive';
         ctx.emitMat = m;
         ctx.materials.push(m);
@@ -2176,25 +2197,42 @@ function emitMaterial(ctx) {
  */
 function lampGlowGeometry(seg, k) {
     const b = new MeshBuilder();
-    const n = Math.max(6, seg);
+    // Граней вдвое больше, чем у самого фонаря: восьмигранный конус света
+    // читается как пирамида, а не как луч. Треугольники тут дешёвые —
+    // фонарей в кадре десятки, а не тысячи.
+    const n = Math.max(10, seg * 2);
     const cx = 0.78;
     const yTop = 5.84;
     const rTop = 0.34;
-    const rBot = 4.6;
+    const rBot = 3.8;
     const yBot = 0.07;
-    const hot = new THREE.Color(0.55 * k, 0.47 * k, 0.30 * k);
-    const mid = new THREE.Color(0.20 * k, 0.17 * k, 0.10 * k);
+    // Яркость подобрана по ночному кадру и она НАМНОГО меньше, чем кажется
+    // по числам. Причин две: стенок у конуса две (материал двусторонний,
+    // обе прибавляются), и цвет здесь линейный — на экран он выходит через
+    // sRGB, где 0,06 линейных это уже четверть шкалы. Первая версия с 0,55
+    // давала белую пирамиду вместо луча.
+    const hot = new THREE.Color(0.0082 * k, 0.0071 * k, 0.0047 * k);
+    // пятно на асфальте, наоборот, должно читаться: односторонняя плоскость
+    const mid = new THREE.Color(0.21 * k, 0.18 * k, 0.115 * k);
     const zero = new THREE.Color(0, 0, 0);
     const a = [0, 0, 0], b2 = [0, 0, 0], c2 = [0, 0, 0], d2 = [0, 0, 0];
 
-    for (let i = 0; i < n; i++) {
-        const t0 = (i / n) * Math.PI * 2;
-        const t1 = ((i + 1) / n) * Math.PI * 2;
-        a[0] = cx + Math.cos(t0) * rTop; a[1] = yTop; a[2] = Math.sin(t0) * rTop;
-        b2[0] = cx + Math.cos(t1) * rTop; b2[1] = yTop; b2[2] = Math.sin(t1) * rTop;
-        c2[0] = cx + Math.cos(t1) * rBot; c2[1] = yBot; c2[2] = Math.sin(t1) * rBot;
-        d2[0] = cx + Math.cos(t0) * rBot; d2[1] = yBot; d2[2] = Math.sin(t0) * rBot;
-        b.quadVC(a, b2, c2, d2, hot, hot, zero, zero);
+    // Две вложенные оболочки вместо одной. Луч зрения через середину конуса
+    // пересекает четыре стенки, через край — две, и шахта получает мягкий
+    // поперечный градиент. Одна оболочка светится ровно до самого силуэта и
+    // читается плоской пирамидой; это дешевле любого шейдера.
+    const shells = [1.0, 0.52];
+    for (let sh = 0; sh < shells.length; sh++) {
+        const kr = shells[sh];
+        for (let i = 0; i < n; i++) {
+            const t0 = (i / n) * Math.PI * 2;
+            const t1 = ((i + 1) / n) * Math.PI * 2;
+            a[0] = cx + Math.cos(t0) * rTop * kr; a[1] = yTop; a[2] = Math.sin(t0) * rTop * kr;
+            b2[0] = cx + Math.cos(t1) * rTop * kr; b2[1] = yTop; b2[2] = Math.sin(t1) * rTop * kr;
+            c2[0] = cx + Math.cos(t1) * rBot * kr; c2[1] = yBot; c2[2] = Math.sin(t1) * rBot * kr;
+            d2[0] = cx + Math.cos(t0) * rBot * kr; d2[1] = yBot; d2[2] = Math.sin(t0) * rBot * kr;
+            b.quadVC(a, b2, c2, d2, hot, hot, zero, zero);
+        }
     }
 
     // пятно на земле: веер от яркой середины к нулю по краю
@@ -2211,7 +2249,7 @@ function lampGlowGeometry(seg, k) {
     // Само пятно плафона — здесь же, в этой геометрии: отдельный меш стоил бы
     // целый draw call ради восьми треугольников. Аддитивный октаэдр читается
     // как горящая лампа с любой стороны.
-    const bulb = new THREE.Color(0.85 * k, 0.72 * k, 0.45 * k);
+    const bulb = new THREE.Color(0.62 * k, 0.52 * k, 0.33 * k);
     const oct = [
         [0, 0.55, 0], [0.55, 0, 0], [0, 0, 0.55], [-0.55, 0, 0], [0, 0, -0.55], [0, -0.55, 0]
     ];

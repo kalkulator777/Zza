@@ -1082,3 +1082,40 @@ export function rangeSphere(positions, start, count, out, off) {
     out[off + 2] = cz;
     out[off + 3] = Math.sqrt(hx * hx + hy * hy + hz * hz);
 }
+
+/**
+ * Аддитивный материал в тумане обязан гаснуть В ЧЁРНОЕ, а не в цвет тумана.
+ *
+ * Штатный `fog_fragment` подмешивает к цвету фрагмента цвет тумана. Для
+ * обычной поверхности это верно, а для аддитивного смешивания — нет: далёкий
+ * ореол вместо того, чтобы исчезнуть, начинает ПРИБАВЛЯТЬ к фону цвет тумана.
+ * Десяток далёких фонарей так поднимают небо у горизонта на несколько
+ * ступеней яркости. Побочный эффект важнее косметики: пока далёкий ореол
+ * что-то добавляет к кадру, отсечение по дальности перестаёт быть
+ * бесплатным — убрать его становится видно.
+ *
+ * Здесь та же строка смешивания уводит цвет в ноль: свет по дороге
+ * рассеивается, а не подкрашивает воздух.
+ */
+export function fadeAdditiveFog(material, key) {
+    // onBeforeCompile получает ИСХОДНИК ДО раскрытия #include: подменять надо
+    // сам include, а не строку из чанка — её в этот момент ещё нет.
+    const body = [
+        '#ifdef USE_FOG',
+        '  #ifdef FOG_EXP2',
+        '    float fogFactor = 1.0 - exp( - fogDensity * fogDensity * vFogDepth * vFogDepth );',
+        '  #else',
+        '    float fogFactor = smoothstep( fogNear, fogFar, vFogDepth );',
+        '  #endif',
+        '  gl_FragColor.rgb = mix( gl_FragColor.rgb, vec3( 0.0 ), fogFactor );',
+        '#endif'
+    ].join('\n');
+    material.onBeforeCompile = function (shader) {
+        shader.fragmentShader = shader.fragmentShader.replace('#include <fog_fragment>', body);
+    };
+    // без своего ключа three.js переиспользует программу обычного материала
+    material.customProgramCacheKey = function () {
+        return 'addFog:' + key;
+    };
+    return material;
+}

@@ -802,7 +802,7 @@ export class RaceRenderer {
             color: 0xfff0cc,
             transparent: true,
             blending: THREE.AdditiveBlending,
-            opacity: 0.55 * this.nightK * Math.min(1.45, nightLights),
+            opacity: 0.62 * this.nightK * Math.min(1.45, nightLights),
             depthWrite: false,
             fog: true
         });
