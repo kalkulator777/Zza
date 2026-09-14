@@ -313,13 +313,12 @@ export function buildCarMesh(shape, bodyColor, quality, opts) {
         setNight: function (k) {
             nightK = k > 0 ? (k > 1.5 ? 1.5 : k) : 0;
             headBase = 0.85 + nightK * 1.5;
-            headMat.emissive.setRGB(
-                1.0,
-                0.95 - nightK * 0.04,
-                0.80 - nightK * 0.10
-            );
+            // значения в рабочем (линейном) пространстве: '#fff2cc' — это
+            // примерно (1.00, 0.88, 0.64), ночью цвет чуть белее
+            headMat.emissive.setRGB(1.0, 0.88 + nightK * 0.05, 0.64 + nightK * 0.12);
             headMat.emissiveIntensity = headOn ? headBase : headBase * 0.14;
-            _brakeOff.setRGB(0.35 + nightK * 0.22, 0.05, 0.05);
+            // '#5a0d0d' — примерно (0.105, 0.007, 0.007)
+            _brakeOff.setRGB(0.105 + nightK * 0.14, 0.007 + nightK * 0.008, 0.007 + nightK * 0.008);
             brakeMat.emissive.copy(_brakeOff);
         },
 

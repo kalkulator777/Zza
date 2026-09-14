@@ -435,8 +435,9 @@ function buildMineGeometry() {
  */
 export class Effects {
     /**
-     * @param {object} opts { quality, fogColor, heightAt }
-     *   heightAt(x, z) — высота поверхности, нужна дыму, минам и взрывам.
+     * @param {object} opts { quality, particles, glow, fogColor, heightAt, night }
+     *   heightAt(x, z) — высота поверхности, нужна дыму, минам и взрывам;
+     *   night — 0 день, 0.5 сумерки, 1 ночь (до 1.5 на ярких огнях).
      */
     constructor(opts) {
         const o = opts || {};
@@ -450,6 +451,11 @@ export class Effects {
         this.particlesOff = qName === 'off';
         // Свечение геометрией — отдельная галочка, независимая от частиц.
         this.glowOn = o.glow !== false;
+        // Ночь: 0 — день, 0.5 — сумерки, 1 — ночь, до 1.5 на ярких огнях.
+        // Фары ночью становятся главным источником картинки, стопы и турбо
+        // читаются издалека. Вспышки взрывов, наоборот, слегка придерживаем:
+        // аддитив по тёмному фону иначе выбивает белое пятно.
+        this.setNight(o.night);
 
         this.time = 0;
         this.heightAt = o.heightAt || null;
@@ -676,6 +682,21 @@ export class Effects {
     }
 
     /**
+     * Ночной режим накладного свечения. Зовётся при сборке гонки и при смене
+     * времени суток; в кадре только читаются готовые множители.
+     */
+    setNight(k) {
+        const n = k > 0 ? (k > 1.5 ? 1.5 : k) : 0;
+        this.nightK = n;
+        this.headSize = 1.0 + n * 1.35;   // ореол фары заметно крупнее
+        this.headGain = 1.0 + n * 0.55;
+        this.tailSize = 1.0 + n * 0.45;
+        this.tailGain = 1.0 + n * 0.5;
+        this.boostGain = 1.0 + n * 0.35;
+        this.flashGain = 1.0 - n * 0.18;  // чтобы взрыв не пересвечивал
+    }
+
+    /**
      * Слот, чья машина в этом кадре скрыта (вид из кокпита). Её накладное
      * свечение не выкладывается.
      */
@@ -796,19 +817,19 @@ export class Effects {
         if (lampsOn) {
             // фары горят постоянно (10.3), кроме машины-призрака — её уже
             // отсекли по FLAG_GHOST выше
-            this.lampRow(view, view.lampHead, 1, LAMP_HEAD_R, LAMP_HEAD_G, LAMP_HEAD_B,
-                1.0, fx, fz, lx, lz);
+            this.lampRow(view, view.lampHead, this.headGain, LAMP_HEAD_R, LAMP_HEAD_G, LAMP_HEAD_B,
+                this.headSize, fx, fz, lx, lz);
 
             // стоп-сигналы: тлеют всегда, при торможении вспыхивают втрое
             const braking = (flags & FLAG_BRAKING) !== 0;
-            this.lampRow(view, view.lampBrake, braking ? 1.0 : 0.34,
+            this.lampRow(view, view.lampBrake, (braking ? 1.0 : 0.34) * this.tailGain,
                 LAMP_BRAKE_R, LAMP_BRAKE_G, LAMP_BRAKE_B,
-                braking ? 1.5 : 0.85, fx, fz, lx, lz);
+                (braking ? 1.5 : 0.85) * this.tailSize, fx, fz, lx, lz);
 
             // выхлоп на турбо: пульсирующий горячий ореол
             if (flags & FLAG_BOOST) {
                 const puls = 0.82 + Math.sin(this.time * 27 + slot) * 0.18;
-                this.lampRow(view, view.lampExhaust, puls,
+                this.lampRow(view, view.lampExhaust, puls * this.boostGain,
                     LAMP_BOOST_R, LAMP_BOOST_G, LAMP_BOOST_B,
                     1.9 * puls, fx, fz, lx, lz);
             }
@@ -1370,9 +1391,10 @@ export class Effects {
             this.flashLife[f] = life;
             const k = life * this.flashInv[f];      // 1 в начале, 0 в конце
             if (this.glowOn) {
+                const fk = k * this.flashGain;
                 this.lamp(this.flashX[f], this.flashY[f], this.flashZ[f],
                     this.flashSize[f] * (1.35 - k * 0.35),
-                    this.flashR[f] * k, this.flashG[f] * k, this.flashB[f] * k);
+                    this.flashR[f] * fk, this.flashG[f] * fk, this.flashB[f] * fk);
             }
             f++;
         }

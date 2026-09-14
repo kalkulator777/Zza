@@ -694,6 +694,8 @@ export class RaceRenderer {
     buildCars(players) {
         if (!players) return;
         const catalog = getCatalog();
+        const nl = NIGHT_LIGHT_K[this.gfx.nightLights] === undefined ? 1 : NIGHT_LIGHT_K[this.gfx.nightLights];
+        const night = this.nightK * nl;
         for (let i = 0; i < players.length; i++) {
             const p = players[i];
             if (!p) continue;
@@ -712,6 +714,7 @@ export class RaceRenderer {
 
             const view = this.views[slot];
             const mesh = buildCarMesh(shape, p.color || '#e5484d', this.quality, { ao: this.gfx.ao });
+            if (mesh.setNight) mesh.setNight(night);
             // Колёса крутятся вокруг своей оси УЖЕ ПОВЁРНУТОЙ рулём, поэтому
             // порядок Эйлера обязан быть YXZ: при XYZ спин ушёл бы вокруг оси
             // кузова и колесо «виляло» бы вместо вращения.
@@ -1377,6 +1380,11 @@ export class RaceRenderer {
         s.textures = info.memory.textures;
         s.particles = this.effects ? this.effects.activeParticles : 0;
         s.cars = this.countCars();
+        // отсечение: сколько экземпляров декора и сегментов ленты дожило до кадра
+        s.decorVisible = this.scenery ? this.scenery.stats.visibleInstances : 0;
+        s.decorTotal = this.scenery ? this.scenery.stats.totalInstances : 0;
+        s.trackSegments = this.trackMeshes ? this.trackMeshes.stats.visibleSegments : 0;
+        s.timeOfDay = this.timeOfDay;
         s.quality = this.quality;
         s.renderScale = this.renderScale;
         return s;

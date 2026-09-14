@@ -416,7 +416,19 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Узкий вариант переключателей: на четыре кнопки в колонке 348 px */
 .segmented-tight { gap: 6px; }
-.segmented-tight .seg { font-size: 12px; padding: 7px 2px; border-radius: 9px; }
+.segmented-tight .seg {
+    font-size: 12px;
+    padding: 7px 2px;
+    border-radius: 9px;
+    /* подписи вроде «Комната» и «Дальше» не должны ломать строку */
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Пояснение под рядом кнопок, а не только под галочкой */
+.gfx-body .segmented + .gfx-hint { margin-top: 6px; }
 
 /* Скроллбары под общий стиль */
 .scroll { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--panel-3) transparent; }

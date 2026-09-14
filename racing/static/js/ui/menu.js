@@ -38,7 +38,10 @@ import {
     applyGfxPreset,
     DECOR_LEVELS,
     PARTICLE_LEVELS,
-    RENDER_SCALES
+    RENDER_SCALES,
+    VIEW_DISTANCES,
+    NIGHT_LIGHT_LEVELS,
+    TIME_OF_DAY_MODES
 } from '../render/renderer.js';
 
 const LS_NAME = 'racing.name';
@@ -54,6 +57,9 @@ const QUALITY_LABELS = { low: 'Низкое', medium: 'Среднее', high: '�
 const DECOR_LABELS = { sparse: 'Реже', normal: 'Обычно', dense: 'Гуще' };
 const PARTICLE_LABELS = { off: 'Выкл', few: 'Мало', normal: 'Норма', many: 'Много' };
 const SCALE_LABELS = { 0.5: '50 %', 0.75: '75 %', 1: '100 %' };
+const VIEW_DISTANCE_LABELS = { near: 'Ближе', normal: 'Обычно', far: 'Дальше' };
+const NIGHT_LIGHT_LABELS = { off: 'Выкл', normal: 'Норма', bright: 'Ярче' };
+const TIME_OF_DAY_LABELS = { auto: 'Комната', day: 'День', dusk: 'Закат', night: 'Ночь' };
 
 /** Безопасное чтение localStorage: в приватном окне доступ может бросать. */
 function lsGet(key) {
@@ -457,7 +463,7 @@ export class MenuScreen {
             self.gfxToggles[key] = input;
         }
 
-        function addSegmented(key, caption, values, labels) {
+        function addSegmented(key, caption, values, labels, hint) {
             const field = el('div', 'field');
             field.appendChild(el('div', 'label', caption));
             const row = el('div', 'segmented segmented-tight');
@@ -475,6 +481,7 @@ export class MenuScreen {
                 buttons.push(btn);
             }
             field.appendChild(row);
+            if (hint) field.appendChild(el('div', 'gfx-hint', hint));
             body.appendChild(field);
             self.gfxSegments[key] = { values: values, buttons: buttons };
         }
@@ -486,6 +493,12 @@ export class MenuScreen {
         addSegmented('decor', 'Плотность декора', DECOR_LEVELS, DECOR_LABELS);
         addSegmented('particles', 'Частицы', PARTICLE_LEVELS, PARTICLE_LABELS);
         addSegmented('renderScale', 'Чёткость картинки', RENDER_SCALES, SCALE_LABELS);
+        addSegmented('viewDistance', 'Дальность отрисовки', VIEW_DISTANCES, VIEW_DISTANCE_LABELS,
+            'Докуда тянется туман и что попадает в кадр.');
+        addSegmented('nightLights', 'Яркость ночных огней', NIGHT_LIGHT_LEVELS, NIGHT_LIGHT_LABELS,
+            'Фонари, окна, подсветка щитов и пятна фар.');
+        addSegmented('timeOfDay', 'Время суток', TIME_OF_DAY_MODES, TIME_OF_DAY_LABELS,
+            'Обычно берётся из настроек комнаты. Здесь можно перебить для себя.');
 
         box.appendChild(body);
         return box;
