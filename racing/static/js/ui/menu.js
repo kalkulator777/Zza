@@ -229,7 +229,11 @@ export class MenuScreen {
         this.handlers = handlers || {};
 
         this.content = null;      // welcome.content
-        this.isHost = false;      // welcome.is_host — право создавать комнаты
+        // welcome.is_host — просто признак «этот клиент запустил сервер».
+        // Правом создавать комнаты он больше НЕ управляет: заказчик снял
+        // ограничение, серверная проверка убрана, код ошибки not_host не
+        // выдаётся. Комнату создаёт любой подключившийся.
+        this.isHost = false;
         this.serverName = '';
         this.rooms = [];
         this.servers = [];
@@ -263,7 +267,7 @@ export class MenuScreen {
 
     // --- входящие события --------------------------------------------------
 
-    /** Событие `welcome`: контент сервера и право на создание комнат. */
+    /** Событие `welcome`: контент сервера и имя сервера. */
     applyWelcome(msg) {
         this.content = msg.content || null;
         this.isHost = !!msg.is_host;
@@ -271,7 +275,6 @@ export class MenuScreen {
 
         this.serverBadgeName.textContent = this.serverName || 'этот компьютер';
         this._buildTrackCards();
-        this._updateCreateAvailability();
     }
 
     /** Событие `rooms`: комнаты этого сервера и другие серверы в сети. */
@@ -511,13 +514,6 @@ export class MenuScreen {
         this.createButton.addEventListener('click', () => this._openModal());
         head.appendChild(this.createButton);
         roomsPanel.appendChild(head);
-
-        this.hostHint = el('div', 'hint hint-warn');
-        this.hostHint.style.margin = '12px 12px 0';
-        this.hostHint.textContent = 'Создавать комнаты может только тот, кто запустил сервер. '
-            + 'Присоединяйтесь к готовой комнате или попросите хозяина запустить run.py с ключом --guest-rooms.';
-        this.hostHint.hidden = true;
-        roomsPanel.appendChild(this.hostHint);
 
         this.roomsList = el('div', 'rooms-list scroll');
         roomsPanel.appendChild(this.roomsList);
@@ -772,7 +768,6 @@ export class MenuScreen {
     }
 
     _openModal() {
-        if (!this.isHost) return;
         this.draft = defaultRoomSettings();
         if (!this._hasTrack(this.draft.track)) {
             const tracks = (this.content && this.content.tracks) || [];
@@ -810,13 +805,6 @@ export class MenuScreen {
         if (this.handlers.onCreateRoom) this.handlers.onCreateRoom(name, settings);
     }
 
-    _updateCreateAvailability() {
-        this.createButton.disabled = !this.isHost;
-        this.createButton.title = this.isHost ? ''
-            : 'Сервер не дал этому клиенту права создавать комнаты';
-        this.hostHint.hidden = this.isHost;
-    }
-
     // --- отрисовка списков -------------------------------------------------
 
     _trackLabel(trackRef) {
@@ -833,9 +821,7 @@ export class MenuScreen {
 
         if (!this.rooms.length) {
             const note = el('div', 'empty-note');
-            note.textContent = this.isHost
-                ? 'Комнат пока нет. Создайте первую — остальные увидят её сразу.'
-                : 'Комнат пока нет. Подождите, пока хозяин сервера создаст заезд.';
+            note.textContent = 'Комнат пока нет. Создайте первую — остальные увидят её сразу.';
             list.appendChild(note);
             return;
         }
@@ -925,7 +911,6 @@ export class MenuScreen {
         this.volumeValue.textContent = String(Math.round(s.volume * 100));
         this.muteInput.checked = !s.muted;
         this._applyGfxState();
-        this._updateCreateAvailability();
     }
 
     /** Разложить текущие галочки графики по элементам управления. */
