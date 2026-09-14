@@ -133,7 +133,6 @@ class CarView {
         this.mesh = null;
         this.present = false;   // машина есть в гонке
         this.fresh = false;     // состояние пришло в этом кадре
-        this.local = false;
 
         this.x = 0; this.y = 0; this.z = 0; this.yaw = 0;
         this.vx = 0; this.vz = 0;
@@ -415,7 +414,6 @@ export class RaceRenderer {
     /** Слот своей машины: за ней идёт камера, её скорость даёт полосы скорости. */
     setLocalSlot(slot) {
         this.localSlot = slot === undefined || slot === null ? -1 : slot;
-        for (let i = 0; i < MAX_CARS; i++) this.views[i].local = i === this.localSlot;
     }
 
     /** Машины из списка игроков race_init. */
