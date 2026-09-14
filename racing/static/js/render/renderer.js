@@ -40,9 +40,9 @@
 
 import * as THREE from 'three';
 import { buildTrackMeshes, createTerrainSampler } from './trackmesh.js';
-import { buildScenery } from './scenery.js';
+import { buildScenery, normalizeEnvironment, ENV_DEFAULT, trackDefaultEnvironment } from './scenery.js';
 import { buildCarMesh, disposeCarCache } from './carmesh.js';
-import { disposeObject, solidify, toColor, mergeGeometries } from './geomutil.js';
+import { disposeObject, solidify, toColor, mergeGeometries, ViewCuller } from './geomutil.js';
 import { Effects, createRadialTexture, writeScaleYaw } from './effects.js';
 import { Track } from '../track.js';
 import { getCatalog } from '../cars.js';
@@ -84,22 +84,54 @@ export const GFX_KEYS = {
     decor: 'racing.gfx.decor',
     decorAnim: 'racing.gfx.decoranim',
     particles: 'racing.gfx.particles',
-    renderScale: 'racing.gfx.renderscale'
+    renderScale: 'racing.gfx.renderscale',
+    // добавлены вместе с отсечением и временем суток
+    viewDistance: 'racing.gfx.viewdistance',
+    nightLights: 'racing.gfx.nightlights',
+    timeOfDay: 'racing.gfx.timeofday'
 };
 
 export const DECOR_LEVELS = ['sparse', 'normal', 'dense'];
 export const PARTICLE_LEVELS = ['off', 'few', 'normal', 'many'];
 export const RENDER_SCALES = [0.5, 0.75, 1.0];
 
+/**
+ * Дальность отрисовки — множитель к дальности тумана из buildScenery.
+ * Туман и отсечение обязаны идти вместе: отсечение режет ровно по той
+ * границе, за которой туман и так подменил цвет объекта своим. Поэтому это
+ * одна настройка, а не две.
+ */
+export const VIEW_DISTANCES = ['near', 'normal', 'far'];
+const VIEW_DISTANCE_K = { near: 0.75, normal: 1.0, far: 1.3 };
+
+/** Яркость ночных огней: фонари, окна, подсветка щитов, фары. */
+export const NIGHT_LIGHT_LEVELS = ['off', 'normal', 'bright'];
+const NIGHT_LIGHT_K = { off: 0, normal: 1.0, bright: 1.45 };
+
+/**
+ * Время суток. `auto` — то, что выбрано в настройках комнаты; остальные три
+ * значения перебивают выбор комнаты локально, на этом клиенте.
+ */
+export const TIME_OF_DAY_MODES = ['auto', 'day', 'dusk', 'night'];
+
 /** Что выставляет каждый пресет. Это ТОЛЬКО умолчания: галочки главнее. */
 export const GFX_PRESETS = {
-    low: { ao: true, glow: false, decor: 'sparse', decorAnim: false, particles: 'few', renderScale: 0.5 },
-    medium: { ao: true, glow: true, decor: 'normal', decorAnim: true, particles: 'normal', renderScale: 0.75 },
-    high: { ao: true, glow: true, decor: 'dense', decorAnim: true, particles: 'many', renderScale: 1.0 }
+    low: {
+        ao: true, glow: false, decor: 'sparse', decorAnim: false, particles: 'few',
+        renderScale: 0.5, viewDistance: 'near', nightLights: 'normal', timeOfDay: 'auto'
+    },
+    medium: {
+        ao: true, glow: true, decor: 'normal', decorAnim: true, particles: 'normal',
+        renderScale: 0.75, viewDistance: 'normal', nightLights: 'normal', timeOfDay: 'auto'
+    },
+    high: {
+        ao: true, glow: true, decor: 'dense', decorAnim: true, particles: 'many',
+        renderScale: 1.0, viewDistance: 'far', nightLights: 'bright', timeOfDay: 'auto'
+    }
 };
 
 /** Настройки, ради которых сцену приходится пересобирать. */
-const GFX_REBUILD = ['ao', 'decor', 'decorAnim', 'particles'];
+const GFX_REBUILD = ['ao', 'decor', 'decorAnim', 'particles', 'nightLights', 'timeOfDay'];
 
 function lsGet(key) {
     try {
@@ -142,6 +174,9 @@ export function loadGfxSettings(quality) {
         decor: readEnum(GFX_KEYS.decor, DECOR_LEVELS, preset.decor),
         decorAnim: readBool(GFX_KEYS.decorAnim, preset.decorAnim),
         particles: readEnum(GFX_KEYS.particles, PARTICLE_LEVELS, preset.particles),
+        viewDistance: readEnum(GFX_KEYS.viewDistance, VIEW_DISTANCES, preset.viewDistance),
+        nightLights: readEnum(GFX_KEYS.nightLights, NIGHT_LIGHT_LEVELS, preset.nightLights),
+        timeOfDay: readEnum(GFX_KEYS.timeOfDay, TIME_OF_DAY_MODES, preset.timeOfDay),
         renderScale: RENDER_SCALES.indexOf(scaleRaw) >= 0 ? scaleRaw : preset.renderScale
     };
 }
@@ -154,6 +189,9 @@ export function saveGfxSettings(patch, quality) {
     if (patch.decorAnim !== undefined) lsSet(GFX_KEYS.decorAnim, patch.decorAnim ? '1' : '0');
     if (patch.particles !== undefined) lsSet(GFX_KEYS.particles, patch.particles);
     if (patch.renderScale !== undefined) lsSet(GFX_KEYS.renderScale, String(patch.renderScale));
+    if (patch.viewDistance !== undefined) lsSet(GFX_KEYS.viewDistance, patch.viewDistance);
+    if (patch.nightLights !== undefined) lsSet(GFX_KEYS.nightLights, patch.nightLights);
+    if (patch.timeOfDay !== undefined) lsSet(GFX_KEYS.timeOfDay, patch.timeOfDay);
     return loadGfxSettings(quality);
 }
 
@@ -323,6 +361,20 @@ export class RaceRenderer {
         this.raceReady = false;
         this.theme = 'city';
 
+        // Окружение приходит СНАРУЖИ (настройки комнаты), а не из трассы:
+        // время суток выбирается в лобби. Здесь лежит последнее принятое
+        // значение; галочка `timeOfDay` в настройках графики может его
+        // локально перебить.
+        this.environment = normalizeEnvironment(null, ENV_DEFAULT);
+        this.timeOfDay = 'day';
+
+        // Отсечение по пирамиде видимости: один объект на рендер, в кадре
+        // только перечитывается камера. Владеет им renderer, применяют его
+        // trackMeshes.cull() и scenery.cull().
+        this.culler = new ViewCuller();
+        this.cullDistance = 1e9;
+        this.nightK = 0;
+
         // Высота поверхности для effects.js: ссылка создаётся один раз, чтобы
         // в кадре не появлялось замыкание. Своя подсказка индекса — чтобы
         // запросы эффектов не сбивали локальный поиск машин и камеры.
@@ -345,6 +397,8 @@ export class RaceRenderer {
 
         this.shadowMesh = null;
         this.shadowTex = null;
+        this.beamMesh = null;
+        this.beamTex = null;
         this.boxMesh = null;
         this.boxCount = 0;
 
