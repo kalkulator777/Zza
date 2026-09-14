@@ -39,7 +39,6 @@ import {
     CAR_CONSTANTS,
     BTN_THROTTLE,
     BTN_BRAKE,
-    BTN_DRIFT,
 } from './physics.js';
 import { MAX_CARS } from './protocol.js';
 
@@ -66,8 +65,6 @@ const HIT_STEP_DROP = 2.2;          // м/с за один шаг 1/60 (стен
 const HIT_SNAP_DROP = 4.0;          // м/с за снапшот 50 мс (чужие машины)
 const HIT_FORCE_REF = 14.0;         // м/с, при которой сила удара равна единице
 const HIT_COOLDOWN = 0.28;          // с, чтобы один удар не звучал дважды
-
-const TAU = Math.PI * 2;
 
 /** performance.now(), если он есть. */
 const nowMs = (typeof performance !== 'undefined' && performance.now)
@@ -96,6 +93,7 @@ const app = {
     localSlot: -1,
     inRoom: false,
     everConnected: false,
+    quietReopen: false,
     roomState: '',
     raceBuilt: false,
     racing: false,
@@ -240,8 +238,10 @@ function teardownRace() {
 
 function onNetOpen() {
     // Первое подключение молчит: тост — это новость, а не приветствие.
+    // Переподключение по смене имени — тоже наша затея, о ней не сообщаем.
     // ui/menu.js знает две окраски: 'info' (синяя) и всё прочее (красная).
-    if (app.everConnected) showToast('Связь восстановлена', 'info');
+    if (app.everConnected && !app.quietReopen) showToast('Связь восстановлена', 'info');
+    app.quietReopen = false;
     app.everConnected = true;
 }
 
@@ -421,7 +421,10 @@ function onNameChange(name) {
     // Имя уезжает на сервер только в hello (раздел 9: события «переименоваться»
     // нет), а набирают его уже после подключения. Пока игрок не в комнате,
     // переподключаемся молча — на локальной сети это мгновенно.
-    if (!app.inRoom) net.reconnect();
+    if (!app.inRoom) {
+        app.quietReopen = true;
+        net.reconnect();
+    }
 }
 
 function onCreateRoom(name, roomSettings) {
@@ -696,7 +699,7 @@ function fillAudio(local, localX, localZ) {
     const buttons = input.buttons;
     audioState.throttle = (buttons & BTN_THROTTLE) !== 0;
     audioState.braking = (buttons & BTN_BRAKE) !== 0;
-    audioState.driftActive = state.driftActive && (buttons & BTN_DRIFT) !== 0;
+    audioState.driftActive = state.driftActive;
     audioState.offtrack = state.offtrack;
     audioState.boosting = state.boostTime > 0;
     audioState.spinning = state.spinTime > 0;

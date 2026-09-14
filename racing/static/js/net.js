@@ -13,18 +13,23 @@
 //      отправляет бинарный пакет ввода. **Именно бинарный кадр**: текстовый
 //      кадр с недопустимым UTF-8 Tornado закрывает как нарушение протокола
 //      (12.6), и обрыв выглядит загадочно.
-//   3. На каждый снапшот сверяет своё состояние на ack_seq с авторитетным.
-//      Расхождение больше RECONCILE_EPS — подставляет авторитетное и
-//      переигрывает сохранённые вводы; видимую разницу гасит за
-//      RECONCILE_SMOOTH линейным спадом, чтобы коррекция не была рывком.
+//   3. На каждый снапшот сверяет своё предсказание с авторитетным состоянием
+//      того же момента. Расхождение больше RECONCILE_EPS — подставляет
+//      авторитетное и переигрывает сохранённые вводы; видимую разницу гасит
+//      за RECONCILE_SMOOTH линейным спадом, чтобы коррекция не была рывком.
+//      Момент ищется по tick снапшота, а не по ack_seq: почему — большой
+//      комментарий в _reconcile, это отступление от буквы §10.2.
 //   4. Чужие машины показывает на момент now - INTERP_DELAY: Эрмит по
 //      позиции и скорости, углы по кратчайшей дуге, экстраполяция не дольше
 //      EXTRAPOLATE_MAX, дальше заморозка.
 //   5. Считает то, чего в снапшоте нет (12.6): время текущего круга, лучший
 //      круг, отставание от лидера и бонус в руках — из race_event и progress.
-//   6. Меряет ping: по времени от отправки ввода до снапшота, который его
-//      подтвердил. Берётся минимум по скользящему окну — он и есть чистый
-//      RTT без доли, которую пакет простоял в очереди снапшота (20 Гц).
+//   6. Меряет ping двумя способами. Свой: время от отправки ввода до
+//      снапшота, который его подтвердил, минимум по скользящему окну —
+//      минимум отбрасывает то, что пакет простоял в очереди снапшота (20 Гц).
+//      И запоминает серверный: сервер сам гоняет ping/pong (§9) и кладёт
+//      результат в room.players[].ping — это самый чистый замер, но он
+//      обновляется только в лобби.
 //
 // АЛЛОКАЦИИ. В кадровом цикле и в обработке снапшота — ноль. Все кольцевые
 // буферы, история снапшотов и выходные массивы выделены один раз в
@@ -53,7 +58,6 @@ import {
     FLAG_BOOST,
     FLAG_SPIN,
     FLAG_SHIELD,
-    FLAG_FINISHED,
 } from './protocol.js';
 
 import { DT, createCarState, createCarStats, step as physicsStep } from './physics.js';
@@ -183,6 +187,7 @@ export class NetClient {
         this.track = null;
         this.localStats = null;
         this.state = createCarState(0, 0, 0);
+        this.localInSnapshot = false;   // машина ещё есть в снапшотах сервера
         this.seq = 0;
         this.ackSeq = 0;
 
@@ -685,6 +690,7 @@ export class NetClient {
         if (!track || !stats || this.localSlot < 0) return;
 
         const idxInSnap = snap.indexBySlot[this.localSlot];
+        this.localInSnapshot = idxInSnap >= 0;
         if (idxInSnap < 0) return;
 
         const ack = snap.ackSeq;
@@ -692,15 +698,38 @@ export class NetClient {
 
         const ax = snap.carX[idxInSnap];
         const az = snap.carZ[idxInSnap];
-        const flags = snap.carFlags[idxInSnap];
 
         // Пока гонка не началась, авторитет безусловен: машина стоит на решётке.
-        if (!this.racing || ack <= 0 || ack > this.seq || this.seq - ack >= INPUT_RING) {
+        if (!this.racing || ack <= 0) {
             this._hardReset(snap, idxInSnap);
             return;
         }
 
-        const slot = ack % INPUT_RING;
+        // ЗАЧЕМ ЗДЕСЬ tick, А НЕ ack_seq.
+        //
+        // §10.2 велит сверяться с собственным состоянием «на момент ack_seq».
+        // Это верно для схемы «сервер делает шаг на каждый принятый пакет»,
+        // но здесь сервер тикает по своим часам 60 Гц независимо от приёма,
+        // а ack_seq — это номер ПОСЛЕДНЕГО ПРИНЯТОГО пакета (sim.set_input
+        // хранит last_seq), а не «столько шагов я сделал». Когда кадр клиента
+        // просел и за один кадр ушло четыре пакета, сервер принимает все
+        // четыре, применяет последний и тикает при этом один раз: ack_seq
+        // прыгает на 4, а состояние продвинулось на 1. Сверка по ack_seq
+        // сравнивает разные моменты времени и даёт метр-полтора выдуманного
+        // расхождения на ровном месте.
+        //
+        // Зато tick снапшота — это ровно «сколько шагов сделал сервер», а темп
+        // шагов клиента привязан к нему (TICK_LEAD_*), поэтому запись кольца
+        // с индексом tick — это наше предсказание того же самого момента.
+        // Сверка становится точной при любом кадре клиента.
+        let base = snap.tick;
+        if (base > this.seq) base = this.seq;   // клиент отстал: берём самое свежее
+        if (base <= 0 || this.seq - base >= INPUT_RING) {
+            this._hardReset(snap, idxInSnap);
+            return;
+        }
+
+        const slot = base % INPUT_RING;
         if (!this.ringValid[slot]) {
             this._hardReset(snap, idxInSnap);
             return;
@@ -721,16 +750,16 @@ export class NetClient {
         const beforeZ = this.state.z;
         const beforeYaw = this.state.yaw;
 
-        // Пункт 4: подставить авторитетное состояние на ack_seq...
+        // Пункт 4: подставить авторитетное состояние на этот момент...
         this._restoreState(slot);
         this._applyAuthoritative(snap, idxInSnap);
         this._recordState(slot);
 
-        // ...и переиграть сохранённые вводы с ack_seq + 1 до текущего seq.
+        // ...и переиграть сохранённые вводы с base + 1 до текущего seq.
         const state = this.state;
         const buttons = this.ringButtons;
         const valid = this.ringValid;
-        for (let s = ack + 1; s <= this.seq; s++) {
+        for (let s = base + 1; s <= this.seq; s++) {
             const i = s % INPUT_RING;
             if (!valid[i]) continue;
             // step() сам делает шаги 14 и 16 (границы и progress): track
@@ -890,6 +919,7 @@ export class NetClient {
     _resetSnapshots() {
         this.snapHead = -1;
         this.snapStored = 0;
+        this.localInSnapshot = false;
         this.clockFill = 0;
         this.clockHead = 0;
         this.clockOffset = 0;
@@ -928,6 +958,11 @@ export class NetClient {
      */
     stepLocal(buttons) {
         if (!this.racing || !this.track || !this.localStats) return;
+        // Финишировавший доживает призраком и через 3 с пропадает из снапшотов
+        // (раздел 9). Предсказывать и слать ввод за исчезнувшую машину незачем:
+        // сервер такой ввод всё равно отбрасывает, а предсказание без
+        // авторитета уехало бы в никуда.
+        if (this.snapshotCount > 0 && !this.localInSnapshot) return;
 
         const state = this.state;
         this.prevX = state.x;
