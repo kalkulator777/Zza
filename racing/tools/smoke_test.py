@@ -105,26 +105,41 @@ MAX_ROLLBACK = 40.0
 SNAPSHOT_HZ_MIN = 17.0
 SNAPSHOT_HZ_MAX = 23.0
 
-# Расхождение «где гость себя предсказал» против «где его видит хозяин».
-# Сравнение идёт с выравниванием по времени: картинка чужой машины у хозяина
-# отстаёт ровно на INTERP_DELAY = 100 мс (10.2), поэтому его кадр в момент T
-# сравнивается с предсказанием гостя на момент T. Остаётся сумма ошибок
-# предсказания (RECONCILE_EPS = 0,05 м), интерполяции Эрмита между снапшотами
-# и расхождения оценок часов двух страниц. Измерено на этом прогоне:
-# медиана 0,1 м, p95 0,2 м. Пороги — примерно втрое, то есть «порядка
-# полуметра», как и ожидает контракт от буфера интерполяции.
-DIVERGE_MEDIAN_MAX = 0.60
-DIVERGE_P95_MAX = 1.50
-DROP_GUARD = 0.25              # с вокруг пропущенного шага клиента — не меряем
+PAUSE_GAP_MS = 1000.0          # простой длиннее — это пауза, а не потеря
 
-# Плавность чужой машины. Метрика та же, что в таблице 12.12: отклонение
-# показанной позиции от гладкой траектории, p95, метры. Для каждой тройки
-# соседних кадров берётся положение, предсказанное линейно по соседям
-# (с поправкой на неравные кадры), и сравнивается с показанным. Настоящее
-# ускорение машины даёт на кадре 60 Гц около a*dt^2/2 ≈ 0,002 м — это и есть
-# «после правки» в 12.12. Ступеньки раз в 50 мс (регрессия, которую чинили)
-# дают 0,3..0,7 м. Порог 0,05 м лежит посередине с запасом на просадки кадра
-# в headless-браузере.
+# Сходимость позиций. Вопрос «видит ли хозяин гостя там, где тот есть»
+# разложен на две половины, и каждая меряется по серверному тику, а не по
+# времени кадра, — поэтому тормоза стенда в них не попадают:
+#
+#   1. гость против сервера: расхождение собственного предсказания
+#      с авторитетным состоянием того же тика. Это то самое, что net.js
+#      считает на каждом снапшоте (10.2): ниже RECONCILE_EPS = 0,05 м
+#      коррекция не нужна вовсе, измеренная там медиана — 0,0094 м;
+#   2. хозяин против сервера: где хозяин рисует гостя против того, где гость
+#      был по данным сервера в этот момент. Здесь и живёт буфер интерполяции
+#      в INTERP_DELAY = 100 мс: ради него картинка чужой машины отстаёт,
+#      и он же не даёт ей разъехаться.
+#
+# Сумма двух и есть «где гость себя предсказал против того, где его видит
+# хозяин» — те самые «порядка полуметра». Пороги взяты примерно втрое от
+# измеренного на этом стенде (медиана 0,05 м, p95 0,3 м у второй половины;
+# 0,01 и 0,2 м у первой), чтобы прогон не краснел от дрожания стенда.
+PREDICT_MEDIAN_MAX = 0.20
+PREDICT_P95_MAX = 1.00
+DIVERGE_MEDIAN_MAX = 0.40
+DIVERGE_P95_MAX = 1.00
+
+# Плавность чужой машины: доля кадров, где видимая скорость (пройденное
+# за кадр расстояние, делённое на длину кадра) отличается от заявленной
+# в снапшоте больше чем на половину. Метрика взята из 10.2, где ею мерили
+# ровно ту регрессию с дёрганьем: «разметка по времени прихода давала 51 %
+# таких кадров, разметка по tick — 1,3 %». Порог 5 % лежит между этими
+# числами ближе к хорошему краю.
+#
+# Почему не отклонение от гладкой траектории в метрах, как в таблице 12.12:
+# оно растёт как куб длины кадра, а headless-браузер выдаёт 15 кадров
+# в секунду вместо 60 — те же 0,0017 м превращаются в 0,13 м, и порог
+# пришлось бы привязывать к скорости стенда. Это число печатается справочно.
 SMOOTH_JUMPY_MAX = 0.05        # доля кадров с отклонением скорости > 50 %
 SMOOTH_MAX_FRAME_MS = 120.0    # окна с кадром длиннее в метрику не идут
 
@@ -392,7 +407,6 @@ PAGE_AGENT = r"""
     progress: -1e9,       // путь по трассе, максимум за гонку, м
     progStart: 1e9,       // он же на первом кадре: решётка стоит до линии
     progressSeries: [],   // он же изредка — проверить, что растёт
-    drops: [],            // счётчик пропущенных шагов на каждом кадре
     maxSpeed: 0.0,
     // своя машина: момент по серверной шкале (с) и показанная позиция
     lt: [], lx: [], lz: [],
@@ -483,7 +497,6 @@ PAGE_AGENT = r"""
       S.lt.push((net.seq - 1 + alpha) * DT);
       S.lx.push(net.renderX(alpha));
       S.lz.push(net.renderZ(alpha));
-      S.drops.push(app.dropped);
       const st = net.state;
       const v = Math.sqrt(st.vx * st.vx + st.vz * st.vz);
       if (v > S.maxSpeed) S.maxSpeed = v;
@@ -773,14 +786,19 @@ def speed_deviation(vt, vx, vz, vvx, vvz, ms):
     return out
 
 
-def intervals_hz(stamps):
-    """Частота по медиане интервалов, Гц. Медиана — чтобы пауза не мешала."""
-    if len(stamps) < 5:
+def snapshot_hz(stamps):
+    """Частота снапшотов, Гц, по среднему интервалу.
+
+    Не по медиане: занятый главный поток страницы разбирает очередь сообщений
+    пачкой, и половина интервалов оказывается по десятой доле миллисекунды —
+    медиана после такого показывает тысячи герц, а среднее остаётся честным.
+    Простои длиннее PAUSE_GAP_MS выброшены: это пауза гонки, там сервер
+    не тикает и снапшотов не шлёт.
+    """
+    gaps = [b - a for a, b in zip(stamps, stamps[1:]) if 0.0 < b - a < PAUSE_GAP_MS]
+    if len(gaps) < 20:
         return 0.0
-    gaps = [stamps[i + 1] - stamps[i] for i in range(len(stamps) - 1)]
-    gaps.sort()
-    mid = gaps[len(gaps) // 2]
-    return 1000.0 / mid if mid > 0 else 0.0
+    return 1000.0 * len(gaps) / sum(gaps)
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +974,9 @@ def enter_name(client):
         # Поля не нашлось (меню перерисовали) — имя всё равно уедет из
         # localStorage при перезагрузке страницы.
         client.page.reload(wait_until='load')
+        if not client.wait('() => !!window.__racing', 15.0):
+            raise TestBroken('страница %s не загрузилась после перезапуска'
+                             % client.name)
         client.install_agent()
         return False
     return True
@@ -1230,7 +1251,7 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
             'maxSpeed: S.maxSpeed, keys: S.keys, events: S.events, '
             'errors: S.errors, at: S.at, ax: S.ax, az: S.az, rec: S.rec, '
             'progress: S.progress - S.progStart, '
-            'series: S.progressSeries, drops: S.drops, '
+            'series: S.progressSeries, '
             'best: window.__racing.net.bestLap, dropped: window.__racing.app.dropped, '
             'fps: S.lastMs > S.firstMs ? S.frames * 1000 / (S.lastMs - S.firstMs) : 0 }; }')
     data = {'host': host.js(dump), 'guest': guest.js(dump)}
@@ -1278,7 +1299,7 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
     # --- снапшоты ----------------------------------------------------------
     rates = {}
     for client, key in ((host, 'host'), (guest, 'guest')):
-        rates[key] = intervals_hz(data[key]['snap'])
+        rates[key] = snapshot_hz(data[key]['snap'])
     good = all(SNAPSHOT_HZ_MIN <= rate <= SNAPSHOT_HZ_MAX for rate in rates.values())
     report.check(good, 'снапшоты: %s %.1f Гц, %s %.1f Гц (ожидание 20 Гц)'
                  % (host.name, rates['host'], guest.name, rates['guest']))
@@ -1287,51 +1308,44 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
     # Где гость предсказал себя против того, где его рисует хозяин.
     # Сравнение выровнено по времени: у хозяина чужая машина показана
     # на момент now - INTERP_DELAY, и этот момент записан вместе с позицией.
-    #
-    # Отдельно про просадки стенда. headless-браузер на программном рендере
-    # выдаёт 10..20 кадров в секунду, и на длинном кадре главный цикл клиента
-    # упирается в MAX_STEPS_PER_FRAME и пропускает шаги (12.4). Пропущенный
-    # шаг — это честно отставшее предсказание, и расхождение в этот момент
-    # меряет тормоза стенда, а не сеть. Такие моменты из метрики выброшены,
-    # а сколько их было — напечатано.
+    # Половина первая: гость против сервера — верно ли он предсказывает себя.
+    for client, key in ((host, 'host'), (guest, 'guest')):
+        rec = data[key]['rec']
+        if len(rec) < 50:
+            report.fail('%s: расхождение предсказания мерить не по чему, '
+                        'замеров %d' % (client.name, len(rec)))
+            continue
+        median = percentile(rec, 0.5)
+        p95 = percentile(rec, 0.95)
+        report.check(median <= PREDICT_MEDIAN_MAX and p95 <= PREDICT_P95_MAX,
+                     '%s предсказывает себя верно: расхождение с авторитетом '
+                     'медиана %.3f м, p95 %.3f м по %d снапшотам '
+                     '(пороги %.2f и %.2f м)'
+                     % (client.name, median, p95, len(rec),
+                        PREDICT_MEDIAN_MAX, PREDICT_P95_MAX))
+
+    # Половина вторая: хозяин против сервера — там ли он рисует гостя.
     guest_data = data['guest']
     seen = data['host']
-    drops = [guest_data['lt'][i] for i in range(1, len(guest_data['drops']))
-             if guest_data['drops'][i] > guest_data['drops'][i - 1]]
-
-    def near_drop(moment):
-        for value in drops:
-            if abs(value - moment) <= DROP_GUARD:
-                return True
-            if value > moment + DROP_GUARD:
-                return False
-        return False
-
     deltas = []
-    skipped = 0
     for i in range(len(seen['vt'])):
-        point = interp_track(guest_data['lt'], guest_data['lx'], guest_data['lz'],
+        point = interp_track(guest_data['at'], guest_data['ax'], guest_data['az'],
                              seen['vt'][i])
         if point is None:
             continue
-        if near_drop(seen['vt'][i]):
-            skipped += 1
-            continue
         deltas.append(math.hypot(seen['vx'][i] - point[0], seen['vz'][i] - point[1]))
-    share = skipped / (skipped + len(deltas)) if (skipped + len(deltas)) else 1.0
     if len(deltas) < 100:
-        report.fail('сходимость позиций: сравнивать нечего, всего %d пар '
-                    '(отброшено вокруг просадок стенда %d)' % (len(deltas), skipped))
+        report.fail('сходимость позиций: сравнивать нечего, всего %d пар'
+                    % len(deltas))
     else:
         median = percentile(deltas, 0.5)
         p95 = percentile(deltas, 0.95)
-        report.check(median <= DIVERGE_MEDIAN_MAX and p95 <= DIVERGE_P95_MAX
-                     and share <= 0.4,
-                     'позиции сходятся: медиана %.3f м, p95 %.3f м по %d парам '
-                     '(пороги %.2f и %.2f м; %.0f %% замеров выброшено вокруг '
-                     'просадок стенда)'
+        report.check(median <= DIVERGE_MEDIAN_MAX and p95 <= DIVERGE_P95_MAX,
+                     'позиции сходятся: хозяин рисует гостя в %.3f м от того '
+                     'места, где тот был по серверу (медиана; p95 %.3f м, '
+                     '%d пар, пороги %.2f и %.2f м)'
                      % (median, p95, len(deltas), DIVERGE_MEDIAN_MAX,
-                        DIVERGE_P95_MAX, share * 100.0))
+                        DIVERGE_P95_MAX))
 
     # --- плавность чужой машины --------------------------------------------
     for client, key in ((host, 'host'), (guest, 'guest')):
@@ -1741,7 +1755,7 @@ async def ws_scenario(report, port):
                      % (moved[host.name], moved[guest.name],
                         speeds[host.name], speeds[guest.name]))
 
-        rate = intervals_hz(host.snap_times)
+        rate = snapshot_hz(host.snap_times)
         report.check(SNAPSHOT_HZ_MIN <= rate <= SNAPSHOT_HZ_MAX,
                      'снапшоты идут %.1f Гц (ожидание 20 Гц)' % rate)
         report.check(host.snap['ack'] > 0 and guest.snap['ack'] > 0,
