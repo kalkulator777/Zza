@@ -78,6 +78,27 @@ const SNAP_SNAP_LIMIT = 6.0;            // м, больше — коррекци
 const HOLDOVER = 0.25;                  // с, «докрутка» таймеров по флагам снапшота
 const GAP_MIN_SPEED = 6.0;              // м/с, нижняя опорная скорость отставания
 
+// Синхронизация темпа шагов с тиком сервера. Обе стороны считают 60 Гц по
+// своим часам, поэтому счётчики медленно расходятся: кадровый цикл клиента
+// то отстаёт на просадке fps, то догоняет. Расхождение счётчиков — это
+// расхождение позиций (шаг на 25 м/с стоит 0,42 м), и именно оно, а не
+// физика, кормит реконсиляцию. Держим опережение в узком коридоре, добавляя
+// или снимая не больше одного шага на снапшот.
+const TICK_LEAD_MIN = 1;                // шагов клиента впереди тика сервера
+const TICK_LEAD_MAX = 5;
+const TICK_CORRECTION_MAX = 3;          // шагов поправки за один снапшот
+
+// Часы истории снапшотов. Ставить в историю местное время прихода нельзя:
+// на просевшем кадре главный поток занят отрисовкой, и два снапшота,
+// отправленных через 50 мс, приходят в обработчик почти одновременно —
+// шкала времени сминается, а Эрмит по смятому интервалу даёт рывок.
+// Поэтому шкалу строим по авторитетному tick снапшота (tick * DT — это в
+// точности sim.race_time, 12.4), а к местным часам привязываем одним
+// смещением: минимумом (приход − серверное время) по скользящему окну.
+// Минимум берётся потому, что задержка доставки бывает только больше нуля:
+// самый быстрый пакет окна и есть честная привязка.
+const CLOCK_WINDOW = 64;                // замеров смещения (3,2 с при 20 Гц)
+
 const TAU = Math.PI * 2;
 
 // Раскладка кольцевого буфера состояний: один Float64Array со страйдом
@@ -149,6 +170,14 @@ export class NetClient {
         this.snapIntervalMs = 50;
         this.snapCountTotal = 0;
         this.snapRaceTime = 0;          // tick * DT — авторитетное время гонки
+        this.snapTick = 0;
+        this.tickLead = 0;
+        this.clockAdjust = 0;           // с, поправка накопителя на следующий кадр
+        this.clockOffset = 0;           // мс, местное время минус серверное
+        this.clockRing = new Float64Array(CLOCK_WINDOW);
+        this.clockFill = 0;
+        this.clockHead = 0;
+        this.lastStamp = 0;
 
         // --- предсказание своей машины ---------------------------------------
         this.track = null;
@@ -237,6 +266,7 @@ export class NetClient {
             reconcileRate: 0,
             seq: 0,
             ackSeq: 0,
+            tickLead: 0,
             connected: false,
         };
 
@@ -287,6 +317,29 @@ export class NetClient {
         ws.onerror = this._onError;
         ws.onmessage = this._onMessage;
         this.ws = ws;
+    }
+
+    /**
+     * Мягкое переподключение: сокет закрывается без объявления обрыва, и
+     * hello уходит заново. Нужно из-за того, что имя игрока едет только
+     * в hello: событие «переименоваться» контракт не заводил (раздел 9),
+     * а имя человек набирает уже после подключения.
+     */
+    reconnect() {
+        const ws = this.ws;
+        if (ws) {
+            ws.onopen = null;
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.onmessage = null;
+            this.ws = null;
+            try { ws.close(); } catch (e) { /* уже закрыт */ }
+        }
+        this.connected = false;
+        this.attempts = 0;
+        this.reconnectDelay = RECONNECT_MIN;
+        this.closedByUs = false;
+        this._open();
     }
 
     /** Закрыть навсегда: переподключения не будет. */
@@ -510,14 +563,59 @@ export class NetClient {
         this.snapPrevRecvMs = this.snapRecvMs;
         this.snapRecvMs = t;
         this.snapshotCount++;
+        this.snapTick = snap.tick;
         this.snapRaceTime = snap.tick * DT;
+        // Насколько предсказание убежало вперёд серверного тика. Оба идут
+        // 60 Гц, поэтому в норме это небольшое положительное число: сколько
+        // шагов клиента ещё не дошло до сервера.
+        const lead = this.seq - snap.tick;
+        this.tickLead = lead;
+        if (this.racing) {
+            // Поправка пропорциональна выходу за коридор, но не больше трёх
+            // шагов на снапшот: после просадки кадра опережение уезжает сразу
+            // на несколько шагов, и возвращать его по одному — это полсекунды
+            // заметного расхождения.
+            let corr = 0;
+            if (lead < TICK_LEAD_MIN) corr = TICK_LEAD_MIN - lead;
+            else if (lead > TICK_LEAD_MAX) corr = TICK_LEAD_MAX - lead;
+            if (corr > TICK_CORRECTION_MAX) corr = TICK_CORRECTION_MAX;
+            else if (corr < -TICK_CORRECTION_MAX) corr = -TICK_CORRECTION_MAX;
+            this.clockAdjust += corr * DT;
+        }
 
-        this._pushHistory(t, snap);
+        this._pushHistory(this._stampOf(snap.tick, t), snap);
         this._measurePing(snap.ackSeq, t);
         this._reconcile(snap);
         this._updateProgress(snap);
 
         if (this.h.onSnapshot) this.h.onSnapshot(snap);
+    }
+
+    /**
+     * Метка времени снапшота на местных часах: серверное время тика плюс
+     * смещение. Смещение — минимум (приход − серверное время) по окну,
+     * поэтому дрожание доставки в шкалу не попадает и соседние снапшоты
+     * стоят ровно через 50 мс, как их и отправляли.
+     */
+    _stampOf(tick, arrivedMs) {
+        const serverMs = tick * (DT * 1000);
+        this.clockRing[this.clockHead] = arrivedMs - serverMs;
+        this.clockHead = this.clockHead + 1 >= CLOCK_WINDOW ? 0 : this.clockHead + 1;
+        if (this.clockFill < CLOCK_WINDOW) this.clockFill++;
+
+        let minOff = this.clockRing[0];
+        for (let i = 1; i < this.clockFill; i++) {
+            const v = this.clockRing[i];
+            if (v < minOff) minOff = v;
+        }
+        this.clockOffset = minOff;
+
+        let stamp = serverMs + minOff;
+        // История обязана быть строго возрастающей: дубликат тика или
+        // сдвинувшееся смещение не должны сломать поиск пары.
+        if (stamp <= this.lastStamp) stamp = this.lastStamp + 0.001;
+        this.lastStamp = stamp;
+        return stamp;
     }
 
     /** Положить снапшот в кольцевую историю. Аллокаций нет. */
@@ -635,9 +733,9 @@ export class NetClient {
         for (let s = ack + 1; s <= this.seq; s++) {
             const i = s % INPUT_RING;
             if (!valid[i]) continue;
+            // step() сам делает шаги 14 и 16 (границы и progress): track
+            // передан ему аргументом, звать их отдельно — двойная работа.
             physicsStep(state, stats, buttons[i], DT, track, state.sampleIdx);
-            track.clampToTrack(state, state.sampleIdx);
-            track.advanceProgress(state, state.sampleIdx);
             this._recordState(i);
         }
 
@@ -785,11 +883,17 @@ export class NetClient {
         this.reconcileError = 0;
         this.reconcileMax = 0;
         this.reconcileCount = 0;
+        this.clockAdjust = 0;
+        this.tickLead = 0;
     }
 
     _resetSnapshots() {
         this.snapHead = -1;
         this.snapStored = 0;
+        this.clockFill = 0;
+        this.clockHead = 0;
+        this.clockOffset = 0;
+        this.lastStamp = 0;
         this.snapRecvMs = 0;
         this.snapPrevRecvMs = 0;
         this.snapshotCount = 0;
@@ -830,10 +934,8 @@ export class NetClient {
         this.prevZ = state.z;
         this.prevYaw = state.yaw;
 
-        const track = this.track;
-        physicsStep(state, this.localStats, buttons, DT, track, state.sampleIdx);
-        track.clampToTrack(state, state.sampleIdx);
-        track.advanceProgress(state, state.sampleIdx);
+        // step() включает шаги 14 (границы) и 16 (progress) — им передан track.
+        physicsStep(state, this.localStats, buttons, DT, this.track, state.sampleIdx);
 
         const seq = this.seq + 1;
         this.seq = seq;
@@ -847,6 +949,18 @@ export class NetClient {
             // Бинарный кадр обязателен (раздел 5, 12.6).
             ws.send(encodeInput(seq, buttons));
         }
+    }
+
+    /**
+     * Забрать накопленную поправку темпа шагов (и обнулить её). Кадровый цикл
+     * прибавляет её к накопителю времени: так число шагов клиента сходится
+     * с числом тиков сервера, а реконсиляции остаётся только настоящая
+     * разница физики.
+     */
+    takeClockAdjust() {
+        const a = this.clockAdjust;
+        this.clockAdjust = 0;
+        return a;
     }
 
     /**
@@ -1090,6 +1204,9 @@ export class NetClient {
      */
     raceTime(nowMs) {
         if (this.snapRecvMs <= 0) return 0;
+        // Вне RACING сервер не тикает: в отсчёте часы стоят на нуле, а на
+        // экране итогов замирают на времени последнего снапшота.
+        if (!this.racing) return this.snapRaceTime;
         const t = this.snapRaceTime + (nowMs - this.snapRecvMs) * 0.001;
         return t > 0 ? t : 0;
     }
@@ -1113,6 +1230,7 @@ export class NetClient {
             ? this.reconcileCount / this.snapshotCount : 0;
         s.seq = this.seq;
         s.ackSeq = this.ackSeq;
+        s.tickLead = this.tickLead;
         s.connected = this.connected;
         return s;
     }
