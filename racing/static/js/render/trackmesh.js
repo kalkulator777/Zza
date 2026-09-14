@@ -6,20 +6,20 @@
  * либо экземпляр клиентского Track из js/track.js (те же массивы под именами
  * cx, cy, cz, ctx, ctz, cnx, cnz, chw, cs), либо список samples из 7.2.
  *
- * Бюджет (раздел 1): шесть мешей на всю трассу.
+ * Бюджет (раздел 1): четыре меша на всю трассу.
  *
- *   road      полотно, вершинные цвета с вариацией
- *   kerbs     бордюры обеих кромок, красно-белые посегментно
+ *   surface   полотно + бордюры + лента рельефа (общий материал)
  *   markings  осевая прерывистая, кромочные, стартовая клетка
- *   terrain   лента рельефа ~50 м с каждой стороны
  *   ground    общий грунт до горизонта (два треугольника)
  *   arch      стартовая арка
  *
- * ОТСЕЧЕНИЕ. Первые четыре меша нарезаны на сегменты по дуге (~180 м) и в
- * кадре рисуются только видимыми кусками: 1–4 вызова на меш вместо одного,
- * но вместо всего кольца — только то, что попадает в пирамиду видимости и
- * ближе тумана. На длинной трассе это кратное падение треугольников.
- * Подробности и обоснование — у SegmentedSurface ниже.
+ * ОТСЕЧЕНИЕ. Первые два меша нарезаны на сегменты по дуге (~180 м) и в кадре
+ * рисуются только видимыми кусками: 1–3 вызова на меш вместо одного, но
+ * вместо всего кольца — только то, что попадает в пирамиду видимости и ближе
+ * тумана. На длинной трассе это кратное падение треугольников.
+ * Полотно, бордюры и рельеф живут в одном меше именно поэтому: нарезка
+ * умножает число вызовов, и держать три меша там, где хватает одного, стало
+ * дорого. Подробности — у SegmentedSurface ниже.
  *
  * Разметка приподнята на 15 мм над полотном И имеет polygonOffset — на
  * Intel UHD этого достаточно, чтобы z-fighting не появлялся на дистанции.
@@ -204,7 +204,7 @@ const SEGMENT_LENGTH = 180.0; // целевая длина сегмента по
  * с промежутком. Хуже картинке от этого не будет — только чуть больше
  * треугольников.
  */
-const MAX_RUNS = 4;
+const MAX_RUNS = 3;
 
 /** Границы сегментов в индексах выборок осевой линии. */
 function planSegments(T) {
@@ -517,23 +517,26 @@ export function buildTrackMeshes(track, theme, quality, opts) {
     const groundY = minY - pal.terrainDrop - 2.0;
 
     const plan = planSegments(T);
-    const road = buildRoad(T, P, colors, pal, surfaceMat, ao, plan);
-    const kerbs = buildKerbs(T, P, colors, surfaceMat, ao, plan);
+    // Полотно, бордюры и лента рельефа делят ОДИН материал, поэтому и меш у
+    // них один: иначе нарезка на сегменты утроила бы число вызовов там, где
+    // раньше был один. Разметке нужен свой материал (polygonOffset), она
+    // остаётся отдельным сегментным мешем.
+    const surface = buildSurface(T, P, colors, pal, groundY, surfaceMat, ao, plan);
     const markings = buildMarkings(T, P, colors, markMat, ao, plan);
-    const terrain = buildTerrain(T, P, colors, pal, groundY, surfaceMat, ao, plan);
     const ground = buildGround(T, colors, groundY, surfaceMat);
     const arch = buildStartArch(T, P, colors, surfaceMat, ao);
 
     // Сегментные поверхности: отсекаются посегментно каждый кадр.
-    const segmented = [road, kerbs, markings, terrain];
-    group.add(ground, terrain.mesh, road.mesh, kerbs.mesh, markings.mesh, arch);
+    const segmented = [surface, markings];
+    group.add(ground, surface.mesh, markings.mesh, arch);
 
     const api = {
         group: group,
-        road: road.mesh,
-        kerbs: kerbs.mesh,
+        surface: surface.mesh,
+        road: surface.mesh,
+        kerbs: surface.mesh,
         markings: markings.mesh,
-        terrain: terrain.mesh,
+        terrain: surface.mesh,
         ground: ground,
         arch: arch,
         segments: plan.count,
@@ -570,8 +573,40 @@ export function buildTrackMeshes(track, theme, quality, opts) {
 // Полотно
 // ---------------------------------------------------------------------------
 
-function buildRoad(T, P, colors, pal, material, ao, plan) {
+/**
+ * Полотно, бордюры и лента рельефа в ОДНОМ сегментном меше.
+ *
+ * Три поверхности делят материал, поэтому их выгодно резать вместе: один
+ * сегмент — один непрерывный диапазон вершин, в котором лежит и асфальт, и
+ * бордюры, и трава этого куска трассы.
+ */
+function buildSurface(T, P, colors, pal, groundY, material, ao, plan) {
     const b = new MeshBuilder();
+    const road = roadWriter(T, P, colors, ao);
+    const kerbs = kerbWriter(T, P, colors, ao);
+    const terrain = terrainWriter(T, P, colors, pal, groundY, ao, plan);
+
+    const starts = new Int32Array(plan.count);
+    const counts = new Int32Array(plan.count);
+    for (let k = 0; k < plan.count; k++) {
+        starts[k] = b.vertexCount;
+        road(b, plan.row[k], plan.row[k + 1]);
+        kerbs(b, plan.row[k], plan.row[k + 1]);
+        terrain(b, k);
+        counts[k] = b.vertexCount - starts[k];
+    }
+
+    const geom = b.build();
+    const spheres = segmentSpheres(geom, starts, counts);
+    return new SegmentedSurface('trackSurface', geom, material, starts, counts, spheres);
+}
+
+// ---------------------------------------------------------------------------
+// Полотно
+// ---------------------------------------------------------------------------
+
+/** Замыкание, пишущее ряды полотна [i0, i1] в переданный построитель. */
+function roadWriter(T, P, colors, ao) {
     const rng = new Rng(T.seed ^ 0x51ed2701);
     const cols = P.roadCols + 1;
     // заранее посчитанный шум на УЗЕЛ сетки: цвет полотна не должен «мигать»
@@ -580,7 +615,6 @@ function buildRoad(T, P, colors, pal, material, ao, plan) {
     for (let i = 0; i < jitter.length; i++) jitter[i] = 1 + (rng.next() * 2 - 1) * 0.05;
 
     const patch = new THREE.Color();
-    // индекс глобального ряда: задаётся снаружи цикла сегментов
     let base = 0;
 
     function point(ii, j, out) {
@@ -606,27 +640,18 @@ function buildRoad(T, P, colors, pal, material, ao, plan) {
         shade(c, patch, k);
     }
 
-    const starts = new Int32Array(plan.count);
-    const counts = new Int32Array(plan.count);
-    for (let k = 0; k < plan.count; k++) {
-        base = plan.row[k];
-        starts[k] = b.vertexCount;
+    return function (b, i0, i1) {
+        base = i0;
         surfaceGrid(b, {
-            rows: plan.row[k + 1] - base + 1, // +1: замыкающий ряд общий с соседом
+            rows: i1 - i0 + 1, // +1: замыкающий ряд общий с соседним сегментом
             cols: cols,
             closed: false,
             point: point,
             vertexColor: vertexColor
         });
-        counts[k] = b.vertexCount - starts[k];
-    }
-
-    const geom = b.build();
-    const spheres = segmentSpheres(geom, starts, counts);
-    return new SegmentedSurface('trackRoad', geom, material, starts, counts, spheres);
+    };
 }
 
-/** Ограничивающие сферы сегментов по готовой геометрии. */
 function segmentSpheres(geom, starts, counts) {
     const pos = geom.attributes.position.array;
     const out = new Float32Array(starts.length * 4);
@@ -640,8 +665,8 @@ function segmentSpheres(geom, starts, counts) {
 // Бордюры
 // ---------------------------------------------------------------------------
 
-function buildKerbs(T, P, colors, material, ao, plan) {
-    const b = new MeshBuilder();
+/** Замыкание, пишущее бордюры обеих кромок для рядов [i0, i1]. */
+function kerbWriter(T, P, colors, ao) {
     const tmp = new THREE.Color();
 
     // профиль в ортах (u — наружу от кромки, v — вверх от полотна)
@@ -681,16 +706,13 @@ function buildKerbs(T, P, colors, material, ao, plan) {
         }
     }
 
-    const starts = new Int32Array(plan.count);
-    const counts = new Int32Array(plan.count);
-    for (let k = 0; k < plan.count; k++) {
-        starts[k] = b.vertexCount;
+    return function (b, i0, i1) {
         for (let side = 0; side < 2; side++) {
             sgn = side === 0 ? 1 : -1;
-            base = plan.row[k];
+            base = i0;
             // для левой стороны профиль отражается, поэтому выворачиваем обход
             extrudeProfile(b, {
-                count: plan.row[k + 1] - base + 1,
+                count: i1 - i0 + 1,
                 closed: false,
                 flip: sgn < 0,
                 profile: profileOut,
@@ -698,12 +720,7 @@ function buildKerbs(T, P, colors, material, ao, plan) {
                 color: color
             });
         }
-        counts[k] = b.vertexCount - starts[k];
-    }
-
-    const geom = b.build();
-    const spheres = segmentSpheres(geom, starts, counts);
-    return new SegmentedSurface('trackKerbs', geom, material, starts, counts, spheres);
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -916,8 +933,8 @@ export function createTerrainSampler(track, theme, quality) {
     return sampler;
 }
 
-function buildTerrain(T, P, colors, pal, groundY, material, ao, plan) {
-    const b = new MeshBuilder();
+/** Замыкание, пишущее ленту рельефа сегмента k (обе стороны). */
+function terrainWriter(T, P, colors, pal, groundY, ao, plan) {
     const tp = terrainParams(T, P, pal, groundY);
     const rings = P.terrainRings;
     // Прореживание по длине круга снято: лента отсекается посегментно,
@@ -936,12 +953,13 @@ function buildTerrain(T, P, colors, pal, groundY, material, ao, plan) {
         ringAO[j] = ao ? 1 - AO_SHOULDER * smooth01(1 - tp.offs[j] / AO_SHOULDER_W) : 1;
     }
 
-    // границы сегментов в рядах ленты: те же места дуги, что и у полотна
-    const segCount = Math.min(plan.count, Math.max(1, rowsAll >> 1));
+    // Границы сегментов в рядах ленты: те же места дуги, что и у полотна.
+    // Сегментов ровно столько же — лента живёт в общем меше с полотном.
+    const segCount = plan.count;
     const tRow = new Int32Array(segCount + 1);
     tRow[0] = 0;
     for (let k = 1; k < segCount; k++) {
-        let v = Math.round(plan.row[Math.round((k * plan.count) / segCount)] / stride);
+        let v = Math.round(plan.row[k] / stride);
         if (v < tRow[k - 1] + 1) v = tRow[k - 1] + 1;
         if (v > rowsAll - (segCount - k)) v = rowsAll - (segCount - k);
         tRow[k] = v;
@@ -980,10 +998,7 @@ function buildTerrain(T, P, colors, pal, groundY, material, ao, plan) {
         shade(c, patch, k);
     }
 
-    const starts = new Int32Array(segCount);
-    const counts = new Int32Array(segCount);
-    for (let k = 0; k < segCount; k++) {
-        starts[k] = b.vertexCount;
+    return function (b, k) {
         for (side = 0; side < 2; side++) {
             sgn = side === 0 ? 1 : -1;
             base = tRow[k];
@@ -996,12 +1011,7 @@ function buildTerrain(T, P, colors, pal, groundY, material, ao, plan) {
                 vertexColor: vertexColor
             });
         }
-        counts[k] = b.vertexCount - starts[k];
-    }
-
-    const geom = b.build();
-    const spheres = segmentSpheres(geom, starts, counts);
-    return new SegmentedSurface('trackTerrain', geom, material, starts, counts, spheres);
+    };
 }
 
 // ---------------------------------------------------------------------------

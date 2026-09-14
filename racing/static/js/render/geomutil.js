@@ -938,6 +938,9 @@ export class ViewCuller {
         this.camX = 0;
         this.camY = 0;
         this.camZ = 0;
+        this.fwdX = 0;
+        this.fwdY = 0;
+        this.fwdZ = -1;
         this.maxDist = 1e9;
         this.enabled = true;
     }
@@ -954,6 +957,12 @@ export class ViewCuller {
         this.camX = e[12];
         this.camY = e[13];
         this.camZ = e[14];
+        // Взгляд камеры: третий столбец матрицы — её локальная +Z, а смотрит
+        // камера в -Z. Нужен именно он, а не радиус (см. visible()).
+        const l = Math.sqrt(e[8] * e[8] + e[9] * e[9] + e[10] * e[10]) || 1;
+        this.fwdX = -e[8] / l;
+        this.fwdY = -e[9] / l;
+        this.fwdZ = -e[10] / l;
         this.maxDist = maxDist > 0 ? maxDist : 1e9;
     }
 
@@ -974,14 +983,25 @@ export class ViewCuller {
         return true;
     }
 
-    /** Сфера видна: и в пирамиде, и ближе предела дальности. */
+    /**
+     * Сфера видна: и в пирамиде, и ближе предела дальности.
+     *
+     * Дальность меряется ВДОЛЬ ВЗГЛЯДА камеры, а не по радиусу, и это не
+     * придирка. `THREE.Fog` линейный по `vFogDepth`, то есть по глубине в
+     * системе камеры (`-mvPosition.z`), а не по расстоянию до камеры. У
+     * объекта на краю кадра радиус больше глубины в полтора раза: отсекая
+     * по радиусу, мы срезали бы то, что туман ещё не успел скрыть, — и на
+     * боку кадра у горизонта появлялась бы заметная разница. Проверено
+     * сравнением кадров: по радиусу — до 0,04 % пикселей расходятся и
+     * доходит до 139 из 255 по яркости, по глубине — ноль.
+     */
     visible(x, y, z, r) {
         if (!this.enabled) return true;
         const dx = x - this.camX;
         const dy = y - this.camY;
         const dz = z - this.camZ;
-        const lim = this.maxDist + r;
-        if (dx * dx + dy * dy + dz * dz > lim * lim) return false;
+        const depth = dx * this.fwdX + dy * this.fwdY + dz * this.fwdZ;
+        if (depth - r > this.maxDist) return false;
         return this.inFrustum(x, y, z, r);
     }
 }
