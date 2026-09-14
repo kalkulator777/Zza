@@ -33,9 +33,11 @@ export const STEER_MAX = 1.0;              // предел |steer| (шаг 3)
 export const TURN_FULL_SPEED = 9.0;        // м/с, полная поворотливость (было 12.0)
 export const TURN_FALLOFF = 0.45;          // срез поворота на max_speed
 
-export const DRIFT_TURN_GAIN = 1.7;        // множитель поворота в заносе (было 1.55)
+export const DRIFT_TURN_GAIN = 1.55;       // множитель поворота в заносе
 export const DRIFT_MIN_SPEED = 7.0;        // м/с, ниже занос не начинается (было 8.0)
 export const DRIFT_STEER_MIN = 0.35;       // порог |steer| для заноса (раздел 6.3)
+export const DRIFT_MAX_SLIP = 0.5;         // потолок |vLat| / |vFwd| в заносе, ~27°
+export const DRIFT_SLIDE_RECOVER = 0.7;    // доля срезанного заноса обратно в vFwd
 
 export const DRIFT_CHARGE_L1 = 0.7;        // с заряда -> уровень 1, синие искры
 export const DRIFT_CHARGE_L2 = 1.4;        // с заряда -> уровень 2, оранжевые
@@ -76,6 +78,8 @@ export const CAR_CONSTANTS = Object.freeze({
     DRIFT_TURN_GAIN,
     DRIFT_MIN_SPEED,
     DRIFT_STEER_MIN,
+    DRIFT_MAX_SLIP,
+    DRIFT_SLIDE_RECOVER,
     DRIFT_CHARGE_L1,
     DRIFT_CHARGE_L2,
     DRIFT_CHARGE_L3,
@@ -373,6 +377,18 @@ export function step(state, carStats, buttons, dt, track, hint) {
     // шаг 10: боковое сцепление (в заносе оно резко ниже)
     if (driftActive) {
         vLat *= 1.0 - carStats.driftGripStep;
+        // потолок угла скольжения: без него курс убегает от вектора скорости,
+        // занос вырождается в раскрутку на месте и срывается сам (см. докстринг
+        // game/physics.py). Срезанное не выбрасывается, а частью возвращается
+        // в продольную скорость — так дрифт становится быстрым, а не наказанием
+        const maxLat = DRIFT_MAX_SLIP * (vFwd < 0.0 ? -vFwd : vFwd);
+        if (vLat > maxLat) {
+            vFwd += (vLat - maxLat) * DRIFT_SLIDE_RECOVER;
+            vLat = maxLat;
+        } else if (vLat < -maxLat) {
+            vFwd += (-vLat - maxLat) * DRIFT_SLIDE_RECOVER;
+            vLat = -maxLat;
+        }
     } else {
         vLat *= 1.0 - carStats.gripStep;
     }

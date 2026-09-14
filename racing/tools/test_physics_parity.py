@@ -19,8 +19,16 @@
 3. Если в системе есть ``node`` — прогоняет ТОТ ЖЕ сценарий и ТУ ЖЕ заглушку
    через static/js/physics.js и сравнивает траектории пошагово.
    Нет ``node`` — честно печатает, что сравнение пропущено, и не падает.
-4. Печатает максимальное расхождение по позиции и по курсу, сверяет события
-   ускорения за занос и меряет время одного шага на одну машину.
+4. Прогоняет второй сценарий: четыре машины съезжаются в одну точку —
+   это единственное, что проверяет ``resolve_collisions``, потому что
+   в первом сценарии машина одна, а столкновения считает только сервер.
+5. Печатает максимальное расхождение по позиции и по курсу, сверяет события
+   ускорения за занос, флаг «вне трассы» и круги, и меряет время одного шага
+   на одну машину — чистого и вместе с обращениями к трассе.
+
+Сценарий обязан задеть все ветки шага: если какая-то (трава, стена, задний
+ход, дрифт, соприкосновение машин) не случилась, тест не молчит, а падает —
+сверка, которая ничего не сверила, хуже отсутствующей.
 
 Заглушка трассы (``StubTrack``) живёт здесь, а не в game/track.py: настоящую
 трассу пишет другой исполнитель, а тесту физики нужна тривиальная геометрия,
@@ -48,8 +56,13 @@ from game.physics import CarState, CarStats, WALL_BOUNCE   # noqa: E402
 # несколько тысяч шагов интегрирования эта разница подрастает. Сантиметры на
 # 70 секундах гонки — норма (RECONCILE_EPS из раздела 10.2 — целых 5 см),
 # метры — это уже разъехавшийся порядок операций, то есть баг.
-POS_TOL = 0.02      # м
-YAW_TOL = 0.005     # рад
+POS_TOL = 0.02      # м, выше этого — провал
+YAW_TOL = 0.005     # рад, выше этого — провал
+# Порог подозрения. Реально наблюдаемый шум от разницы sin/cos в Python и V8 —
+# около 2e-13 м на 4200 шагов. Всё, что заметно больше, но ещё в допуске, —
+# почти наверняка не шум, а разошедшаяся константа или переставленная операция;
+# такое лучше увидеть сразу, а не когда оно дорастёт до сантиметров.
+POS_SUSPECT = 1e-6  # м
 
 # Биты ввода (раздел 5.2)
 GAS = physics.BTN_THROTTLE
@@ -136,8 +149,8 @@ SCRIPT = (
     (120, GAS | RIGHT,         "правый поворот"),
     (240, GAS | LEFT | DRIFT,  "дрифт влево, 4 с заряда — уровень 3"),
     (120, GAS,                 "срыв заноса, награда и разгон на ней"),
-    (150, GAS | RIGHT | DRIFT, "дрифт вправо, 2.5 с — уровень 3"),
-    (90,  GAS,                 "срыв"),
+    (120, GAS | RIGHT | DRIFT, "дрифт вправо, 2 с — уровень 2"),
+    (120, GAS,                 "срыв"),
     (60,  GAS | LEFT | DRIFT,  "короткий дрифт, 1 с — уровень 1"),
     (60,  GAS,                 "срыв"),
     (30,  GAS | DRIFT,         "ручник без руля — занос не начинается"),
@@ -152,21 +165,45 @@ SCRIPT = (
 
 # Внешние воздействия: (шаг, поле состояния, значение). Через них подаётся
 # то, чего не выразить кнопками: попадания, бонусы и постановка машины
-# в нужную точку для удара о стену.
+# в нужную точку. Без постановки фазы вырождаются: машину уносит доворотами
+# в стену коридора, и «торможение» на деле проверяет стоящую у стены машину.
+def _restart(at, speed):
+    """Поставить машину в центр коридора носом в +Z на заданной скорости."""
+    return ((at, "x", 0.0), (at, "yaw", 0.0), (at, "vx", 0.0), (at, "vz", speed))
+
+
 INJECT = (
-    (2100, "spin_time", 1.5),      # попадание ракеты, раскрутка 1.5 с
-    (2450, "boost_time", 2.5),     # применил «Турбо»
-    (2700, "slow_time", 1.2),      # накрыло «Грозой»
-    (2880, "shield_time", 8.0),    # поднял щит
-    # ставим машину на траву в 2 м от стены носом точно в неё, на 22 м/с:
-    # гарантированный удар и гарантированная работа OFFTRACK_FACTOR
-    (2900, "x", 58.0),
-    (2900, "yaw", 1.5707963267948966),
-    (2900, "vx", 22.0),
-    (2900, "vz", 0.0),
+    _restart(1200, 18.0)            # перед «дрифтом вправо»
+    + _restart(1440, 18.0)          # перед коротким дрифтом
+    + _restart(1710, 18.0)          # перед торможением в пол
+    + _restart(2070, 0.0)           # перед разгоном с нуля
+    + ((2100, "spin_time", 1.5),)   # попадание ракеты, раскрутка 1.5 с
+    + _restart(2370, 18.0)          # перед виражом
+    + ((2450, "boost_time", 2.5),)  # применил «Турбо»
+    + _restart(2670, 18.0)          # перед дрифтом под «Грозой»
+    + ((2700, "slow_time", 1.2),    # накрыло «Грозой»
+       (2880, "shield_time", 8.0),  # поднял щит
+       # ставим машину на траву в 2 м от стены носом точно в неё, на 22 м/с:
+       # гарантированный удар и гарантированная работа OFFTRACK_FACTOR
+       (2900, "x", 58.0),
+       (2900, "yaw", 1.5707963267948966),
+       (2900, "vx", 22.0),
+       (2900, "vz", 0.0))
 )
 
 TOTAL_STEPS = 4200
+
+# Второй сценарий: четыре машины съезжаются в одну точку. Проверяет
+# resolve_collisions — расталкивание с учётом массы и обмен импульсом.
+# Столкновения считает только сервер, поэтому в первом сценарии их нет.
+COLLIDE_STEPS = 600
+COLLIDE_CARS = (
+    # x, z, yaw (носом к центру), масса, кнопки
+    (0.0, -12.0, 0.0, 1.0, GAS),
+    (0.0, 12.0, 3.141592653589793, 1.4, GAS),
+    (-12.0, 0.0, 1.5707963267948966, 0.8, GAS | LEFT),
+    (12.0, 0.0, -1.5707963267948966, 1.2, GAS | RIGHT),
+)
 
 
 def build_plan():
@@ -197,6 +234,8 @@ def build_plan():
         "inject": [list(item) for item in INJECT],
         "stats": HATCH_STATS,
         "dt": physics.DT,
+        "collide_steps": COLLIDE_STEPS,
+        "collide_cars": [list(car) for car in COLLIDE_CARS],
     }
 
 
@@ -219,6 +258,7 @@ def run_python(plan):
     vxs = [0.0] * n
     vzs = [0.0] * n
     charges = [0.0] * n
+    offs = [0] * n
     events = []
 
     for i in range(n):
@@ -236,19 +276,61 @@ def run_python(plan):
         vxs[i] = state.vx
         vzs[i] = state.vz
         charges[i] = state.drift_charge
+        offs[i] = 1 if state.offtrack else 0
 
     return {
         "x": xs, "z": zs, "yaw": yaws, "vx": vxs, "vz": vzs,
-        "charge": charges, "events": events,
+        "charge": charges, "offtrack": offs, "events": events,
         "progress": state.progress, "lap": state.lap,
     }
+
+
+def run_python_collisions(plan):
+    """Прогнать сценарий столкновений через resolve_collisions."""
+    rows = plan["collide_cars"]
+    count = len(rows)
+    cars = []
+    stats = []
+    tracks = []
+    buttons = []
+    for x, z, yaw, mass, mask in rows:
+        state = CarState(x, z, yaw)
+        cars.append(state)
+        car_stats = CarStats(**plan["stats"])
+        car_stats.mass = mass
+        stats.append(car_stats)
+        tracks.append(StubTrack())   # своя заглушка на машину: last_s у неё своя
+        buttons.append(int(mask))
+
+    dt = plan["dt"]
+    steps = plan["collide_steps"]
+    out = []
+    for _ in range(count):
+        out.append([0.0] * (steps * 4))
+
+    for i in range(steps):
+        for c in range(count):
+            physics.step(cars[c], stats[c], buttons[c], dt, tracks[c],
+                         cars[c].sample_idx)
+        # между шагами: расталкивание и обмен импульсом для всех машин сразу
+        physics.resolve_collisions(cars, stats, count)
+        for c in range(count):
+            row = out[c]
+            base = i * 4
+            row[base] = cars[c].x
+            row[base + 1] = cars[c].z
+            row[base + 2] = cars[c].vx
+            row[base + 3] = cars[c].vz
+    return out
 
 
 # Драйвер для node: та же заглушка трассы, тот же цикл. План приходит файлом,
 # траектория уходит файлом — так не зависим от кодировки и буферов stdout.
 STUB_JS = """
 import { readFileSync, writeFileSync } from 'node:fs';
-import { step, createCarState, createCarStats, WALL_BOUNCE } from './physics.mjs';
+import {
+    step, resolveCollisions, createCarState, createCarStats, WALL_BOUNCE,
+} from './physics.mjs';
 
 /* Зеркало StubTrack из tools/test_physics_parity.py */
 const HALF_WIDTH = 40.0;
@@ -341,6 +423,7 @@ const yaws = new Array(n);
 const vxs = new Array(n);
 const vzs = new Array(n);
 const charges = new Array(n);
+const offs = new Array(n);
 const events = [];
 
 for (let i = 0; i < n; i++) {
@@ -360,22 +443,60 @@ for (let i = 0; i < n; i++) {
     vxs[i] = state.vx;
     vzs[i] = state.vz;
     charges[i] = state.driftCharge;
+    offs[i] = state.offtrack ? 1 : 0;
+}
+
+/* второй сценарий: столкновения машина-машина */
+const rows = plan.collide_cars;
+const count = rows.length;
+const cars = [];
+const carStats = [];
+const tracks = [];
+const masks = [];
+for (let c = 0; c < count; c++) {
+    cars.push(createCarState(rows[c][0], rows[c][1], rows[c][2]));
+    const cs = createCarStats(plan.stats);
+    cs.mass = rows[c][3];
+    carStats.push(cs);
+    tracks.push(new StubTrack());
+    masks.push(rows[c][4]);
+}
+const collideSteps = plan.collide_steps;
+const collide = [];
+for (let c = 0; c < count; c++) {
+    collide.push(new Array(collideSteps * 4));
+}
+for (let i = 0; i < collideSteps; i++) {
+    for (let c = 0; c < count; c++) {
+        step(cars[c], carStats[c], masks[c], dt, tracks[c], cars[c].sampleIdx);
+    }
+    resolveCollisions(cars, carStats, count);
+    for (let c = 0; c < count; c++) {
+        const row = collide[c];
+        const base = i * 4;
+        row[base] = cars[c].x;
+        row[base + 1] = cars[c].z;
+        row[base + 2] = cars[c].vx;
+        row[base + 3] = cars[c].vz;
+    }
 }
 
 writeFileSync(process.argv[3], JSON.stringify({
     x: xs, z: zs, yaw: yaws, vx: vxs, vz: vzs,
-    charge: charges, events: events,
+    charge: charges, offtrack: offs, events: events,
     progress: state.progress, lap: state.lap,
+    collide: collide,
 }));
 """
 
 
-def run_js(plan):
-    """Прогнать тот же план через static/js/physics.js. None, если нет node."""
-    node = shutil.which("node")
-    if node is None:
-        return None
+def run_js(plan, node):
+    """Прогнать тот же план через static/js/physics.js.
 
+    Возвращает траекторию или None, если прогон не удался. Отсутствие node
+    проверяет вызывающий: «node нет» — законный пропуск, «node есть, но
+    прогон упал» — провал.
+    """
     js_src = os.path.join(ROOT, "static", "js", "physics.js")
     workdir = tempfile.mkdtemp(prefix="physics-parity-")
     try:
@@ -433,15 +554,19 @@ def compare(py, js):
         if dv > max_vel:
             max_vel = dv
 
-    print("  расхождение позиции: %.6f м (максимум на шаге %d)"
+    print("  расхождение позиции: %.3e м (максимум на шаге %d)"
           % (max_pos, max_pos_at))
-    print("  расхождение курса:   %.9f рад (максимум на шаге %d)"
+    print("  расхождение курса:   %.3e рад (максимум на шаге %d)"
           % (max_yaw, max_yaw_at))
-    print("  расхождение скорости: %.6f м/с" % max_vel)
+    print("  расхождение скорости: %.3e м/с" % max_vel)
     print("  progress: python %.6f м, js %.6f м, разница %.6f м"
           % (py["progress"], js["progress"], abs(py["progress"] - js["progress"])))
 
     ok = True
+    if POS_SUSPECT < max_pos <= POS_TOL:
+        print("  ВНИМАНИЕ: расхождение сильно выше шума sin/cos (~2e-13 м).")
+        print("  В допуск укладывается, но так выглядит разошедшаяся константа")
+        print("  или переставленная операция — сверь файлы бок о бок.")
     if py["events"] != js["events"]:
         print("  РАСХОЖДЕНИЕ: события ускорения за занос не совпали")
         print("    python: %r" % (py["events"],))
@@ -450,6 +575,10 @@ def compare(py, js):
     else:
         print("  события ускорения за занос совпали: %d штук, уровни %s"
               % (len(py["events"]), [e[1] for e in py["events"]]))
+    if py["offtrack"] != js["offtrack"]:
+        bad = next(i for i in range(n) if py["offtrack"][i] != js["offtrack"][i])
+        print("  РАСХОЖДЕНИЕ: флаг «вне трассы» разошёлся на шаге %d" % bad)
+        ok = False
     if py["lap"] != js["lap"]:
         print("  РАСХОЖДЕНИЕ: круги не совпали (%d против %d)"
               % (py["lap"], js["lap"]))
@@ -463,14 +592,70 @@ def compare(py, js):
     return ok
 
 
-def bench(plan, repeats=40):
+def collide_stats(rows):
+    """Минимальное расстояние между машинами за прогон и в конце прогона."""
+    count = len(rows)
+    steps = len(rows[0]) // 4
+    closest = 1e9
+    final_min = 1e9
+    for i in range(steps):
+        base = i * 4
+        for a in range(count - 1):
+            for b in range(a + 1, count):
+                dx = rows[a][base] - rows[b][base]
+                dz = rows[a][base + 1] - rows[b][base + 1]
+                d = (dx * dx + dz * dz) ** 0.5
+                if d < closest:
+                    closest = d
+                if i == steps - 1 and d < final_min:
+                    final_min = d
+    return closest, final_min
+
+
+def compare_collisions(py_rows, js_rows):
+    """Сравнить траектории сценария столкновений."""
+    worst = 0.0
+    worst_car = 0
+    for c in range(len(py_rows)):
+        a = py_rows[c]
+        b = js_rows[c]
+        if len(a) != len(b):
+            print("  РАСХОЖДЕНИЕ: длина траектории машины %d не совпала" % c)
+            return False
+        for k in range(0, len(a), 4):
+            dx = a[k] - b[k]
+            dz = a[k + 1] - b[k + 1]
+            d = (dx * dx + dz * dz) ** 0.5
+            if d > worst:
+                worst = d
+                worst_car = c
+    print("  столкновения: расхождение позиции %.3e м (худшая машина %d)"
+          % (worst, worst_car))
+    if worst > POS_TOL:
+        print("  РАСХОЖДЕНИЕ: столкновения вышли за допуск %.3f м" % POS_TOL)
+        return False
+    return True
+
+
+class NullTrack:
+    """Трасса, которая ничего не делает: чтобы замерить чистую цену шага."""
+
+    __slots__ = ()
+
+    def clamp_to_track(self, state, hint):
+        pass
+
+    def advance_progress(self, state, hint):
+        pass
+
+
+def bench(plan, track, repeats=40):
     """Сколько микросекунд занимает один шаг на одну машину."""
     buttons = plan["buttons"]
     stats = CarStats(**plan["stats"])
     dt = plan["dt"]
     n = len(buttons)
     state = CarState(0.0, 0.0, 0.0)
-    track = StubTrack()
     phys_step = physics.step
 
     # прогрев
@@ -480,7 +665,8 @@ def bench(plan, repeats=40):
     best = None
     for _ in range(repeats):
         state.reset(0.0, 0.0, 0.0)
-        track.last_s = 0.0
+        if isinstance(track, StubTrack):
+            track.last_s = 0.0
         t0 = time.perf_counter()
         for i in range(n):
             phys_step(state, stats, buttons[i], dt, track, state.sample_idx)
@@ -492,6 +678,7 @@ def bench(plan, repeats=40):
 
 def report_feel(py):
     """Пара чисел про ощущения от управления — глазами их проверять дольше."""
+    from math import sin, cos
     vx = py["vx"]
     vz = py["vz"]
     speeds = [(vx[i] * vx[i] + vz[i] * vz[i]) ** 0.5 for i in range(len(vx))]
@@ -504,6 +691,29 @@ def report_feel(py):
     print(line)
     print("  скорость в конце прямого разгона: %.1f м/с (%.0f км/ч)"
           % (speeds[599], speeds[599] * 3.6))
+
+    # покрытие: сценарий обязан задеть все ветки шага, иначе сверка пустая
+    n = len(vx)
+    fwd = [vx[i] * sin(py["yaw"][i]) + vz[i] * cos(py["yaw"][i]) for i in range(n)]
+    off_steps = sum(py["offtrack"])
+    wall_steps = sum(1 for i in range(n)
+                     if py["x"][i] >= StubTrack.WALL_LIMIT - 1e-9
+                     or py["x"][i] <= -StubTrack.WALL_LIMIT + 1e-9)
+    reverse_steps = sum(1 for v in fwd if v < -1.0)
+    drifting = sum(1 for c in py["charge"] if c > 0.0)
+    print("  покрытие: вне трассы %d шагов, в стене %d, задним ходом %d, "
+          "в заносе %d, задний ход до %.1f м/с"
+          % (off_steps, wall_steps, reverse_steps, drifting, min(fwd)))
+    missing = []
+    if off_steps == 0:
+        missing.append("трава")
+    if wall_steps == 0:
+        missing.append("стена")
+    if reverse_steps == 0:
+        missing.append("задний ход")
+    if drifting == 0:
+        missing.append("дрифт")
+    return missing
 
 
 def main():
@@ -520,25 +730,45 @@ def main():
         print("  ОШИБКА: сценарий не выдал ни одного ускорения за занос,")
         print("  значит дрифт не проверен. Чини сценарий.")
         return 1
-    report_feel(py)
+    missing = report_feel(py)
+    if missing:
+        print("  ОШИБКА: сценарий не задел ветки: %s" % ", ".join(missing))
+        return 1
 
     print()
-    js = run_js(plan)
-    if js is None:
-        if shutil.which("node") is None:
-            print("  node в системе не найден — сравнение с JS пропущено.")
-            print("  Python-реализация прогнана целиком и отработала.")
-        else:
-            print("  JS-прогон не удался, сравнение пропущено (см. вывод выше).")
+    py_collide = run_python_collisions(plan)
+    closest, final_min = collide_stats(py_collide)
+    print("  сценарий столкновений: %d машин, %d шагов, сблизились до %.3f м, "
+          "в конце ближайшая пара в %.3f м (диаметр %.1f м)"
+          % (len(py_collide), COLLIDE_STEPS, closest, final_min,
+             physics.CAR_RADIUS * 2.0))
+    if closest > physics.CAR_RADIUS * 2.0:
+        print("  ОШИБКА: машины не соприкоснулись, столкновения не проверены")
+        return 1
+
+    print()
+    node = shutil.which("node")
+    if node is None:
+        print("  node в системе не найден — сравнение с JS пропущено.")
+        print("  Python-реализация прогнана целиком и отработала.")
         ok = True
     else:
-        ok = compare(py, js)
+        js = run_js(plan, node)
+        if js is None:
+            print("  ПРОВАЛ: node есть, но прогон static/js/physics.js не удался.")
+            ok = False
+        else:
+            ok = compare(py, js)
+            if not compare_collisions(py_collide, js["collide"]):
+                ok = False
 
     print()
-    per_step = bench(plan)
-    print("  один шаг физики на одну машину: %.2f мкс" % per_step)
-    print("  восемь машин на тик: %.3f мс (бюджет тика — 2 мс)"
-          % (per_step * 8 / 1000.0))
+    pure = bench(plan, NullTrack())
+    full = bench(plan, StubTrack())
+    print("  один шаг физики на одну машину: %.2f мкс" % pure)
+    print("  то же вместе с заглушкой трассы (шаги 14 и 16): %.2f мкс" % full)
+    print("  восемь машин на тик: %.3f мс чистой физики, %.3f мс с трассой "
+          "(бюджет тика — 2 мс)" % (pure * 8 / 1000.0, full * 8 / 1000.0))
 
     print()
     if ok:

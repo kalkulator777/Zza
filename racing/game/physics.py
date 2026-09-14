@@ -38,8 +38,6 @@
 * ``TURN_FULL_SPEED`` 12.0 -> 9.0  — полная поворотливость доступна с 32 км/ч.
   Реальные скорости на трассе 12..22 м/с (см. ниже про ``roll``), с порогом
   12.0 машина недоворачивала ровно в самом ходовом диапазоне.
-* ``DRIFT_TURN_GAIN`` 1.55 -> 1.7  — по ручнику машина охотно срывается
-  в занос, а не «немного сильнее поворачивает».
 * ``DRIFT_MIN_SPEED`` 8.0 -> 7.0   — дрифт доступен и в медленных шпильках.
 * ``SLOW_FACTOR``     0.985 -> 0.995 — 0.985 на шаг это -18 м/с² на скорости
   20 м/с, вдвое сильнее двигателя: «Гроза» не замедляла, а почти
@@ -48,8 +46,37 @@
   от трассовой, машина в ней вязла намертво. 0.992 даёт около 60 % —
   срезка наказана, но не смертельна.
 
+``DRIFT_TURN_GAIN`` оставлен контрактным (1.55), но сам дрифт из 6.2/6.3
+в исходном виде не работал вообще, и это не вопрос вкуса. Шаг 10 гасит
+боковую скорость, шаг 9 крутит курс, и при ``drift_grip_step = 0.055``
+курс убегает от вектора скорости быстрее, чем сцепление успевает её
+подобрать: угол скольжения разносит до 50..57°, продольная скорость (её же
+проверяет условие заноса из 6.3) падает ниже ``DRIFT_MIN_SPEED`` за
+полсекунды, занос срывается сам собой и заряд обнуляется. Машина теряла
+60 % скорости за секунду, а уровень 2-3 был недостижим в принципе.
+Поэтому в шаг 10 добавлены две константы:
+
+* ``DRIFT_MAX_SLIP`` = 0.5 — потолок отношения |v_lat| / |v_fwd|, то есть
+  угол скольжения не больше 27°. Занос перестал быть раскруткой: он
+  предсказуем, машина стоит боком на постоянный угол и ловится за 0.2 с
+  после отпускания ручника.
+* ``DRIFT_SLIDE_RECOVER`` = 0.7 — доля срезанной боковой скорости, которая
+  возвращается в продольную, а не выбрасывается. Физически это ровно то,
+  что делает шина в заносе: перенаправляет импульс, а не уничтожает его.
+  Именно эта доля делает дрифт быстрым способом прохождения поворота.
+
+Замеры на «Хэтче» (скорость на прямой 19.9 м/с, полный руль, 60 Гц)::
+
+    приём                поворот за 0.75 с   скорость после
+    на сцеплении                81°          19.9 -> 16.8 м/с
+    по ручнику (дрифт)         124°          19.9 -> 16.2 м/с
+
+То есть ручник даёт в полтора раза более крутой поворот практически даром —
+и сверху ещё ускорение за заряд. Ради этого дрифт в игре и нужен.
+
 Добавлены константы, которых в 6.4 не было, но без которых шаг недописан:
 ``REVERSE_MAX_SPEED``, ``BRAKE_REVERSE_SPEED``, ``DRIFT_STEER_MIN``,
+``DRIFT_MAX_SLIP``, ``DRIFT_SLIDE_RECOVER``,
 ``DRIFT_CHARGE_L1..L3``, ``DRIFT_BOOST_L1..L3``, ``COLLISION_RESTITUTION``,
 ``STEER_MAX``. Значения и причины — в комментариях у самих констант.
 
@@ -70,6 +97,34 @@
    ``advance_progress`` (раздел 7.4). Нужны ещё — добавлять сюда.
 6. Затухание при обмене импульсом в столкновениях названо, но не задано
    числом: введён ``COLLISION_RESTITUTION``.
+7. «Столкновения считаются между шагами 14 и 15» и «столкновения — отдельная
+   функция, а не часть шага» — требования несовместимые: чтобы влезть
+   между 14 и 15, шаг пришлось бы разрезать надвое и тащить локальные
+   ``v_fwd`` и ``spinning`` через поля состояния. Здесь ``step`` неделим
+   (1..16), а ``resolve_collisions`` сервер зовёт между тиками, после шага
+   всех машин. Разница ровно одна: ``progress`` толкнутой машины учитывает
+   выталкивание на кадр позже. Шаг 15 не затронут вовсе — он и так смотрит
+   на ``v_fwd``, посчитанную в шаге 11, до обращения к трассе.
+8. Тип ``car_stats`` в контракте не назван. Шаг читает атрибуты (``mass``,
+   ``engine_force``, ...), а не ключи словаря: ``game/cars.py`` может отдавать
+   любой объект с этими атрибутами, ``CarStats.from_dict`` — готовый вариант.
+9. Имена полей состояния в JS контракт не фиксирует. В ``static/js/physics.js``
+   они в camelCase (``driftCharge``, ``boostTime``, ``sampleIdx``) — по образцу
+   раздела 7.3, где методы трассы тоже переименованы в camelCase.
+   ``static/js/track.js`` и ``static/js/net.js`` обязаны читать их так же.
+
+Замечание к content/cars.json (файл чужой, правит [track])
+---------------------------------------------------------
+С характеристиками «Хэтча» из раздела 6.5 машина упирается в 19.9 м/с
+(72 км/ч), а вовсе не в заявленные ``max_speed = 44``: сопротивление качению
+``roll = 0.35`` съедает тягу задолго до потолка (14*(1 - v/44) = 0.35v +
+0.0016v² даёт ровно v = 20). ``boost_speed = 58`` недостижим по той же
+причине — «Турбо» вытягивает до 37 м/с. Формула шага 6 верна, перекошены
+характеристики: ``roll`` для аркады должен быть 0.08..0.12, тогда
+``max_speed`` и ``boost_speed`` станут честными числами, а падение поворота
+``TURN_FALLOFF`` начнёт работать в реальном диапазоне скоростей. Пока этого
+не случилось, ``TURN_FULL_SPEED`` выставлен под фактические 12..22 м/с;
+если ``roll`` поправят, вернуть его к 12.0.
 """
 
 from math import sin, cos, sqrt
@@ -79,6 +134,7 @@ __all__ = [
     "STEER_RATE", "STEER_RETURN", "STEER_MAX",
     "TURN_FULL_SPEED", "TURN_FALLOFF",
     "DRIFT_TURN_GAIN", "DRIFT_MIN_SPEED", "DRIFT_STEER_MIN",
+    "DRIFT_MAX_SLIP", "DRIFT_SLIDE_RECOVER",
     "DRIFT_CHARGE_L1", "DRIFT_CHARGE_L2", "DRIFT_CHARGE_L3",
     "DRIFT_BOOST_L1", "DRIFT_BOOST_L2", "DRIFT_BOOST_L3",
     "SPIN_RATE", "BOOST_ACCEL", "SLOW_FACTOR", "OFFTRACK_FACTOR",
@@ -102,9 +158,11 @@ STEER_MAX = 1.0                  # предел |steer| (шаг 3 требует
 TURN_FULL_SPEED = 9.0            # м/с, выше — полная поворотливость (было 12.0)
 TURN_FALLOFF = 0.45              # насколько срезается поворот на max_speed
 
-DRIFT_TURN_GAIN = 1.7            # множитель поворота в заносе (было 1.55)
+DRIFT_TURN_GAIN = 1.55           # множитель поворота в заносе
 DRIFT_MIN_SPEED = 7.0            # м/с, ниже занос не начинается (было 8.0)
 DRIFT_STEER_MIN = 0.35           # порог |steer| для заноса (раздел 6.3)
+DRIFT_MAX_SLIP = 0.5             # потолок |v_lat| / |v_fwd| в заносе, ~27°
+DRIFT_SLIDE_RECOVER = 0.7        # доля срезанного заноса обратно в v_fwd
 
 DRIFT_CHARGE_L1 = 0.7            # с заряда -> уровень 1, синие искры
 DRIFT_CHARGE_L2 = 1.4            # с заряда -> уровень 2, оранжевые искры
@@ -420,6 +478,17 @@ def step(state, car_stats, buttons, dt, track, hint):
     # --- шаг 10: боковое сцепление (в заносе оно резко ниже)
     if drift_active:
         v_lat *= 1.0 - car_stats.drift_grip_step
+        # потолок угла скольжения: без него курс убегает от вектора скорости,
+        # занос вырождается в раскрутку на месте и срывается сам (см. докстринг).
+        # Срезанное не выбрасывается, а частью возвращается в продольную
+        # скорость — так дрифт становится быстрым, а не наказанием
+        max_lat = DRIFT_MAX_SLIP * (-v_fwd if v_fwd < 0.0 else v_fwd)
+        if v_lat > max_lat:
+            v_fwd += (v_lat - max_lat) * DRIFT_SLIDE_RECOVER
+            v_lat = max_lat
+        elif v_lat < -max_lat:
+            v_fwd += (-v_lat - max_lat) * DRIFT_SLIDE_RECOVER
+            v_lat = -max_lat
     else:
         v_lat *= 1.0 - car_stats.grip_step
 
@@ -463,30 +532,29 @@ def step(state, car_stats, buttons, dt, track, hint):
             state.drift_active = False
         if drift_charge != 0.0:
             state.drift_charge = 0.0
-    else:
-        if btn_drift and v_fwd > DRIFT_MIN_SPEED and \
-                (steer > DRIFT_STEER_MIN or steer < -DRIFT_STEER_MIN):
-            if not drift_active:
-                state.drift_active = True
-            state.drift_charge = drift_charge + dt
-        elif drift_active:
-            # ручник отпущен, руль выпрямлен или скорость потеряна
-            if drift_charge >= DRIFT_CHARGE_L3:
-                level = 3
-                reward = DRIFT_BOOST_L3
-            elif drift_charge >= DRIFT_CHARGE_L2:
-                level = 2
-                reward = DRIFT_BOOST_L2
-            elif drift_charge >= DRIFT_CHARGE_L1:
-                level = 1
-                reward = DRIFT_BOOST_L1
-            else:
-                reward = 0.0
-            # новый буст не укорачивает уже идущий
-            if reward > boost_time:
-                state.boost_time = reward
-            state.drift_active = False
-            state.drift_charge = 0.0
+    elif btn_drift and v_fwd > DRIFT_MIN_SPEED \
+            and (steer > DRIFT_STEER_MIN or steer < -DRIFT_STEER_MIN):
+        if not drift_active:
+            state.drift_active = True
+        state.drift_charge = drift_charge + dt
+    elif drift_active:
+        # ручник отпущен, руль выпрямлен или скорость потеряна
+        if drift_charge >= DRIFT_CHARGE_L3:
+            level = 3
+            reward = DRIFT_BOOST_L3
+        elif drift_charge >= DRIFT_CHARGE_L2:
+            level = 2
+            reward = DRIFT_BOOST_L2
+        elif drift_charge >= DRIFT_CHARGE_L1:
+            level = 1
+            reward = DRIFT_BOOST_L1
+        else:
+            reward = 0.0
+        # новый буст не укорачивает уже идущий
+        if reward > boost_time:
+            state.boost_time = reward
+        state.drift_active = False
+        state.drift_charge = 0.0
 
     # --- шаг 16: progress, круги и отсечки
     track.advance_progress(state, hint)
