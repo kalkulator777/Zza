@@ -15,9 +15,14 @@
 // Имена полей состояния здесь в camelCase (driftCharge, boostTime, sampleIdx),
 // как и имена методов трассы в разделе 7.3 (nearestIndex, clampToTrack).
 // Соответствие полям раздела 6.1 — один в один, см. createCarState.
+// driftActive и driftCharge имён не меняли, хотя кнопка теперь зовётся
+// ручником: оба поля едут в снапшот и их читают рендер, HUD и звук.
 //
-// Подкрученные константы и места, где контракт пришлось дотолковать,
-// перечислены в докстринге game/physics.py. Значения обоих файлов совпадают.
+// Четыре правки по итогам живого плейтеста (столкновения капсулой, ручник
+// вместо дрифта, предел поперечного ускорения в шаге 9, поднятый потолок
+// скорости), подкрученные константы и места, где контракт пришлось
+// дотолковать, подробно расписаны в докстринге game/physics.py.
+// Значения обоих файлов совпадают до последнего разряда.
 
 // ---------------------------------------------------------------------------
 // КОНСТАНТЫ (раздел 6.4)
@@ -33,11 +38,33 @@ export const STEER_MAX = 1.0;              // предел |steer| (шаг 3)
 export const TURN_FULL_SPEED = 9.0;        // м/с, полная поворотливость (было 12.0)
 export const TURN_FALLOFF = 0.45;          // срез поворота на max_speed
 
-export const DRIFT_TURN_GAIN = 1.55;       // множитель поворота в заносе
-export const DRIFT_MIN_SPEED = 7.0;        // м/с, ниже занос не начинается (было 8.0)
-export const DRIFT_STEER_MIN = 0.35;       // порог |steer| для заноса (раздел 6.3)
-export const DRIFT_MAX_SLIP = 0.5;         // потолок |vLat| / |vFwd| в заносе, ~27°
-export const DRIFT_SLIDE_RECOVER = 0.7;    // доля срезанного заноса обратно в vFwd
+// --- предел по сцеплению в шаге 9 ------------------------------------------
+// Поперечное ускорение в повороте есть |vFwd * turn|. Потолок этой величины
+// задаётся сцеплением машины: aLatMax = gripStep * GRIP_LAT_ACCEL. Отсюда
+// скорость в повороте радиуса R равна sqrt(aLatMax * R), а не R * turnRate,
+// то есть gripStep наконец что-то решает. Множитель подобран замером: при
+// разбросе gripStep 0.158..0.190 он даёт 25.3..30.4 м/с² поперёк, то есть
+// 20.1..22.1 м/с в связке радиусом 16 м и 31.8..34.9 м/с в дуге 40 м. Меньше —
+// и сцепление начинает решать всё, машины перестают балансироваться; больше —
+// и предела фактически нет, как было до правки.
+export const GRIP_LAT_ACCEL = 160.0;       // м/с² поперёк на единицу gripStep
+export const LAT_CAP_MIN_SPEED = 6.0;      // м/с: ниже предел не сужается
+
+// --- ручной тормоз (в 6.3 и 6.4 он назван «дрифтом») -----------------------
+// Занос — следствие ручника, а не название кнопки. Ручник: (а) доворачивает
+// корму сверх того, что позволяет сцепление, (б) снимает боковое сцепление до
+// driftGripStep, (в) умеренно тормозит. Усиление 1.55 из 6.4 на здешних
+// поворотах (радиус 13..17,5 м) разворачивало машину вокруг оси; 1.18 плюс
+// поднятый на HANDBRAKE_LAT_GAIN предел по сцеплению дают поворот в 1.45 раза
+// круче, чем на сцеплении, ценой четверти скорости — занос, который держишь
+// рулём, а не разворот.
+export const HANDBRAKE_TURN_GAIN = 1.18;   // множитель поворота на ручнике (было 1.55)
+export const HANDBRAKE_LAT_GAIN = 1.25;    // во сколько ручник поднимает предел
+export const HANDBRAKE_DECEL = 9.0;        // м/с² продольного замедления
+export const HANDBRAKE_MIN_SPEED = 7.0;    // м/с, ниже занос не начинается (было 8.0)
+export const HANDBRAKE_MAX_SLIP = 0.36;    // потолок |vLat| / |vFwd|, ~20° (было 0.5)
+export const HANDBRAKE_SLIDE_RECOVER = 0.7;// доля срезанного заноса обратно в vFwd
+export const HANDBRAKE_CHARGE_SLIP = 0.12; // ниже этого скольжения заряд не копится
 
 export const DRIFT_CHARGE_L1 = 0.7;        // с заряда -> уровень 1, синие искры
 export const DRIFT_CHARGE_L2 = 1.4;        // с заряда -> уровень 2, оранжевые
@@ -57,7 +84,13 @@ export const REVERSE_MAX_SPEED = 9.0;      // м/с, потолок заднег
 export const WALL_BOUNCE = 0.35;           // доля нормальной скорости после стены
 export const COLLISION_PUSH = 0.6;         // доля перекрытия, снимаемая за шаг
 export const COLLISION_RESTITUTION = 0.35; // упругость обмена импульсом
-export const CAR_RADIUS = 1.1;             // м, круг столкновений
+
+// --- габарит столкновений: капсула вдоль продольной оси ---------------------
+// Кузова в content/cars.json: длина 3.7..4.95 м, ширина 1.80..2.02 м. Капсула
+// одна на всех (характеристик формы в статистиках машины нет), взята по
+// среднему кузову: отрезок 2*1.05 м с радиусом 0.95 м даёт габарит 4.00 x 1.90 м.
+export const CAR_RADIUS = 0.95;            // м, радиус капсулы = полуширина кузова
+export const CAR_AXIS_HALF = 1.05;         // м, полуотрезок капсулы вдоль оси
 
 // Биты ввода. Значения обязаны совпадать с BTN_* из static/js/protocol.js;
 // продублированы здесь, чтобы физика не тянула за собой сетевой модуль.
@@ -65,7 +98,8 @@ export const BTN_THROTTLE = 1 << 0;
 export const BTN_BRAKE = 1 << 1;
 export const BTN_LEFT = 1 << 2;
 export const BTN_RIGHT = 1 << 3;
-export const BTN_DRIFT = 1 << 4;
+export const BTN_HANDBRAKE = 1 << 4;
+export const BTN_DRIFT = BTN_HANDBRAKE;    // имя из раздела 5.2 и protocol.js
 
 // Тот же набор одним объектом — для HUD, настроек и отладочного оверлея.
 export const CAR_CONSTANTS = Object.freeze({
@@ -75,11 +109,15 @@ export const CAR_CONSTANTS = Object.freeze({
     STEER_MAX,
     TURN_FULL_SPEED,
     TURN_FALLOFF,
-    DRIFT_TURN_GAIN,
-    DRIFT_MIN_SPEED,
-    DRIFT_STEER_MIN,
-    DRIFT_MAX_SLIP,
-    DRIFT_SLIDE_RECOVER,
+    GRIP_LAT_ACCEL,
+    LAT_CAP_MIN_SPEED,
+    HANDBRAKE_TURN_GAIN,
+    HANDBRAKE_LAT_GAIN,
+    HANDBRAKE_DECEL,
+    HANDBRAKE_MIN_SPEED,
+    HANDBRAKE_MAX_SLIP,
+    HANDBRAKE_SLIDE_RECOVER,
+    HANDBRAKE_CHARGE_SLIP,
     DRIFT_CHARGE_L1,
     DRIFT_CHARGE_L2,
     DRIFT_CHARGE_L3,
@@ -96,6 +134,7 @@ export const CAR_CONSTANTS = Object.freeze({
     COLLISION_PUSH,
     COLLISION_RESTITUTION,
     CAR_RADIUS,
+    CAR_AXIS_HALF,
 });
 
 /**
@@ -112,8 +151,8 @@ export function createCarState(x, z, yaw) {
         vx: 0.0,                  // скорость в мировых координатах, м/с
         vz: 0.0,
         steer: 0.0,               // текущий угол руля, -1..1
-        driftCharge: 0.0,         // накопленный заряд дрифта, с
-        driftActive: false,       // идёт ли занос
+        driftCharge: 0.0,         // накопленный заряд заноса, с
+        driftActive: false,       // идёт ли занос (ручник держит машину боком)
         boostTime: 0.0,           // остаток ускорения, с
         spinTime: 0.0,            // остаток раскрутки после урона, с
         shieldTime: 0.0,          // остаток щита, с
@@ -207,7 +246,7 @@ export function step(state, carStats, buttons, dt, track, hint) {
     let boostTime = state.boostTime;
     let slowTime = state.slowTime;
     let shieldTime = state.shieldTime;
-    const driftActive = state.driftActive;
+    const sliding = state.driftActive;   // занос, поднятый ручником на прошлом шаге
     const driftCharge = state.driftCharge;
     let vx = state.vx;
     let vz = state.vz;
@@ -220,7 +259,7 @@ export function step(state, carStats, buttons, dt, track, hint) {
     let btnBrake = buttons & BTN_BRAKE;
     let btnLeft = buttons & BTN_LEFT;
     let btnRight = buttons & BTN_RIGHT;
-    let btnDrift = buttons & BTN_DRIFT;
+    let btnHandbrake = buttons & BTN_HANDBRAKE;
 
     // шаг 1: раскрутка после урона глушит ввод и крутит машину
     let spinning;
@@ -229,7 +268,7 @@ export function step(state, carStats, buttons, dt, track, hint) {
         btnBrake = 0;
         btnLeft = 0;
         btnRight = 0;
-        btnDrift = 0;
+        btnHandbrake = 0;
         yaw += SPIN_RATE * dt;
         spinTime -= dt;
         if (spinTime < 0.0) {
@@ -315,6 +354,19 @@ export function step(state, carStats, buttons, dt, track, hint) {
         accel = 0.0;
     }
     vFwd += accel * dt;
+    // шаг 6, расширение: ручник тормозит. Без этого «ручной тормоз» только
+    // снимал боковое сцепление и названию не соответствовал. Замедление
+    // одинаково на переднем и заднем ходу и никогда не переворачивает знак.
+    if (btnHandbrake) {
+        const handStep = HANDBRAKE_DECEL * dt;
+        if (vFwd > handStep) {
+            vFwd -= handStep;
+        } else if (vFwd < -handStep) {
+            vFwd += handStep;
+        } else {
+            vFwd = 0.0;
+        }
+    }
 
     // шаг 7: ускорение от бонуса (и от заноса — уровни 1..3)
     if (boostTime > 0.0) {
@@ -369,24 +421,46 @@ export function step(state, carStats, buttons, dt, track, hint) {
     if (vFwd < 0.0) {
         turn = -turn;            // задним ходом руль работает наоборот
     }
-    if (driftActive) {
-        turn *= DRIFT_TURN_GAIN;
+    if (sliding) {
+        turn *= HANDBRAKE_TURN_GAIN;
+    }
+    // шаг 9, расширение: предел по сцеплению. Поперечное ускорение в повороте
+    // есть |vFwd * turn|; выше aLatMax машина просто не поворачивает. Отсюда
+    // скорость в дуге радиуса R равна sqrt(aLatMax * R) — именно это делает
+    // gripStep характеристикой, а не украшением карточки машины. На ручнике
+    // потолок поднят: занос и нужен, чтобы повернуть круче, чем позволяет
+    // сцепление.
+    let latLimit = carStats.gripStep * GRIP_LAT_ACCEL;
+    if (sliding) {
+        latLimit *= HANDBRAKE_LAT_GAIN;
+    }
+    let turnCap;
+    if (absFwd > LAT_CAP_MIN_SPEED) {
+        turnCap = latLimit / absFwd;
+    } else {
+        turnCap = latLimit / LAT_CAP_MIN_SPEED;
+    }
+    if (turn > turnCap) {
+        turn = turnCap;
+    } else if (turn < -turnCap) {
+        turn = -turnCap;
     }
     yaw += turn * dt;
 
-    // шаг 10: боковое сцепление (в заносе оно резко ниже)
-    if (driftActive) {
+    // шаг 10: боковое сцепление (на ручнике оно резко ниже)
+    if (sliding) {
         vLat *= 1.0 - carStats.driftGripStep;
         // потолок угла скольжения: без него курс убегает от вектора скорости,
         // занос вырождается в раскрутку на месте и срывается сам (см. докстринг
         // game/physics.py). Срезанное не выбрасывается, а частью возвращается
-        // в продольную скорость — так дрифт становится быстрым, а не наказанием
-        const maxLat = DRIFT_MAX_SLIP * (vFwd < 0.0 ? -vFwd : vFwd);
+        // в продольную скорость — так занос остаётся быстрым способом
+        // пройти поворот
+        const maxLat = HANDBRAKE_MAX_SLIP * (vFwd < 0.0 ? -vFwd : vFwd);
         if (vLat > maxLat) {
-            vFwd += (vLat - maxLat) * DRIFT_SLIDE_RECOVER;
+            vFwd += (vLat - maxLat) * HANDBRAKE_SLIDE_RECOVER;
             vLat = maxLat;
         } else if (vLat < -maxLat) {
-            vFwd += (-vLat - maxLat) * DRIFT_SLIDE_RECOVER;
+            vFwd += (-vLat - maxLat) * HANDBRAKE_SLIDE_RECOVER;
             vLat = -maxLat;
         }
     } else {
@@ -426,24 +500,30 @@ export function step(state, carStats, buttons, dt, track, hint) {
     // (столкновения машина-машина считает только сервер, между шагами 14 и 15;
     //  клиент их не предсказывает, в шаг они не входят)
 
-    // шаг 15: заряд дрифта и награда за занос (раздел 6.3)
+    // шаг 15: заряд заноса и награда за него (раздел 6.3)
     let level = 0;
     if (spinning) {
         // раскрутило — занос сбит, заряд сгорает без награды
-        if (driftActive) {
+        if (sliding) {
             state.driftActive = false;
         }
         if (driftCharge !== 0.0) {
             state.driftCharge = 0.0;
         }
-    } else if (btnDrift && vFwd > DRIFT_MIN_SPEED
-               && (steer > DRIFT_STEER_MIN || steer < -DRIFT_STEER_MIN)) {
-        if (!driftActive) {
+    } else if (btnHandbrake && vFwd > HANDBRAKE_MIN_SPEED) {
+        // требования «|steer| > 0.35» больше нет: ручник срабатывает от одного
+        // пробела, руль нужен, чтобы заносом управлять, а не чтобы его начать
+        if (!sliding) {
             state.driftActive = true;
         }
-        state.driftCharge = driftCharge + dt;
-    } else if (driftActive) {
-        // ручник отпущен, руль выпрямлен или скорость потеряна
+        // ...но заряд копится только за НАСТОЯЩИЙ занос. Иначе зажатый на
+        // прямой пробел давал бы ускорение ни за что
+        const absLat = vLat < 0.0 ? -vLat : vLat;
+        if (absLat > HANDBRAKE_CHARGE_SLIP * vFwd) {
+            state.driftCharge = driftCharge + dt;
+        }
+    } else if (sliding) {
+        // ручник отпущен или скорость потеряна
         let reward;
         if (driftCharge >= DRIFT_CHARGE_L3) {
             level = 3;
@@ -471,29 +551,97 @@ export function step(state, carStats, buttons, dt, track, hint) {
     return level;
 }
 
+// Продольные оси машин на текущий тик. Буфер модульного уровня: считать
+// sin/cos на каждую ПАРУ было бы 2*C(8,2) = 56 вызовов вместо восьми, а
+// заводить массив внутри функции нельзя — resolveCollisions зовётся 60 раз
+// в секунду и обязана быть без аллокаций. Растёт один раз до нужной длины.
+const AXIS_X = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+const AXIS_Z = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
 /**
- * Столкновения машина-машина, круг-круг радиуса CAR_RADIUS.
+ * Столкновения машина-машина: капсула против капсулы.
  *
  * На клиенте НЕ вызывается (раздел 6.2: столкновения считает только сервер) и
  * намеренно не является частью step. Экспортируется, чтобы зеркало было полным
  * и чтобы одиночные офлайн-прогоны в браузере вели себя как сервер.
  *
+ * Машина — капсула вдоль продольной оси: отрезок от -CAR_AXIS_HALF до
+ * +CAR_AXIS_HALF вдоль (sin yaw, cos yaw), обмотанный радиусом CAR_RADIUS.
+ * Габарит 4,00 x 1,90 м против прежнего круга 2,2 м — именно из-за круга
+ * казалось, что столкновений нет: машины успевали въехать друг в друга
+ * на два метра, прежде чем что-то происходило.
+ *
  * cars — массив состояний, stats — параллельный ему массив характеристик
  * (нужна mass), count — сколько первых элементов участвует.
  */
 export function resolveCollisions(cars, stats, count) {
-    const diameter = CAR_RADIUS + CAR_RADIUS;
-    const minDistSq = diameter * diameter;
+    while (AXIS_X.length < count) {
+        AXIS_X.push(0.0);
+        AXIS_Z.push(0.0);
+    }
+    for (let i = 0; i < count; i++) {
+        const yaw = cars[i].yaw;
+        AXIS_X[i] = Math.sin(yaw);
+        AXIS_Z[i] = Math.cos(yaw);
+    }
+
+    const half = CAR_AXIS_HALF;
+    const contact = CAR_RADIUS + CAR_RADIUS;
+    const contactSq = contact * contact;
+    // предпроверка по центрам: дальше этого капсулы не достанут никак
+    const reach = half + half + contact;
+    const reachSq = reach * reach;
+
     const last = count - 1;
     for (let i = 0; i < last; i++) {
         const a = cars[i];
+        let ax = a.x;
+        let az = a.z;
+        const ux = AXIS_X[i];
+        const uz = AXIS_Z[i];
         const massA = stats[i].mass;
         for (let j = i + 1; j < count; j++) {
             const b = cars[j];
-            const dx = b.x - a.x;
-            const dz = b.z - a.z;
+            const cx = ax - b.x;
+            const cz = az - b.z;
+            if (cx * cx + cz * cz >= reachSq) {
+                continue;
+            }
+            const wx = AXIS_X[j];
+            const wz = AXIS_Z[j];
+            // ближайшая пара точек на двух отрезках:
+            // минимум |D + s*u - t*w|² по s, t из [-half, half]
+            const dotUw = ux * wx + uz * wz;
+            const dU = cx * ux + cz * uz;
+            const dW = cx * wx + cz * wz;
+            const denom = 1.0 - dotUw * dotUw;
+            let s;
+            if (denom > 1e-9) {
+                s = (dotUw * dW - dU) / denom;
+            } else {
+                // оси параллельны: минимум вырожден в отрезок, берём
+                // проекцию центра b на ось a
+                s = -dU;
+            }
+            if (s > half) {
+                s = half;
+            } else if (s < -half) {
+                s = -half;
+            }
+            let t = dW + s * dotUw;
+            if (t > half || t < -half) {
+                t = t > half ? half : -half;
+                s = t * dotUw - dU;
+                if (s > half) {
+                    s = half;
+                } else if (s < -half) {
+                    s = -half;
+                }
+            }
+            const dx = (b.x + wx * t) - (ax + ux * s);
+            const dz = (b.z + wz * t) - (az + uz * s);
             const distSq = dx * dx + dz * dz;
-            if (distSq >= minDistSq) {
+            if (distSq >= contactSq) {
                 continue;
             }
             const massB = stats[j].mass;
@@ -505,14 +653,21 @@ export function resolveCollisions(cars, stats, count) {
                 const inv = 1.0 / dist;
                 nx = dx * inv;
                 nz = dz * inv;
-                overlap = diameter - dist;
+                overlap = contact - dist;
             } else {
-                // машины строго в одной точке — расталкиваем по оси X,
-                // направление зависит только от индексов, значит
-                // результат детерминирован
-                nx = 1.0;
-                nz = 0.0;
-                overlap = diameter;
+                // точки контакта совпали — расталкиваем по линии центров,
+                // а если совпали и центры, то по оси X: направление зависит
+                // только от индексов, значит результат детерминирован
+                const centerSq = cx * cx + cz * cz;
+                if (centerSq > 1e-9) {
+                    const inv = 1.0 / Math.sqrt(centerSq);
+                    nx = -cx * inv;
+                    nz = -cz * inv;
+                } else {
+                    nx = 1.0;
+                    nz = 0.0;
+                }
+                overlap = contact;
             }
 
             // расталкивание, тяжёлую машину двигаем меньше
@@ -524,6 +679,8 @@ export function resolveCollisions(cars, stats, count) {
             a.z -= nz * pushA;
             b.x += nx * pushB;
             b.z += nz * pushB;
+            ax = a.x;
+            az = a.z;
 
             // обмен импульсом вдоль нормали, с затуханием
             const relN = (b.vx - a.vx) * nx + (b.vz - a.vz) * nz;

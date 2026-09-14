@@ -32,6 +32,7 @@ import {
     shade,
     mixColor,
     toColor,
+    bakeContactAO,
     disposeObject,
     countTriangles,
     countDrawCalls
@@ -42,10 +43,36 @@ import {
 // ---------------------------------------------------------------------------
 
 const QUALITY = {
-    low: { roadCols: 3, terrainRings: 4, terrainStride: 3, kerbSide: false, edgeLines: true, archDetail: 0 },
-    medium: { roadCols: 4, terrainRings: 6, terrainStride: 2, kerbSide: true, edgeLines: true, archDetail: 1 },
-    high: { roadCols: 6, terrainRings: 8, terrainStride: 1, kerbSide: true, edgeLines: true, archDetail: 2 }
+    low: { roadCols: 4, terrainRings: 4, terrainStride: 3, kerbSide: false, edgeLines: true, archDetail: 0 },
+    medium: { roadCols: 6, terrainRings: 6, terrainStride: 2, kerbSide: true, edgeLines: true, archDetail: 1 },
+    high: { roadCols: 8, terrainRings: 8, terrainStride: 1, kerbSide: true, edgeLines: true, archDetail: 2 }
 };
+
+// ---------------------------------------------------------------------------
+// Запечённое затенение (задача «AO в вершины»)
+// ---------------------------------------------------------------------------
+//
+// Считается один раз при построении и живёт в атрибуте color. В кадре стоит
+// ноль. Полосу вдоль кромки полотна даёт вершинный градиент: узлы сетки у
+// бордюра темнее, к середине дороги затенение сходит на нет.
+
+const AO_EDGE_DEPTH = 0.40;   // насколько темнеет асфальт у самого бордюра
+const AO_EDGE_WIDTH = 1.7;    // м, ширина тёмной полосы вдоль кромки
+const AO_SHOULDER = 0.42;     // насколько темнеет обочина у кромки
+const AO_SHOULDER_W = 4.5;    // м, на каком удалении затенение обочины сходит
+const AO_DITCH = 0.22;        // добавка за провал рельефа ниже полотна
+
+/** Гладкая ступенька smoothstep(0, 1, t). */
+function smooth01(t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return t * t * (3 - 2 * t);
+}
+
+/** Множитель затенения асфальта: dist — расстояние от кромки полотна, м. */
+function roadEdgeAO(dist) {
+    return 1 - AO_EDGE_DEPTH * smooth01(1 - dist / AO_EDGE_WIDTH);
+}
 
 // ---------------------------------------------------------------------------
 // Палитры тем
@@ -213,10 +240,14 @@ export function readTrack(track) {
  * @param {object} track   данные формата 12.1
  * @param {string} theme   city | mountain | industrial (по умолчанию из track)
  * @param {string} quality low | medium | high
+ * @param {object} [opts]  { ao } — запекать ли затенение в вершинные цвета.
+ *                         Параметр добавлен после контракта и НЕОБЯЗАТЕЛЕН:
+ *                         без него поведение прежнее (затенение включено).
  */
-export function buildTrackMeshes(track, theme, quality) {
+export function buildTrackMeshes(track, theme, quality, opts) {
     const T = readTrack(track);
     const P = QUALITY[quality] || QUALITY.medium;
+    const ao = !opts || opts.ao !== false;
     const themeName = theme || T.theme || 'city';
     const pal = THEMES[themeName] || THEMES.city;
 
@@ -267,12 +298,12 @@ export function buildTrackMeshes(track, theme, quality) {
     }
     const groundY = minY - pal.terrainDrop - 2.0;
 
-    const road = buildRoad(T, P, colors, pal, surfaceMat);
-    const kerbs = buildKerbs(T, P, colors, surfaceMat);
-    const markings = buildMarkings(T, P, colors, markMat);
-    const terrain = buildTerrain(T, P, colors, pal, groundY, surfaceMat);
+    const road = buildRoad(T, P, colors, pal, surfaceMat, ao);
+    const kerbs = buildKerbs(T, P, colors, surfaceMat, ao);
+    const markings = buildMarkings(T, P, colors, markMat, ao);
+    const terrain = buildTerrain(T, P, colors, pal, groundY, surfaceMat, ao);
     const ground = buildGround(T, colors, groundY, surfaceMat);
-    const arch = buildStartArch(T, P, colors, surfaceMat);
+    const arch = buildStartArch(T, P, colors, surfaceMat, ao);
 
     group.add(ground, terrain, road, kerbs, markings, arch);
 
@@ -301,14 +332,14 @@ export function buildTrackMeshes(track, theme, quality) {
 // Полотно
 // ---------------------------------------------------------------------------
 
-function buildRoad(T, P, colors, pal, material) {
+function buildRoad(T, P, colors, pal, material, ao) {
     const b = new MeshBuilder();
     const rng = new Rng(T.seed ^ 0x51ed2701);
     const cols = P.roadCols + 1;
-    // заранее посчитанный шум на квад: цвет полотна не должен «мигать» при
-    // повторной сборке, поэтому берём его из детерминированного ГПСЧ
-    const jitter = new Float32Array(T.count * P.roadCols);
-    for (let i = 0; i < jitter.length; i++) jitter[i] = 1 + (rng.next() * 2 - 1) * 0.055;
+    // заранее посчитанный шум на УЗЕЛ сетки: цвет полотна не должен «мигать»
+    // при повторной сборке, поэтому берём его из детерминированного ГПСЧ
+    const jitter = new Float32Array(T.count * cols);
+    for (let i = 0; i < jitter.length; i++) jitter[i] = 1 + (rng.next() * 2 - 1) * 0.05;
 
     const patch = new THREE.Color();
 
@@ -322,12 +353,18 @@ function buildRoad(T, P, colors, pal, material) {
             out[1] = T.y[i];
             out[2] = T.z[i] + T.nz[i] * u;
         },
-        color: function (i, j, c) {
+        // Цвет считается на УЗЕЛ, а не на квад: только так тёмная полоса у
+        // бордюра получается плавной, а не ступенькой в одну колонку.
+        vertexColor: function (i, j, c) {
+            const edge = Math.abs(-1 + (2 * j) / P.roadCols); // 0 в центре, 1 у кромки
             // траектория по центру чуть темнее (резина), кромки светлее (пыль)
-            const mid = (j + 0.5) / P.roadCols; // 0..1 поперёк
-            const edge = Math.abs(mid - 0.5) * 2; // 0 в центре, 1 у кромки
             mixColor(patch, colors.asphaltDark, colors.asphalt, 0.25 + 0.75 * edge);
-            shade(c, patch, jitter[i * P.roadCols + j]);
+            let k = jitter[i * cols + j];
+            if (ao) {
+                // запечённый контакт с бордюром и обочиной
+                k *= roadEdgeAO(T.hw[i] * (1 - edge));
+            }
+            shade(c, patch, k);
         }
     });
 
@@ -343,8 +380,9 @@ function buildRoad(T, P, colors, pal, material) {
 // Бордюры
 // ---------------------------------------------------------------------------
 
-function buildKerbs(T, P, colors, material) {
+function buildKerbs(T, P, colors, material, ao) {
     const b = new MeshBuilder();
+    const tmp = new THREE.Color();
 
     // профиль в ортах (u — наружу от кромки, v — вверх от полотна)
     const profileOut = P.kerbSide
@@ -372,10 +410,16 @@ function buildKerbs(T, P, colors, material) {
             },
             color: function (i, k, c) {
                 if (k === 1) {
-                    c.copy(colors.kerbSide); // наружная стенка
+                    // наружная стенка смотрит вниз и в грунт — там темнее всего
+                    if (ao) shade(c, colors.kerbSide, 0.52);
+                    else c.copy(colors.kerbSide);
                 } else {
                     // чередование посегментно: шаг выборки 2 м, полоса = 2 м
-                    c.copy((i & 1) === 0 ? colors.kerbA : colors.kerbB);
+                    // Цвет на квад, а не на узел: иначе красно-белая шашка
+                    // расплылась бы в градиент и перестала читаться.
+                    tmp.copy((i & 1) === 0 ? colors.kerbA : colors.kerbB);
+                    if (ao) shade(c, tmp, 0.88);
+                    else c.copy(tmp);
                 }
             }
         });
@@ -392,9 +436,13 @@ function buildKerbs(T, P, colors, material) {
 // Разметка
 // ---------------------------------------------------------------------------
 
-function buildMarkings(T, P, colors, material) {
+function buildMarkings(T, P, colors, material, ao) {
     const b = new MeshBuilder();
     const lift = MARK_LIFT;
+    const lineC = new THREE.Color();
+    // кромочная линия лежит внутри тёмной полосы у бордюра: если оставить её
+    // белой, запечённый контакт разрежется пополам яркой чертой
+    const edgeLineK = ao ? roadEdgeAO(0.36) : 1;
 
     // кромочные линии по обеим сторонам, сплошные
     if (P.edgeLines) {
@@ -412,11 +460,12 @@ function buildMarkings(T, P, colors, material) {
                 outer[i * 3 + 1] = T.y[i] + lift;
                 outer[i * 3 + 2] = T.z[i] + T.nz[i] * uo;
             }
+            shade(lineC, colors.line, edgeLineK);
             ribbonStrip(b, inner, outer, {
                 closed: true,
                 flip: sgn < 0,
                 color: function (i, j, c) {
-                    c.copy(colors.line);
+                    c.copy(lineC);
                 }
             });
         }
@@ -577,7 +626,7 @@ export function createTerrainSampler(track, theme, quality) {
     return sampler;
 }
 
-function buildTerrain(T, P, colors, pal, groundY, material) {
+function buildTerrain(T, P, colors, pal, groundY, material, ao) {
     const b = new MeshBuilder();
     const tp = terrainParams(T, P, pal, groundY);
     const rings = P.terrainRings;
@@ -588,6 +637,12 @@ function buildTerrain(T, P, colors, pal, groundY, material) {
     const patch = new THREE.Color();
     const grassJit = new Float32Array(rowsAll * rings);
     for (let i = 0; i < grassJit.length; i++) grassJit[i] = 1 + (jitRng.next() * 2 - 1) * 0.09;
+
+    // затенение кольца: у самой кромки полотна темно, дальше светлеет
+    const ringAO = new Float32Array(rings);
+    for (let j = 0; j < rings; j++) {
+        ringAO[j] = ao ? 1 - AO_SHOULDER * smooth01(1 - tp.offs[j] / AO_SHOULDER_W) : 1;
+    }
 
     for (let side = 0; side < 2; side++) {
         const sgn = side === 0 ? 1 : -1;
@@ -603,14 +658,22 @@ function buildTerrain(T, P, colors, pal, groundY, material) {
                 out[1] = ringHeight(T, tp, i, j, side);
                 out[2] = T.z[i] + T.nz[i] * u;
             },
-            color: function (i, j, c) {
+            // цвет на узел: тёмная кайма у обочины переходит в траву плавно
+            vertexColor: function (ii, j, c) {
+                const i = (ii * stride) % T.count;
+                let k = grassJit[(ii % rowsAll) * rings + j] * ringAO[j];
+                if (ao) {
+                    // канава ниже полотна дополнительно затенена
+                    const drop = T.y[i] - ringHeight(T, tp, i, j, side);
+                    if (drop > 0) k *= 1 - AO_DITCH * smooth01(drop / 6);
+                }
                 if (j === 0) {
-                    shade(c, colors.shoulder, grassJit[i * rings + j]);
+                    shade(c, colors.shoulder, k);
                     return;
                 }
                 const t = j / (rings - 1);
                 mixColor(patch, colors.groundNear, colors.groundFar, t);
-                shade(c, patch, grassJit[i * rings + j]);
+                shade(c, patch, k);
             }
         });
     }
@@ -664,7 +727,7 @@ function buildGround(T, colors, groundY, material) {
 // Стартовая арка
 // ---------------------------------------------------------------------------
 
-function buildStartArch(T, P, colors, material) {
+function buildStartArch(T, P, colors, material, ao) {
     const i0 = 0;
     const hw = T.hw[i0];
     const px = T.x[i0],
@@ -750,7 +813,12 @@ function buildStartArch(T, P, colors, material) {
         }
     }
 
-    const mesh = new THREE.Mesh(b.build(), material);
+    const archGeom = b.build();
+    if (ao) {
+        // основания опор тонут в тени, верх перекладины видит всё небо
+        bakeContactAO(archGeom, { base: py, height: 3.2, floor: 0.5, power: 0.7, sky: 0.3 });
+    }
+    const mesh = new THREE.Mesh(archGeom, material);
     mesh.name = 'trackArch';
     mesh.matrixAutoUpdate = false;
     mesh.updateMatrix();

@@ -32,6 +32,8 @@ import {
     paintVertices,
     trs,
     toColor,
+    bakeContactAO,
+    bakeProximityAO,
     disposeObject,
     countTriangles
 } from './geomutil.js';
@@ -42,10 +44,21 @@ import { readTrack, createTerrainSampler } from './trackmesh.js';
 // ---------------------------------------------------------------------------
 
 const QUALITY = {
-    low: { density: 0.45, seg: 5, clouds: 3, peaks: 10, skySeg: 12, fogFar: 260 },
-    medium: { density: 1.0, seg: 6, clouds: 5, peaks: 16, skySeg: 16, fogFar: 360 },
-    high: { density: 1.6, seg: 8, clouds: 8, peaks: 22, skySeg: 20, fogFar: 470 }
+    low: { density: 0.5, seg: 5, clouds: 3, peaks: 10, skySeg: 12, fogFar: 260 },
+    medium: { density: 1.1, seg: 6, clouds: 5, peaks: 16, skySeg: 16, fogFar: 360 },
+    high: { density: 1.7, seg: 8, clouds: 8, peaks: 22, skySeg: 20, fogFar: 470 }
 };
+
+/**
+ * Плотность декора — ОТДЕЛЬНАЯ настройка, а не производная пресета
+ * (требование заказчика: каждую добавку можно выключить или убавить своей
+ * галочкой). Пресет лишь выставляет значение по умолчанию.
+ */
+const DECOR_DENSITY = { sparse: 0.5, normal: 1.1, dense: 1.7 };
+
+// Горы — самая тяжёлая тема по треугольникам (хвоя), поэтому прибавка
+// плотности там сдержаннее: коэффициент на тему.
+const THEME_DENSITY = { city: 1.0, mountain: 0.82, industrial: 1.0 };
 
 // ---------------------------------------------------------------------------
 // Темы: небо, туман, свет, палитры объектов
@@ -116,14 +129,24 @@ const THEME_ENV = {
  * @param {string} theme   city | mountain | industrial
  * @param {number} seed    decor_seed (если не задан — берётся из track)
  * @param {string} quality low | medium | high
+ * @param {object} [opts]  отдельные настройки графики, добавлены после
+ *                         контракта и НЕОБЯЗАТЕЛЬНЫ:
+ *                         { ao, decor: sparse|normal|dense, anim }
  */
-export function buildScenery(track, theme, seed, quality) {
+export function buildScenery(track, theme, seed, quality, opts) {
     const T = readTrack(track);
     const qName = QUALITY[quality] ? quality : 'medium';
     const Q = QUALITY[qName];
     const themeName = theme || T.theme || 'city';
     const env = THEME_ENV[themeName] || THEME_ENV.city;
     const baseSeed = (seed === undefined || seed === null ? T.seed : seed) >>> 0;
+
+    const o = opts || {};
+    const ao = o.ao !== false;
+    const anim = o.anim !== false;
+    const decorLevel = DECOR_DENSITY[o.decor] !== undefined ? o.decor : null;
+    const density = (decorLevel ? DECOR_DENSITY[decorLevel] : Q.density)
+        * (THEME_DENSITY[themeName] || 1);
 
     const sampler = createTerrainSampler(track, themeName, qName);
     const clearance = makeClearance(T);
@@ -135,6 +158,11 @@ export function buildScenery(track, theme, seed, quality) {
     // один материал на весь твёрдый декор: меньше переключений состояния
     const material = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
     material.name = 'sceneryLambert';
+
+    // Общее время для вершинной анимации. Объект уходит в uniforms шейдера
+    // как есть, поэтому обновление сводится к записи одного числа в кадре —
+    // ни аллокаций, ни перекомпиляции.
+    const timeUniform = { value: 0 };
 
     const ctx = {
         T: T,
@@ -148,7 +176,11 @@ export function buildScenery(track, theme, seed, quality) {
         material: material,
         instances: {},
         materials: [material],
-        density: Q.density
+        density: density,
+        ao: ao,
+        anim: anim,
+        timeUniform: timeUniform,
+        swayMats: {}
     };
 
     if (themeName === 'mountain') buildMountainTheme(ctx, baseSeed);
@@ -201,6 +233,17 @@ export function buildScenery(track, theme, seed, quality) {
             skyGroup.position.z = camera.position.z;
         },
 
+        /**
+         * Время вершинной анимации декора: качание деревьев и флагов,
+         * шевеление толпы. Одна запись числа в общий uniform — вся работа
+         * происходит в вершинном шейдере и для процессора стоит ноль.
+         * Если анимация выключена, вызов тоже ничего не стоит.
+         */
+        animated: anim,
+        updateAnim: function (t) {
+            timeUniform.value = t;
+        },
+
         materials: ctx.materials,
         stats: {
             drawCalls: countInstanced(group),
@@ -220,6 +263,86 @@ function countInstanced(root) {
         if (o.isMesh || o.isInstancedMesh) n++;
     });
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// Вершинная анимация декора
+// ---------------------------------------------------------------------------
+//
+// Качание деревьев и флагов и шевеление толпы делает ВЕРШИННЫЙ ШЕЙДЕР.
+// Для процессора это ровно одна запись числа в кадр на всю сцену, а на GPU
+// добавляется пара синусов на вершину — на интегрированной графике это
+// дешевле, чем переписывать матрицы инстансов.
+//
+// Фаза берётся из матрицы инстанса (instanceMatrix[3] — перенос), поэтому
+// соседние деревья качаются вразнобой без единого дополнительного атрибута.
+// Нормали намеренно не пересчитываются: у гранёной низкополигональной хвои
+// перекос освещения при отклонении в десяток сантиметров не виден.
+
+const SWAY_MODES = {
+    // ось Y: вес растёт от основания к верхушке (деревья, кусты)
+    tree: { axis: 'y', base: 0.4, weight: 0.055, speed: 1.25, lift: 0 },
+    bush: { axis: 'y', base: 0.05, weight: 0.1, speed: 2.0, lift: 0 },
+    // ось X: полотнище флага висит вдоль +X, свободный край гуляет сильнее
+    flag: { axis: 'x', base: 0.02, weight: 0.22, speed: 3.6, lift: 0.55 },
+    // толпа: мелкое покачивание плюс подпрыгивание
+    crowd: { axis: 'y', base: 0.18, weight: 0.05, speed: 2.7, lift: 1.2 }
+};
+
+function glslNum(v) {
+    const s = String(v);
+    return s.indexOf('.') >= 0 || s.indexOf('e') >= 0 ? s : s + '.0';
+}
+
+/**
+ * Материал декора с качанием в вершинном шейдере.
+ * @param {object} timeUniform общий {value} — его обновляет updateAnim()
+ * @param {string} mode ключ SWAY_MODES
+ */
+function makeSwayMaterial(timeUniform, mode) {
+    const M = SWAY_MODES[mode] || SWAY_MODES.tree;
+    const mat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
+    mat.name = 'scenerySway_' + mode;
+    const coord = M.axis === 'x' ? 'abs(position.x)' : 'position.y';
+    const body = [
+        'vec3 transformed = vec3( position );',
+        '#ifdef USE_INSTANCING',
+        '  float swayPhase = instanceMatrix[3].x * 0.61 + instanceMatrix[3].z * 0.43;',
+        '#else',
+        '  float swayPhase = 0.0;',
+        '#endif',
+        'float swayW = max(' + coord + ' - ' + glslNum(M.base) + ', 0.0) * ' + glslNum(M.weight) + ';',
+        'float swayT = uTime * ' + glslNum(M.speed) + ' + swayPhase;',
+        'transformed.x += sin(swayT) * swayW;',
+        'transformed.z += cos(swayT * 0.79 + swayPhase * 1.7) * swayW * 0.7;',
+        M.lift > 0
+            ? 'transformed.y += abs(sin(swayT * 0.87)) * swayW * ' + glslNum(M.lift) + ';'
+            : ''
+    ].join('\n');
+
+    mat.onBeforeCompile = function (shader) {
+        shader.uniforms.uTime = timeUniform;
+        shader.vertexShader = 'uniform float uTime;\n' + shader.vertexShader
+            .replace('#include <begin_vertex>', body);
+    };
+    // Разные режимы — разный исходник вершинного шейдера. Без своего ключа
+    // three.js переиспользовал бы программу первого попавшегося режима.
+    mat.customProgramCacheKey = function () {
+        return 'sceneSway:' + mode;
+    };
+    return mat;
+}
+
+/** Материал качания нужного режима, по одному на сцену. */
+function swayMaterial(ctx, mode) {
+    if (!ctx.anim) return ctx.material;
+    let m = ctx.swayMats[mode];
+    if (!m) {
+        m = makeSwayMaterial(ctx.timeUniform, mode);
+        ctx.swayMats[mode] = m;
+        ctx.materials.push(m);
+    }
+    return m;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,13 +457,19 @@ function scatter(ctx, rng, opts, cb) {
     }
 }
 
-/** Сборка InstancedMesh из списка размещений. */
-function addInstanced(ctx, name, geometry, placements) {
+/**
+ * Сборка InstancedMesh из списка размещений.
+ * opts: { ao } — параметры запекания контактного затенения в вершинные цвета
+ *       (см. bakeContactAO), { material } — свой материал вместо общего.
+ */
+function addInstanced(ctx, name, geometry, placements, opts) {
     if (!placements.length) {
         geometry.dispose();
         return null;
     }
-    const mesh = new THREE.InstancedMesh(geometry, ctx.material, placements.length);
+    const o = opts || {};
+    if (ctx.ao && o.ao) bakeContactAO(geometry, o.ao);
+    const mesh = new THREE.InstancedMesh(geometry, o.material || ctx.material, placements.length);
     mesh.name = name;
     mesh.frustumCulled = false;
     const m = new THREE.Matrix4();
@@ -479,6 +608,74 @@ function spectatorGeometry() {
     return mergeGeometries(parts);
 }
 
+/**
+ * Лиственное дерево: ствол и две гранёные кроны. Дешевле хвойного и нужно,
+ * чтобы город и промзона перестали быть голыми коробками.
+ */
+function broadleafGeometry(seg, trunkColor, leafColor) {
+    const trunk = toColor(trunkColor);
+    const leaf = toColor(leafColor);
+    const dark = new THREE.Color(leaf.r * 0.72, leaf.g * 0.74, leaf.b * 0.7);
+    return mergeGeometries([
+        primCyl(0.13, 0.19, 2.2, Math.max(4, seg - 2), trunk, 0, 1.1, 0),
+        primPoly(1.15, 0, leaf, 0, 3.1, 0),
+        primPoly(0.78, 0, dark, 0.42, 2.4, 0.2)
+    ]);
+}
+
+/** Куст: приплюснутый многогранник у самой земли. */
+function bushGeometry(color) {
+    const g = primPoly(0.8, 0, toColor(color), 0, 0.42, 0);
+    g.scale(1.0, 0.62, 1.0);
+    return g;
+}
+
+/** Бочка: цилиндр с двумя ободами. */
+function barrelGeometry(seg, color) {
+    const body = toColor(color);
+    const ring = new THREE.Color(body.r * 0.7, body.g * 0.7, body.b * 0.7);
+    return mergeGeometries([
+        primCyl(0.29, 0.29, 0.88, seg, body, 0, 0.44, 0),
+        primCyl(0.31, 0.31, 0.07, seg, ring, 0, 0.28, 0),
+        primCyl(0.31, 0.31, 0.07, seg, ring, 0, 0.62, 0)
+    ]);
+}
+
+/**
+ * Флаг на мачте. Полотнище лежит вдоль +X от мачты и нарезано на сегменты:
+ * вершинный шейдер гнёт его волной, поэтому сегменты обязаны быть.
+ * Ткань строится двумя гранями подряд (лицом в +Z и в -Z), чтобы флаг
+ * читался с обеих сторон БЕЗ двустороннего материала: прозрачности здесь
+ * нет, но лишний материал — лишняя программа, а так их ноль.
+ */
+function flagGeometry(seg, poleColor, clothColor) {
+    const pole = toColor(poleColor);
+    const cloth = toColor(clothColor);
+    const clothDark = new THREE.Color(cloth.r * 0.74, cloth.g * 0.74, cloth.b * 0.74);
+    const b = new MeshBuilder();
+    const segs = 5;
+    const x0 = 0.07;
+    const len = 1.55;
+    const yb = 2.62;
+    const yt = 3.62;
+    for (let k = 0; k < segs; k++) {
+        const ax = x0 + (len * k) / segs;
+        const bx = x0 + (len * (k + 1)) / segs;
+        // покоящаяся волна: даже без анимации полотнище не плоская доска
+        const az = Math.sin(k * 0.9) * 0.05;
+        const bz = Math.sin((k + 1) * 0.9) * 0.05;
+        const c = k & 1 ? clothDark : cloth;
+        b.quad([ax, yb, az], [bx, yb, bz], [bx, yt, bz], [ax, yt, az], c);
+        b.quad([bx, yb, bz], [ax, yb, az], [ax, yt, az], [bx, yt, bz], c);
+    }
+    const clothGeom = b.build();
+    return mergeGeometries([
+        primCyl(0.045, 0.07, 4.1, Math.max(4, seg - 3), pole, 0, 2.05, 0),
+        primCyl(0.09, 0.09, 0.1, Math.max(4, seg - 3), pole, 0, 4.12, 0),
+        clothGeom
+    ]);
+}
+
 /** Трибуна: четыре ступени и задняя стенка, 18 м по фронту. */
 function standGeometry(pal) {
     const frame = toColor('#8e949b');
@@ -522,7 +719,11 @@ function buildCityTheme(ctx, seed) {
             color: p.rng.pick(pal.concrete)
         });
     });
-    addInstanced(ctx, 'buildings', boxBands(6, 0.62, 1.1, false), buildings);
+    addInstanced(ctx, 'buildings', boxBands(6, 0.62, 1.1, false), buildings, {
+        // здание — единичный куб, растянутый до 30 м: высота затенения тоже
+        // задаётся в долях куба, иначе тень у основания уползёт на пол-этажа
+        ao: { base: 0, height: 0.13, floor: 0.44, power: 0.75, sky: 0.26 }
+    });
 
     // фонари вдоль кромки
     const rngL = new Rng(seed ^ 0x00c2);
@@ -530,7 +731,9 @@ function buildCityTheme(ctx, seed) {
     scatter(ctx, rngL, { step: 30 / d, jitter: 1.5, offMin: 2.2, offMax: 3.2, radius: 0.6, margin: 0.6, chance: 0.5 }, function (p) {
         lamps.push({ x: p.x, y: p.y, z: p.z, yaw: p.yaw + (p.side > 0 ? Math.PI : 0), sy: p.rng.range(0.92, 1.08) });
     });
-    addInstanced(ctx, 'lamps', lampGeometry(pal, seg), lamps);
+    addInstanced(ctx, 'lamps', lampGeometry(pal, seg), lamps, {
+        ao: { base: 0, height: 1.5, floor: 0.42, power: 0.65, sky: 0.3 }
+    });
 
     // отбойники: сплошные участки по 6 м
     const rngG = new Rng(seed ^ 0x00d3);
@@ -538,7 +741,9 @@ function buildCityTheme(ctx, seed) {
     scatter(ctx, rngG, { step: 6.0, jitter: 0, offMin: 1.5, offMax: 1.5, radius: 0.4, margin: 0.4, chance: 0.55 }, function (p) {
         rails.push({ x: p.x, y: p.y, z: p.z, yaw: p.yaw });
     });
-    addInstanced(ctx, 'guardrails', guardrailGeometry(pal), rails);
+    addInstanced(ctx, 'guardrails', guardrailGeometry(pal), rails, {
+        ao: { base: 0, height: 0.75, floor: 0.44, power: 0.7, sky: 0.3 }
+    });
 
     // рекламные щиты
     const rngA = new Rng(seed ^ 0x00e4);
@@ -554,7 +759,30 @@ function buildCityTheme(ctx, seed) {
             color: p.rng.pick(pal.accent)
         });
     });
-    addInstanced(ctx, 'billboards', billboardGeometry(pal), boards);
+    addInstanced(ctx, 'billboards', billboardGeometry(pal), boards, {
+        ao: { base: 0, height: 2.0, floor: 0.46, power: 0.7, sky: 0.28 }
+    });
+
+    // уличные деревья вдоль тротуара: город перестаёт быть голыми коробками
+    const rngT = new Rng(seed ^ 0x00f5);
+    const trees = [];
+    scatter(ctx, rngT, { step: 17 / d, jitter: 3.5, offMin: 3.4, offMax: 9, radius: 1.5, margin: 1.2, chance: 0.66 }, function (p) {
+        const sc = p.rng.range(0.8, 1.35);
+        trees.push({
+            x: p.x, y: p.y - 0.1, z: p.z,
+            yaw: p.rng.range(0, Math.PI * 2),
+            sx: sc * p.rng.range(0.9, 1.1),
+            sy: sc * p.rng.range(0.95, 1.3),
+            sz: sc * p.rng.range(0.9, 1.1),
+            color: p.rng.pick(['#4e8a4a', '#5f9a52', '#417a45', '#6aa25a'])
+        });
+    });
+    addInstanced(ctx, 'cityTrees', broadleafGeometry(seg, '#5a4632', '#ffffff'), trees, {
+        material: swayMaterial(ctx, 'tree'),
+        ao: { base: 0, height: 1.7, floor: 0.42, power: 0.6, sky: 0.34, down: 0.7 }
+    });
+
+    buildFlags(ctx, seed ^ 0x00a6, ['#d0552f', '#3f7ea8', '#cbb04a', '#eaeaea']);
 }
 
 // ---------------------------------------------------------------------------
@@ -601,7 +829,11 @@ function buildMountainTheme(ctx, seed) {
             sz: s * p.rng.range(0.9, 1.1)
         });
     });
-    for (let k = 0; k < 3; k++) addInstanced(ctx, kinds[k].name, kinds[k].geom, lists[k]);
+    const pineAO = { base: 0, height: 1.5, floor: 0.4, power: 0.6, sky: 0.34, down: 0.68 };
+    const pineMat = swayMaterial(ctx, 'tree');
+    for (let k = 0; k < 3; k++) {
+        addInstanced(ctx, kinds[k].name, kinds[k].geom, lists[k], { material: pineMat, ao: pineAO });
+    }
 
     // валуны
     const rngR = new Rng(seed ^ 0x0f02);
@@ -620,7 +852,26 @@ function buildMountainTheme(ctx, seed) {
             color: p.rng.pick(pal.rock)
         });
     });
-    addInstanced(ctx, 'rocks', rockGeom, rocks);
+    addInstanced(ctx, 'rocks', rockGeom, rocks, {
+        ao: { height: 1.3, floor: 0.46, power: 0.7, sky: 0.3 }
+    });
+
+    // кусты в подлеске: мелкая зелень, которая шевелится на ветру
+    const rngBu = new Rng(seed ^ 0x0f07);
+    const bushes = [];
+    scatter(ctx, rngBu, { step: 9 / d, jitter: 3.5, offMin: 3.0, offMax: 30, offBias: 1.5, radius: 0.9, margin: 0.9, chance: 0.55 }, function (p) {
+        const sc = p.rng.range(0.7, 1.5);
+        bushes.push({
+            x: p.x, y: p.y - 0.08, z: p.z,
+            yaw: p.rng.range(0, Math.PI * 2),
+            sx: sc, sy: sc * p.rng.range(0.7, 1.2), sz: sc,
+            color: p.rng.pick(['#416a3a', '#4d7742', '#375d33', '#5a8147'])
+        });
+    });
+    addInstanced(ctx, 'bushes', bushGeometry('#ffffff'), bushes, {
+        material: swayMaterial(ctx, 'bush'),
+        ao: { height: 0.7, floor: 0.44, power: 0.7, sky: 0.32, down: 0.7 }
+    });
 
     // деревянные ограждения по кромке
     const rngF = new Rng(seed ^ 0x0f03);
@@ -634,7 +885,9 @@ function buildMountainTheme(ctx, seed) {
     scatter(ctx, rngF, { step: 4.0, jitter: 0, offMin: 1.6, offMax: 1.6, radius: 0.4, margin: 0.4, chance: 0.5 }, function (p) {
         fences.push({ x: p.x, y: p.y, z: p.z, yaw: p.yaw });
     });
-    addInstanced(ctx, 'fences', fence, fences);
+    addInstanced(ctx, 'fences', fence, fences, {
+        ao: { base: 0, height: 0.95, floor: 0.44, power: 0.7, sky: 0.3 }
+    });
 
     // редкие домики
     const rngH = new Rng(seed ^ 0x0f04);
@@ -654,7 +907,11 @@ function buildMountainTheme(ctx, seed) {
             color: p.rng.pick(['#d8cdb4', '#c8b89c', '#bfc4c0'])
         });
     });
-    addInstanced(ctx, 'huts', hutGeom, huts);
+    addInstanced(ctx, 'huts', hutGeom, huts, {
+        ao: { base: 0, height: 1.7, floor: 0.45, power: 0.7, sky: 0.28 }
+    });
+
+    buildFlags(ctx, seed ^ 0x0f06, ['#c23b3b', '#e8eaec', '#3d7042', '#c9d3d8']);
 
     // дальние вершины по горизонту
     buildPeaks(ctx, seed ^ 0x0f05);
@@ -735,7 +992,9 @@ function buildIndustrialTheme(ctx, seed) {
             color: p.rng.pick(pal.hangar)
         });
     });
-    addInstanced(ctx, 'hangars', hangar, hangars);
+    addInstanced(ctx, 'hangars', hangar, hangars, {
+        ao: { base: 0, height: 0.2, floor: 0.44, power: 0.75, sky: 0.26 }
+    });
 
     // цистерны
     const tank = mergeGeometries([
@@ -759,7 +1018,9 @@ function buildIndustrialTheme(ctx, seed) {
             color: p.rng.pick(pal.tank)
         });
     });
-    addInstanced(ctx, 'tanks', tank, tanks);
+    addInstanced(ctx, 'tanks', tank, tanks, {
+        ao: { base: 0, height: 0.26, floor: 0.45, power: 0.7, sky: 0.3 }
+    });
 
     // эстакады труб
     const pipeGeom = mergeGeometries(
@@ -781,7 +1042,9 @@ function buildIndustrialTheme(ctx, seed) {
     scatter(ctx, rngP, { step: 130 / d, jitter: 16, offMin: 9, offMax: 20, radius: 6, margin: 2.5, chance: 0.7 }, function (p) {
         pipes.push({ x: p.x, y: p.y, z: p.z, yaw: p.yaw + p.rng.spread(0.2) });
     });
-    addInstanced(ctx, 'pipes', pipeGeom, pipes);
+    addInstanced(ctx, 'pipes', pipeGeom, pipes, {
+        ao: { base: 0, height: 1.9, floor: 0.46, power: 0.7, sky: 0.3 }
+    });
 
     // контейнеры, иногда в два яруса
     const container = boxBands(7, 0.88, 1.04, true);
@@ -802,7 +1065,45 @@ function buildIndustrialTheme(ctx, seed) {
             });
         }
     });
-    addInstanced(ctx, 'containers', container, containers);
+    addInstanced(ctx, 'containers', container, containers, {
+        ao: { base: 0, height: 0.3, floor: 0.46, power: 0.75, sky: 0.28 }
+    });
+
+    // бочки: мелочь у оснований, за которую цепляется глаз
+    const rngB = new Rng(seed ^ 0x1a07);
+    const barrels = [];
+    scatter(ctx, rngB, { step: 21 / d, jitter: 5, offMin: 4.5, offMax: 16, radius: 0.5, margin: 1.0, chance: 0.6 }, function (p) {
+        const n = p.rng.int(1, 3);
+        for (let k = 0; k < n; k++) {
+            barrels.push({
+                x: p.x + p.rng.spread(0.7),
+                y: p.y,
+                z: p.z + p.rng.spread(0.7),
+                yaw: p.rng.range(0, Math.PI * 2),
+                color: p.rng.pick(['#bf5b32', '#3d6f8e', '#c9a63c', '#6f757b'])
+            });
+        }
+    });
+    addInstanced(ctx, 'barrels', barrelGeometry(Math.max(5, seg), '#ffffff'), barrels, {
+        ao: { base: 0, height: 0.7, floor: 0.46, power: 0.7, sky: 0.3 }
+    });
+
+    // деревья по краю промзоны
+    const rngTr = new Rng(seed ^ 0x1a08);
+    const trees = [];
+    scatter(ctx, rngTr, { step: 24 / d, jitter: 5, offMin: 5, offMax: 22, offBias: 1.3, radius: 1.6, margin: 1.3, chance: 0.5 }, function (p) {
+        const sc = p.rng.range(0.75, 1.25);
+        trees.push({
+            x: p.x, y: p.y - 0.1, z: p.z,
+            yaw: p.rng.range(0, Math.PI * 2),
+            sx: sc, sy: sc * p.rng.range(0.9, 1.2), sz: sc,
+            color: p.rng.pick(['#5d7a45', '#6b8450', '#4f6b3e'])
+        });
+    });
+    addInstanced(ctx, 'cityTrees', broadleafGeometry(seg, '#57493a', '#ffffff'), trees, {
+        material: swayMaterial(ctx, 'tree'),
+        ao: { base: 0, height: 1.7, floor: 0.42, power: 0.6, sky: 0.34, down: 0.7 }
+    });
 
     // сетчатый забор: одна текстурированная плоскость на секцию
     buildChainFence(ctx, seed ^ 0x1a05);
@@ -813,7 +1114,11 @@ function buildIndustrialTheme(ctx, seed) {
     scatter(ctx, rngG, { step: 6.0, jitter: 0, offMin: 1.5, offMax: 1.5, radius: 0.4, margin: 0.4, chance: 0.6 }, function (p) {
         rails.push({ x: p.x, y: p.y, z: p.z, yaw: p.yaw });
     });
-    addInstanced(ctx, 'guardrails', guardrailGeometry(pal), rails);
+    addInstanced(ctx, 'guardrails', guardrailGeometry(pal), rails, {
+        ao: { base: 0, height: 0.75, floor: 0.44, power: 0.7, sky: 0.3 }
+    });
+
+    buildFlags(ctx, seed ^ 0x1a09, ['#c95f28', '#d9b93c', '#3d6f8e', '#dcdcd4']);
 }
 
 /**
@@ -875,6 +1180,7 @@ function buildChainFence(ctx, seed) {
         mat.dispose();
         return;
     }
+    if (ctx.ao) bakeContactAO(plane, { base: 0, height: 1.2, floor: 0.5, power: 0.7, sky: 0.2 });
     const mesh = new THREE.InstancedMesh(plane, mat, list.length);
     mesh.name = 'chainFence';
     mesh.frustumCulled = false;
@@ -895,8 +1201,32 @@ function buildChainFence(ctx, seed) {
 }
 
 // ---------------------------------------------------------------------------
-// Общее: трибуны, зрители, конусы
+// Общее: флаги, трибуны, зрители, конусы
 // ---------------------------------------------------------------------------
+
+/**
+ * Флаги на мачтах вдоль кромки. Полотнище качает вершинный шейдер — это
+ * самая заметная «жизнь» в кадре и для процессора она стоит ноль.
+ */
+function buildFlags(ctx, seed, colors) {
+    const rng = new Rng(seed >>> 0);
+    const list = [];
+    scatter(ctx, rng, { step: 46 / ctx.density, jitter: 7, offMin: 2.6, offMax: 5.5, radius: 0.6, margin: 0.8, chance: 0.5 }, function (p) {
+        list.push({
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            // полотнище смотрит поперёк трассы, чтобы его было видно с дороги
+            yaw: p.yaw + (p.side > 0 ? Math.PI * 0.5 : Math.PI * 1.5),
+            sy: p.rng.range(0.88, 1.15),
+            color: p.rng.pick(colors)
+        });
+    });
+    addInstanced(ctx, 'flags', flagGeometry(ctx.Q.seg, '#b9c0c8', '#ffffff'), list, {
+        material: swayMaterial(ctx, 'flag'),
+        ao: { base: 0, height: 1.6, floor: 0.5, power: 0.6, sky: 0.22 }
+    });
+}
 
 function buildGrandstands(ctx, seed) {
     const rng = new Rng(seed >>> 0);
@@ -921,7 +1251,10 @@ function buildGrandstands(ctx, seed) {
             });
         }
     }
-    addInstanced(ctx, 'stands', standGeometry(ctx.pal), list);
+    addInstanced(ctx, 'stands', standGeometry(ctx.pal), list, {
+        // ниши под ступенями и задняя стенка тонут в тени, верхние ряды светлее
+        ao: { base: 0, height: 2.6, floor: 0.38, power: 0.75, sky: 0.34, down: 0.58 }
+    });
     ctx._standSeats = list;
     ctx._standRng = rng;
 }
@@ -968,7 +1301,10 @@ function buildCrowd(ctx, seed) {
             });
         }
     });
-    addInstanced(ctx, 'spectators', spectatorGeometry(), list);
+    addInstanced(ctx, 'spectators', spectatorGeometry(), list, {
+        material: swayMaterial(ctx, 'crowd'),
+        ao: { base: 0, height: 1.1, floor: 0.6, power: 0.8, sky: 0.22 }
+    });
 }
 
 function buildCones(ctx, seed) {
@@ -997,7 +1333,9 @@ function buildCones(ctx, seed) {
             sy: rng.range(0.9, 1.1)
         });
     }
-    addInstanced(ctx, 'cones', coneGeometry(ctx.pal, Math.max(5, ctx.Q.seg)), list);
+    addInstanced(ctx, 'cones', coneGeometry(ctx.pal, Math.max(5, ctx.Q.seg)), list, {
+        ao: { base: 0, height: 0.45, floor: 0.5, power: 0.7, sky: 0.26 }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,7 +1417,10 @@ function buildClouds(env, Q, rng) {
         transparent: true,
         opacity: 0.9,
         depthWrite: false,
-        side: THREE.DoubleSide
+        side: THREE.DoubleSide,
+        // 12.11: прозрачный двусторонний материал рисуется В ДВА ПРОХОДА.
+        // Одна строка возвращает в бюджет целый draw call.
+        forceSinglePass: true
     });
     mat.name = 'clouds';
     const mesh = new THREE.Mesh(b.build(), mat);

@@ -66,6 +66,103 @@ export const QUALITY_PRESETS = {
     high: { renderScale: 1.0, cockpitDetail: 2, shadowOpacity: 0.6 }
 };
 
+// ---------------------------------------------------------------------------
+// Отдельные настройки графики
+// ---------------------------------------------------------------------------
+//
+// Требование заказчика: каждая добавка к картинке обязана выключаться своей
+// галочкой, а пресеты low/medium/high остаются быстрыми заготовками, которые
+// выставляют эти галочки скопом.
+//
+// Хранилище — localStorage, ключи в стиле 12.6 (`racing.*`). Владелец
+// значений здесь, в рендере: меню только читает и пишет их через эти функции,
+// а применение целиком на стороне рендера (setQuality -> refreshGfx).
+
+export const GFX_KEYS = {
+    ao: 'racing.gfx.ao',
+    glow: 'racing.gfx.glow',
+    decor: 'racing.gfx.decor',
+    decorAnim: 'racing.gfx.decoranim',
+    particles: 'racing.gfx.particles',
+    renderScale: 'racing.gfx.renderscale'
+};
+
+export const DECOR_LEVELS = ['sparse', 'normal', 'dense'];
+export const PARTICLE_LEVELS = ['off', 'few', 'normal', 'many'];
+export const RENDER_SCALES = [0.5, 0.75, 1.0];
+
+/** Что выставляет каждый пресет. Это ТОЛЬКО умолчания: галочки главнее. */
+export const GFX_PRESETS = {
+    low: { ao: true, glow: false, decor: 'sparse', decorAnim: false, particles: 'few', renderScale: 0.5 },
+    medium: { ao: true, glow: true, decor: 'normal', decorAnim: true, particles: 'normal', renderScale: 0.75 },
+    high: { ao: true, glow: true, decor: 'dense', decorAnim: true, particles: 'many', renderScale: 1.0 }
+};
+
+/** Настройки, ради которых сцену приходится пересобирать. */
+const GFX_REBUILD = ['ao', 'decor', 'decorAnim', 'particles'];
+
+function lsGet(key) {
+    try {
+        return window.localStorage.getItem(key);
+    } catch (e) {
+        return null; // приватное окно: живём без хранилища
+    }
+}
+
+function lsSet(key, value) {
+    try {
+        window.localStorage.setItem(key, value);
+    } catch (e) {
+        /* нет хранилища — настройка проживёт до перезагрузки */
+    }
+}
+
+function readBool(key, def) {
+    const v = lsGet(key);
+    if (v === '1') return true;
+    if (v === '0') return false;
+    return def;
+}
+
+function readEnum(key, list, def) {
+    const v = lsGet(key);
+    return list.indexOf(v) >= 0 ? v : def;
+}
+
+/**
+ * Текущие настройки графики. Значение по умолчанию берётся из пресета,
+ * поэтому свежий профиль сразу получает осмысленный набор.
+ */
+export function loadGfxSettings(quality) {
+    const preset = GFX_PRESETS[quality] || GFX_PRESETS.medium;
+    const scaleRaw = parseFloat(lsGet(GFX_KEYS.renderScale));
+    return {
+        ao: readBool(GFX_KEYS.ao, preset.ao),
+        glow: readBool(GFX_KEYS.glow, preset.glow),
+        decor: readEnum(GFX_KEYS.decor, DECOR_LEVELS, preset.decor),
+        decorAnim: readBool(GFX_KEYS.decorAnim, preset.decorAnim),
+        particles: readEnum(GFX_KEYS.particles, PARTICLE_LEVELS, preset.particles),
+        renderScale: RENDER_SCALES.indexOf(scaleRaw) >= 0 ? scaleRaw : preset.renderScale
+    };
+}
+
+/** Записать часть настроек. Возвращает полный набор после записи. */
+export function saveGfxSettings(patch, quality) {
+    if (patch.ao !== undefined) lsSet(GFX_KEYS.ao, patch.ao ? '1' : '0');
+    if (patch.glow !== undefined) lsSet(GFX_KEYS.glow, patch.glow ? '1' : '0');
+    if (patch.decor !== undefined) lsSet(GFX_KEYS.decor, patch.decor);
+    if (patch.decorAnim !== undefined) lsSet(GFX_KEYS.decorAnim, patch.decorAnim ? '1' : '0');
+    if (patch.particles !== undefined) lsSet(GFX_KEYS.particles, patch.particles);
+    if (patch.renderScale !== undefined) lsSet(GFX_KEYS.renderScale, String(patch.renderScale));
+    return loadGfxSettings(quality);
+}
+
+/** Выставить все галочки по пресету — это и есть «быстрая заготовка». */
+export function applyGfxPreset(quality) {
+    const preset = GFX_PRESETS[quality] || GFX_PRESETS.medium;
+    return saveGfxSettings(preset, quality);
+}
+
 export const CAMERA_CHASE = 0;
 export const CAMERA_COCKPIT = 1;
 
@@ -153,6 +250,13 @@ class CarView {
         this.wheelRadius = 0.34;
         this.shadowSx = 1.2;
         this.shadowSz = 2.2;
+
+        // Якоря накладного свечения в системе координат машины (carmesh.js):
+        // плоские массивы x, y, z, размер. Ссылки на чертёж, а не копии —
+        // в кадре по ним только читают.
+        this.lampHead = null;
+        this.lampBrake = null;
+        this.lampExhaust = null;
     }
 }
 
@@ -170,7 +274,9 @@ export class RaceRenderer {
         this.canvas = canvas;
         this.quality = QUALITY_PRESETS[o.quality] ? o.quality : 'medium';
         this.preset = QUALITY_PRESETS[this.quality];
-        this.renderScale = o.renderScale || this.preset.renderScale;
+        // Отдельные галочки графики читаются из localStorage и главнее пресета.
+        this.gfx = loadGfxSettings(this.quality);
+        this.renderScale = o.renderScale || this.gfx.renderScale;
 
         // Целевое железо — Intel UHD 24 EU: сглаживание и высокий пиксель-рейт
         // не по карману (раздел 1).
@@ -316,18 +422,48 @@ export class RaceRenderer {
     }
 
     /**
-     * Сменить пресет качества. Если гонка уже собрана, её приходится
-     * пересобрать: плотность сетки трассы и декора заложена в геометрию.
+     * Применить настройки графики: пресет качества плюс отдельные галочки.
+     *
+     * Это ЕДИНСТВЕННАЯ точка входа для меню (main.js зовёт её на каждое
+     * изменение настроек). Галочки перечитываются из localStorage, и если
+     * поменялось что-то, запечённое в геометрию, гонка пересобирается —
+     * без перезагрузки страницы.
+     *
      * Возвращает true, если пересборка состоялась.
      */
     setQuality(quality) {
-        if (!QUALITY_PRESETS[quality] || quality === this.quality) return false;
-        this.quality = quality;
-        this.preset = QUALITY_PRESETS[quality];
-        this.renderScale = this.preset.renderScale;
-        this.stats.quality = quality;
-        this.applySize();
-        if (this.raceReady) {
+        if (QUALITY_PRESETS[quality] && quality !== this.quality) {
+            this.quality = quality;
+            this.preset = QUALITY_PRESETS[quality];
+            this.stats.quality = quality;
+        }
+        return this.refreshGfx();
+    }
+
+    /**
+     * Перечитать отдельные настройки графики и применить их.
+     * Что можно — применяется на месте (render scale, свечение), остальное
+     * требует пересборки сцены: затенение и плотность декора запечены
+     * в вершины и в матрицы инстансов.
+     */
+    refreshGfx() {
+        const next = loadGfxSettings(this.quality);
+        const prev = this.gfx;
+        let rebuild = false;
+        for (let i = 0; i < GFX_REBUILD.length; i++) {
+            const k = GFX_REBUILD[i];
+            if (prev[k] !== next[k]) rebuild = true;
+        }
+        this.gfx = next;
+
+        if (next.renderScale !== this.renderScale) {
+            this.renderScale = next.renderScale;
+            this.applySize();
+        }
+        // свечение включается на живой сцене, без пересборки
+        if (this.effects) this.effects.setGlowEnabled(next.glow);
+
+        if (rebuild && this.raceReady) {
             const track = this.trackSource;
             const players = this.playerSource;
             const local = this.localSlot;
@@ -363,8 +499,13 @@ export class RaceRenderer {
 
         // 12.6: buildTrackMeshes и buildScenery ОБЯЗАНЫ получить один и тот же
         // quality, иначе декор всплывёт над землёй.
-        this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality);
-        this.scenery = buildScenery(this.track, this.theme, this.track.decorSeed, quality);
+        const gfx = this.gfx;
+        this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality, { ao: gfx.ao });
+        this.scenery = buildScenery(this.track, this.theme, this.track.decorSeed, quality, {
+            ao: gfx.ao,
+            decor: gfx.decor,
+            anim: gfx.decorAnim
+        });
         this.sampler = createTerrainSampler(this.track, this.theme, quality);
 
         this.scene.add(this.trackMeshes.group);
@@ -394,6 +535,8 @@ export class RaceRenderer {
         // --- эффекты ---------------------------------------------------------
         this.effects = new Effects({
             quality: quality,
+            particles: gfx.particles,
+            glow: gfx.glow,
             fogColor: sc.fog.color,
             heightAt: this._heightAt
         });
@@ -437,7 +580,7 @@ export class RaceRenderer {
             }
 
             const view = this.views[slot];
-            const mesh = buildCarMesh(shape, p.color || '#e5484d', this.quality);
+            const mesh = buildCarMesh(shape, p.color || '#e5484d', this.quality, { ao: this.gfx.ao });
             // Колёса крутятся вокруг своей оси УЖЕ ПОВЁРНУТОЙ рулём, поэтому
             // порядок Эйлера обязан быть YXZ: при XYZ спин ушёл бы вокруг оси
             // кузова и колесо «виляло» бы вместо вращения.
@@ -463,6 +606,10 @@ export class RaceRenderer {
             view.roll = 0;
             view.bodyPitch = 0;
             view.terrainPitch = 0;
+            const lamps = mesh.lamps;
+            view.lampHead = lamps ? lamps.head : null;
+            view.lampBrake = lamps ? lamps.brake : null;
+            view.lampExhaust = lamps ? lamps.exhaust : null;
         }
         this.stats.cars = this.countCars();
     }
@@ -720,6 +867,8 @@ export class RaceRenderer {
 
         // купол неба держится над камерой (12.6)
         this.scenery.updateSky(this.camera);
+        // время вершинной анимации декора: одна запись числа на всю сцену
+        this.scenery.updateAnim(this.time);
 
         this.effects.update(step, this.camera, target ? target.speed : 0);
     }
@@ -1098,6 +1247,9 @@ export class RaceRenderer {
             v.present = false;
             v.fresh = false;
             v.hint = -1;
+            v.lampHead = null;
+            v.lampBrake = null;
+            v.lampExhaust = null;
         }
         // кэш чертежей общий на все машины (carmesh.js), чистится отдельно
         disposeCarCache();

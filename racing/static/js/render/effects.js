@@ -9,10 +9,11 @@
  * --------------------------------------------------------------------------
  * БЮДЖЕТ DRAW CALL (раздел 1: всего 60 на кадр, на рендер остаётся ~9-13)
  * --------------------------------------------------------------------------
- * Пять инстансированных мешей, и ни одним больше:
+ * Шесть инстансированных мешей, и ни одним больше:
  *
  *   smokeMesh   1   дым дрифта, пыль вне трассы, дым взрыва и раскрутки
  *   glowMesh    1   искры заряда, след буста, вспышка взрыва, полосы скорости
+ *   lampMesh    1   накладное свечение: фары, стопы, турбо, маяки мин, щиты
  *   rocketMesh  1   летящие ракеты (снаряды kind = 2)
  *   mineMesh    1   лежащие мины (снаряды kind = 3)
  *   shieldMesh  1   купол щита вокруг машины
@@ -43,7 +44,7 @@
  */
 
 import * as THREE from 'three';
-import { solidify, mergeGeometries, toColor, disposeObject } from './geomutil.js';
+import { MeshBuilder, solidify, mergeGeometries, toColor, disposeObject } from './geomutil.js';
 import {
     FLAG_OFFTRACK,
     FLAG_DRIFTING,
@@ -51,6 +52,7 @@ import {
     FLAG_SPIN,
     FLAG_SHIELD,
     FLAG_GHOST,
+    FLAG_BRAKING,
     MAX_CARS,
     MAX_PROJECTILES,
     driftChargeSeconds
@@ -61,6 +63,15 @@ import {
 // ---------------------------------------------------------------------------
 
 export const EFFECT_QUALITY = {
+    // «частицы выключены» — отдельный уровень настройки, а не пресет качества:
+    // пулы схлопываются в один элемент, все частоты нулевые, ни одна частица
+    // не рождается. Дым, искры и полосы скорости пропадают, свечение и
+    // снаряды остаются — это разные галочки.
+    off: {
+        smoke: 1, glow: 1,
+        smokeRate: 0, sparkRate: 0, boostRate: 0, dustRate: 0,
+        speedLines: 0, shieldDetail: 0, explosionScale: 0
+    },
     low: {
         smoke: 96, glow: 176,
         smokeRate: 22, sparkRate: 24, boostRate: 30, dustRate: 12,
@@ -77,6 +88,30 @@ export const EFFECT_QUALITY = {
         speedLines: 48, shieldDetail: 1, explosionScale: 1.35
     }
 };
+
+/**
+ * Уровень частиц — ОТДЕЛЬНАЯ настройка графики (галочка под пресетом).
+ * Значение переводится в пресет пулов выше.
+ */
+export const PARTICLE_LEVELS = { off: 'off', few: 'low', normal: 'medium', many: 'high' };
+
+// ---------------------------------------------------------------------------
+// Накладное свечение геометрией (задача «свечение фар, стопов и турбо»)
+// ---------------------------------------------------------------------------
+//
+// Полноэкранный bloom на UHD 24 EU не по карману: он требует второго
+// фреймбуфера в разрешении экрана плюс несколько проходов размытия, то есть
+// десятки мегабайт трафика видеопамяти на кадр. Вместо него — накладные
+// плоскости с мягким градиентом, развёрнутые к камере, с аддитивным
+// смешиванием. Все они лежат в ОДНОМ InstancedMesh: один draw call на всё
+// свечение сцены, а при выключенной галочке меш просто прячется.
+
+const LAMP_CAP = MAX_CARS * 8 + MAX_PROJECTILES * 2 + 16;
+const FLASH_CAP = 16;
+
+const LAMP_HEAD_R = 1.0, LAMP_HEAD_G = 0.93, LAMP_HEAD_B = 0.74;
+const LAMP_BRAKE_R = 1.0, LAMP_BRAKE_G = 0.13, LAMP_BRAKE_B = 0.06;
+const LAMP_BOOST_R = 1.0, LAMP_BOOST_G = 0.62, LAMP_BOOST_B = 0.18;
 
 // цвета искр по уровням заряда дрифта (6.3): 1 синий, 2 оранжевый, 3 фиолетовый
 const SPARK_L1 = [0.32, 0.66, 1.0];
@@ -297,30 +332,79 @@ function buildRocketGeometry() {
     return merged;
 }
 
-/** Мина: приплюснутый корпус с шипами, лежит на земле. */
+/**
+ * Мина. Заказчик: «сейчас мина теряется на асфальте, игрок узнаёт о ней после
+ * попадания». Поэтому силуэт переделан целиком:
+ *
+ *  - предупреждающий круг на земле радиусом 1,35 м с чёрно-жёлтыми секторами.
+ *    Радиус срабатывания 2,4 м (12.10), то есть круг ЗАМЕТНО МЕНЬШЕ опасной
+ *    зоны: мина осталась опасной для невнимательного, а не только для слепого;
+ *  - корпус вдвое выше прежнего, с чёрно-жёлтой «дорожной» юбкой;
+ *  - вертикальная стойка с маяком наверху: она торчит над асфальтом и видна
+ *    издалека даже под острым углом камеры;
+ *  - три косых шипа, ломающие круглый силуэт.
+ *
+ * Круг лежит на 2 см над полотном, а материал мины получает polygonOffset —
+ * без этого на дистанции появился бы z-fighting с асфальтом.
+ */
+const MINE_MARK_RADIUS = 1.35;
+const MINE_ARM = 0.5;   // с, взведение мины (12.10)
+
 function buildMineGeometry() {
-    const bodyCol = toColor('#3a3f47');
-    const trimCol = toColor('#e0632a');
-    const geoms = [];
-    const mats = [];
+    const shell = toColor('#26292f');
+    const warn = toColor('#ffc21a');
+    const trim = toColor('#e0632a');
+    const beacon = toColor('#ff3a24');
+    const b = new MeshBuilder();
 
-    const body = solidify(new THREE.CylinderGeometry(0.42, 0.5, 0.24, 8), bodyCol);
-    geoms.push(body);
-    mats.push(new THREE.Matrix4().makeTranslation(0, 0.12, 0));
+    // --- предупреждающий круг на земле: чередование секторов ---------------
+    const sectors = 12;
+    const rIn = 0.62;
+    const rOut = MINE_MARK_RADIUS;
+    const y = 0.02;
+    for (let k = 0; k < sectors; k++) {
+        const a0 = (k / sectors) * Math.PI * 2;
+        const a1 = ((k + 1) / sectors) * Math.PI * 2;
+        const c = k & 1 ? warn : shell;
+        b.quad(
+            [Math.sin(a0) * rIn, y, Math.cos(a0) * rIn],
+            [Math.sin(a0) * rOut, y, Math.cos(a0) * rOut],
+            [Math.sin(a1) * rOut, y, Math.cos(a1) * rOut],
+            [Math.sin(a1) * rIn, y, Math.cos(a1) * rIn],
+            c
+        );
+    }
 
-    const cap = solidify(new THREE.CylinderGeometry(0.2, 0.3, 0.12, 8), trimCol);
-    geoms.push(cap);
-    mats.push(new THREE.Matrix4().makeTranslation(0, 0.28, 0));
+    const geoms = [b.build()];
+    const mats = [null];
 
-    for (let k = 0; k < 6; k++) {
-        const a = (k / 6) * Math.PI * 2;
-        const spike = solidify(new THREE.ConeGeometry(0.07, 0.22, 4), trimCol);
+    // --- корпус: широкая юбка, чёрно-жёлтый пояс, тёмная крышка ------------
+    geoms.push(solidify(new THREE.CylinderGeometry(0.46, 0.6, 0.1, 8), shell));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 0.06, 0));
+    geoms.push(solidify(new THREE.CylinderGeometry(0.4, 0.46, 0.2, 8), warn, function (x, yy, z, i, c) {
+        // грани через одну тёмные — получается «дорожная» разметка по кругу
+        if (((i / 6) | 0) % 2 === 0) c.copy(shell);
+    }));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 0.21, 0));
+    geoms.push(solidify(new THREE.CylinderGeometry(0.26, 0.38, 0.16, 8), shell));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 0.39, 0));
+
+    // --- стойка с маяком: то, что видно издалека ---------------------------
+    geoms.push(solidify(new THREE.CylinderGeometry(0.05, 0.07, 0.52, 5), shell));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 0.72, 0));
+    geoms.push(solidify(new THREE.OctahedronGeometry(0.19, 0), beacon));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 1.04, 0));
+
+    // --- шипы --------------------------------------------------------------
+    for (let k = 0; k < 3; k++) {
+        const a = (k / 3) * Math.PI * 2 + 0.5;
+        const spike = solidify(new THREE.ConeGeometry(0.08, 0.3, 4), trim);
         const m = new THREE.Matrix4().makeRotationY(a);
-        const tilt = new THREE.Matrix4().makeRotationZ(-0.85);
-        const off = new THREE.Matrix4().makeTranslation(0, 0.22, 0);
+        const tilt = new THREE.Matrix4().makeRotationZ(-0.95);
+        const off = new THREE.Matrix4().makeTranslation(0, 0.3, 0);
         tilt.multiply(off);
         m.multiply(tilt);
-        const shift = new THREE.Matrix4().makeTranslation(0, 0.1, 0);
+        const shift = new THREE.Matrix4().makeTranslation(0, 0.26, 0);
         shift.multiply(m);
         geoms.push(spike);
         mats.push(shift);
@@ -356,10 +440,16 @@ export class Effects {
      */
     constructor(opts) {
         const o = opts || {};
-        const qName = EFFECT_QUALITY[o.quality] ? o.quality : 'medium';
+        // Уровень частиц — своя настройка: пресет качества задаёт умолчание,
+        // но галочка в меню может увести его в любую сторону, вплоть до нуля.
+        const level = PARTICLE_LEVELS[o.particles];
+        const qName = EFFECT_QUALITY[level] ? level : EFFECT_QUALITY[o.quality] ? o.quality : 'medium';
         this.quality = qName;
         const Q = EFFECT_QUALITY[qName];
         this.Q = Q;
+        this.particlesOff = qName === 'off';
+        // Свечение геометрией — отдельная галочка, независимая от частиц.
+        this.glowOn = o.glow !== false;
 
         this.time = 0;
         this.heightAt = o.heightAt || null;
@@ -434,17 +524,56 @@ export class Effects {
         this.mineMat = new THREE.MeshLambertMaterial({
             vertexColors: true,
             flatShading: true,
-            emissive: new THREE.Color('#3a1000'),
-            emissiveIntensity: 1.0
+            emissive: new THREE.Color('#4a1400'),
+            emissiveIntensity: 1.0,
+            // предупреждающий круг лежит в двух сантиметрах над полотном:
+            // без смещения полигонов он замерцает на дистанции
+            polygonOffset: true,
+            polygonOffsetFactor: -3,
+            polygonOffsetUnits: -6
         });
         this.mineMat.name = 'fxMine';
         this.mineMesh = new THREE.InstancedMesh(this.mineGeom, this.mineMat, MAX_PROJECTILES);
         this.mineMesh.name = 'fxMines';
         this.mineMesh.frustumCulled = false;
         this.mineMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        // 12.11: instanceColor доходит до шейдера только при vertexColors и
+        // атрибуте color у геометрии — оба условия здесь выполнены.
+        this.mineMesh.instanceColor = new THREE.InstancedBufferAttribute(
+            new Float32Array(MAX_PROJECTILES * 3).fill(1), 3
+        );
+        this.mineMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
         this.mineMesh.count = 0;
         this.mineMesh.visible = false;
         this.group.add(this.mineMesh);
+
+        // --- накладное свечение: фары, стопы, турбо, искры, маяки мин -------
+        this.lampMat = new THREE.MeshBasicMaterial({
+            map: this.glowTex,
+            vertexColors: true,
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            fog: true,
+            side: THREE.FrontSide,
+            forceSinglePass: true
+        });
+        this.lampMat.name = 'fxLamp';
+        this.lampMesh = makeInstanced(makeParticleQuad(), this.lampMat, LAMP_CAP, 'fxLampMesh');
+        this.lampMesh.renderOrder = 7;
+        this.group.add(this.lampMesh);
+
+        // Накопитель ореолов кадра: заполняется в emitFromCar и в разборе
+        // снарядов, а разворачивается к камере уже в update(), когда известен
+        // базис камеры. Массивы выделены один раз — в кадре ноль аллокаций.
+        this.lampN = 0;
+        this.lampX = new Float32Array(LAMP_CAP);
+        this.lampY = new Float32Array(LAMP_CAP);
+        this.lampZ = new Float32Array(LAMP_CAP);
+        this.lampS = new Float32Array(LAMP_CAP);
+        this.lampR = new Float32Array(LAMP_CAP);
+        this.lampG = new Float32Array(LAMP_CAP);
+        this.lampB = new Float32Array(LAMP_CAP);
 
         // --- щиты -----------------------------------------------------------
         // Купол ярче по «экватору» и глуше к полюсу: аддитивная сфера с
@@ -491,6 +620,14 @@ export class Effects {
         this.shieldCount = 0;
 
         // --- снаряды --------------------------------------------------------
+        // Возраст снаряда нужен мине: первые MINE_ARM секунд она НЕ взведена
+        // и обязана выглядеть иначе (12.10). Идентификатор снаряда в снапшоте
+        // есть (5.3), поэтому возраст считается по нему: таблица «видели id —
+        // во столько-то» переживает кадр и не требует ни одной аллокации.
+        this.projBorn = new Float32Array(MAX_PROJECTILES);
+        this.projSeenId = new Uint16Array(MAX_PROJECTILES);
+        this.projSeenBorn = new Float32Array(MAX_PROJECTILES);
+        this.projSeenN = 0;
         this.projCount = 0;
         this.projKind = new Uint8Array(MAX_PROJECTILES);
         this.projX = new Float32Array(MAX_PROJECTILES);
@@ -513,8 +650,35 @@ export class Effects {
         // --- полосы скорости ------------------------------------------------
         this.accLines = 0;
 
+        // Вспышки взрывов и щитов: короткоживущие ореолы. Живут отдельно от
+        // частиц, поэтому взрыв остаётся заметным даже при выключенных
+        // частицах. Пул плотно упакован, потолок фиксирован.
+        this.flashN = 0;
+        this.flashX = new Float32Array(FLASH_CAP);
+        this.flashY = new Float32Array(FLASH_CAP);
+        this.flashZ = new Float32Array(FLASH_CAP);
+        this.flashLife = new Float32Array(FLASH_CAP);
+        this.flashInv = new Float32Array(FLASH_CAP);
+        this.flashSize = new Float32Array(FLASH_CAP);
+        this.flashR = new Float32Array(FLASH_CAP);
+        this.flashG = new Float32Array(FLASH_CAP);
+        this.flashB = new Float32Array(FLASH_CAP);
+
         // счётчик активных частиц для оверлея F3
         this.activeParticles = 0;
+    }
+
+    /**
+     * Включить или выключить накладное свечение на живой сцене.
+     * Пересборка не нужна: ореолы рождаются каждый кадр заново.
+     */
+    setGlowEnabled(on) {
+        this.glowOn = on !== false;
+        if (!this.glowOn) {
+            this.lampN = 0;
+            this.lampMesh.count = 0;
+            this.lampMesh.visible = false;
+        }
     }
 
     /** Цвет тумана: в него растворяется дым, чтобы не пропадать рывком. */
@@ -555,6 +719,43 @@ export class Effects {
     /** Сброс покадровых счётчиков. Зовётся до emitFromCar. */
     beginFrame() {
         this.shieldCount = 0;
+        this.lampN = 0;
+    }
+
+    /**
+     * Записать ореол в накопитель кадра. Разворот к камере произойдёт позже,
+     * в update(), когда известен базис камеры. Ни одной аллокации.
+     */
+    lamp(x, y, z, size, r, g, b) {
+        const i = this.lampN;
+        if (i >= LAMP_CAP) return;
+        this.lampN = i + 1;
+        this.lampX[i] = x;
+        this.lampY[i] = y;
+        this.lampZ[i] = z;
+        this.lampS[i] = size;
+        this.lampR[i] = r;
+        this.lampG[i] = g;
+        this.lampB[i] = b;
+    }
+
+    /**
+     * Ореолы ламп одной машины: фары горят всегда, стопы тлеют и вспыхивают
+     * при торможении, выхлоп светится на турбо.
+     * points — плоский массив x, y, z, размер в системе координат машины.
+     */
+    lampRow(view, points, k, r, g, b, sizeK, fx, fz, lx, lz) {
+        if (!points) return;
+        for (let i = 0; i < points.length; i += 4) {
+            const px = points[i], py = points[i + 1], pz = points[i + 2];
+            this.lamp(
+                view.x + px * lx + pz * fx,
+                view.y + py,
+                view.z + px * lz + pz * fz,
+                points[i + 3] * sizeK,
+                r * k, g * k, b * k
+            );
+        }
     }
 
     /**
@@ -574,6 +775,28 @@ export class Effects {
         const speed = view.speed;
         const halfTrack = view.halfWidth;
         const rearZ = view.rearZ;
+
+        // --- накладное свечение ламп ----------------------------------------
+        if (this.glowOn) {
+            // фары горят постоянно (10.3), кроме машины-призрака — её уже
+            // отсекли по FLAG_GHOST выше
+            this.lampRow(view, view.lampHead, 1, LAMP_HEAD_R, LAMP_HEAD_G, LAMP_HEAD_B,
+                1.0, fx, fz, lx, lz);
+
+            // стоп-сигналы: тлеют всегда, при торможении вспыхивают втрое
+            const braking = (flags & FLAG_BRAKING) !== 0;
+            this.lampRow(view, view.lampBrake, braking ? 1.0 : 0.34,
+                LAMP_BRAKE_R, LAMP_BRAKE_G, LAMP_BRAKE_B,
+                braking ? 1.5 : 0.85, fx, fz, lx, lz);
+
+            // выхлоп на турбо: пульсирующий горячий ореол
+            if (flags & FLAG_BOOST) {
+                const puls = 0.82 + Math.sin(this.time * 27 + slot) * 0.18;
+                this.lampRow(view, view.lampExhaust, puls,
+                    LAMP_BOOST_R, LAMP_BOOST_G, LAMP_BOOST_B,
+                    1.9 * puls, fx, fz, lx, lz);
+            }
+        }
 
         // --- дым от дрифта --------------------------------------------------
         const drifting = (flags & FLAG_DRIFTING) !== 0;
@@ -613,6 +836,18 @@ export class Effects {
             else if (charge >= DRIFT_L1) level = 1;
             if (level > 0) {
                 const col = level === 3 ? SPARK_L3 : level === 2 ? SPARK_L2 : SPARK_L1;
+                if (this.glowOn) {
+                    // ореол у задних колёс: уровень заряда виден и по цвету,
+                    // и по размеру, даже если частицы выключены
+                    const puls = 0.7 + Math.sin(this.time * (14 + level * 6) + slot) * 0.3;
+                    const size = (0.34 + level * 0.16) * (0.75 + puls * 0.35);
+                    for (let sgn = -1; sgn <= 1; sgn += 2) {
+                        const ox = fx * rearZ + lx * halfTrack * sgn;
+                        const oz = fz * rearZ + lz * halfTrack * sgn;
+                        this.lamp(view.x + ox, view.y + 0.16, view.z + oz, size,
+                            col[0] * puls, col[1] * puls, col[2] * puls);
+                    }
+                }
                 const rateS = this.Q.sparkRate * (0.6 + level * 0.25);
                 this.accSpark[slot] += rateS * dt;
                 while (this.accSpark[slot] >= 1) {
@@ -750,6 +985,12 @@ export class Effects {
                 c[idx * 3] = k * 0.85;
                 c[idx * 3 + 1] = k;
                 c[idx * 3 + 2] = k;
+                if (this.glowOn) {
+                    // купол читается и днём: мягкий холодный ореол по контуру
+                    const gl = 0.32 + Math.sin(this.time * 3.2 + slot) * 0.08 + flash * 0.8;
+                    this.lamp(view.x, view.y + view.halfLength * 0.5, view.z, r * 2.6,
+                        gl * 0.42, gl * 0.78, gl);
+                }
             }
         }
         if (this.shieldFlash[slot] > 0) {
@@ -757,10 +998,27 @@ export class Effects {
         }
     }
 
+    /** Короткоживущий ореол: взрыв, срабатывание щита. */
+    addFlash(x, y, z, size, life, r, g, b) {
+        const i = this.flashN;
+        if (i >= FLASH_CAP) return;
+        this.flashN = i + 1;
+        this.flashX[i] = x;
+        this.flashY[i] = y;
+        this.flashZ[i] = z;
+        this.flashSize[i] = size;
+        this.flashLife[i] = life;
+        this.flashInv[i] = 1 / life;
+        this.flashR[i] = r;
+        this.flashG[i] = g;
+        this.flashB[i] = b;
+    }
+
     /** Вспышка щита: бонус погасил попадание. */
     flashShield(slot, x, y, z) {
         if (slot < 0 || slot >= MAX_CARS) return;
         this.shieldFlash[slot] = 1;
+        this.addFlash(x, y + 0.9, z, 4.2, 0.34, 0.45, 0.85, 1.0);
         const n = 18;
         for (let i = 0; i < n; i++) {
             const a = (i / n) * Math.PI * 2;
@@ -793,6 +1051,11 @@ export class Effects {
     explosion(x, y, z, power) {
         const p = power === undefined ? 1 : power;
         const scale = this.Q.explosionScale * p;
+
+        // Ореол взрыва живёт в системе свечения, а не в пуле частиц: так
+        // попадание видно даже с выключенными частицами.
+        this.addFlash(x, y + 1.0, z, 6.5 * p, 0.4, 1.0, 0.62, 0.22);
+        this.addFlash(x, y + 0.7, z, 3.2 * p, 0.16, 1.0, 0.95, 0.8);
 
         // Ядро вспышки. Билборд вертикальный, поэтому его нижняя половина
         // уходит под полотно и обрезается по глубине ровной прямой линией.
@@ -876,6 +1139,7 @@ export class Effects {
         const n = snap.projCount < MAX_PROJECTILES ? snap.projCount : MAX_PROJECTILES;
         this.projCount = n;
         const h = this.heightAt;
+        const seenN = this.projSeenN;
         for (let i = 0; i < n; i++) {
             const x = snap.projX[i];
             const z = snap.projZ[i];
@@ -884,7 +1148,22 @@ export class Effects {
             this.projZ[i] = z;
             this.projYaw[i] = snap.projYaw[i];
             this.projY[i] = h ? h(x, z) : 0;
+            // время появления: ищем идентификатор в таблице прошлого кадра
+            const id = snap.projId ? snap.projId[i] : 0;
+            let born = -1;
+            for (let k = 0; k < seenN; k++) {
+                if (this.projSeenId[k] === id) {
+                    born = this.projSeenBorn[k];
+                    break;
+                }
+            }
+            this.projBorn[i] = born < 0 ? this.time : born;
         }
+        for (let i = 0; i < n; i++) {
+            this.projSeenId[i] = snap.projId ? snap.projId[i] : 0;
+            this.projSeenBorn[i] = this.projBorn[i];
+        }
+        this.projSeenN = n;
     }
 
     /** Маска активных боксов из снапшота (12.3). Ссылка на массив, не копия. */
@@ -960,16 +1239,54 @@ export class Effects {
             const z = this.projZ[i];
             const y = this.projY[i];
             if (kind === 3) {
-                // мина: лежит на поверхности, медленно вращается и пульсирует
-                const puls = 1 + Math.sin(this.time * 6 + i) * 0.08;
-                writeScaleYaw(mArr, mineN * 16, x, y + 0.02, z,
-                    this.time * 0.8 + i, puls, puls, puls);
+                // --- мина ---------------------------------------------------
+                // Первые MINE_ARM секунд мина НЕ взведена (12.10): она
+                // разворачивается из сложенного состояния, светится холодным
+                // серым и не пульсирует. Взведённая — крупная, с жёлто-чёрным
+                // кругом, красным маяком и тревожной пульсацией.
+                const age = this.time - this.projBorn[i];
+                const arming = age < MINE_ARM;
+                const t = arming ? age / MINE_ARM : 1;
+                const grow = arming ? 0.42 + t * 0.58 : 1;
+                const puls = arming ? 1 : 1 + Math.sin(this.time * 7.5 + i * 1.7) * 0.07;
+                const sc = grow * puls;
+                const spin = arming ? this.time * 5.0 + i : this.time * 0.9 + i;
+                writeScaleYaw(mArr, mineN * 16, x, y + 0.02, z, spin, sc, sc, sc);
+                const mc = this.mineMesh.instanceColor.array;
+                const mo = mineN * 3;
+                if (arming) {
+                    // невзведённая: холодная и приглушённая
+                    mc[mo] = 0.5;
+                    mc[mo + 1] = 0.62;
+                    mc[mo + 2] = 0.78;
+                } else {
+                    const beat = 0.88 + Math.sin(this.time * 7.5 + i * 1.7) * 0.32;
+                    mc[mo] = beat;
+                    mc[mo + 1] = beat * 0.8;
+                    mc[mo + 2] = beat * 0.62;
+                    if (this.glowOn) {
+                        // маяк над миной: её видно издалека и под острым углом
+                        const gl = 0.55 + Math.sin(this.time * 7.5 + i * 1.7) * 0.45;
+                        this.lamp(x, y + 1.06, z, 0.85 + gl * 0.5,
+                            1.0 * gl, 0.2 * gl, 0.06 * gl);
+                        this.lamp(x, y + 0.06, z, 2.0,
+                            0.34 * gl, 0.16 * gl, 0.0);
+                    }
+                }
                 mineN++;
             } else {
                 // ракета: летит над поверхностью, слегка покачивается
                 const yy = y + 0.72 + Math.sin(this.time * 9 + i) * 0.05;
                 writeScaleYaw(rArr, rocketN * 16, x, yy, z, this.projYaw[i], 1, 1, 1);
                 rocketN++;
+                if (this.glowOn) {
+                    // факел в сопле
+                    const fx0 = Math.sin(this.projYaw[i]);
+                    const fz0 = Math.cos(this.projYaw[i]);
+                    const gl = 0.8 + Math.sin(this.time * 31 + i) * 0.2;
+                    this.lamp(x - fx0 * 0.45, yy, z - fz0 * 0.45, 1.15,
+                        1.0 * gl, 0.55 * gl, 0.16 * gl);
+                }
                 for (let t = 0; t < trailShots; t++) {
                     const fx = Math.sin(this.projYaw[i]);
                     const fz = Math.cos(this.projYaw[i]);
@@ -996,9 +1313,12 @@ export class Effects {
         if (rocketN > 0) this.rocketMesh.instanceMatrix.needsUpdate = true;
         this.mineMesh.count = mineN;
         this.mineMesh.visible = mineN > 0;
-        if (mineN > 0) this.mineMesh.instanceMatrix.needsUpdate = true;
+        if (mineN > 0) {
+            this.mineMesh.instanceMatrix.needsUpdate = true;
+            this.mineMesh.instanceColor.needsUpdate = true;
+        }
         this.rocketMat.emissiveIntensity = 0.8 + Math.sin(this.time * 14) * 0.2;
-        this.mineMat.emissiveIntensity = 0.6 + Math.sin(this.time * 5) * 0.4;
+        this.mineMat.emissiveIntensity = 0.55 + Math.sin(this.time * 7.5) * 0.45;
 
         // --- щиты -----------------------------------------------------------
         this.shieldMesh.count = this.shieldCount;
@@ -1011,10 +1331,71 @@ export class Effects {
         // --- боксы с бонусами -----------------------------------------------
         this.updateBoxes(dt);
 
+        // --- короткоживущие вспышки -----------------------------------------
+        let f = 0;
+        while (f < this.flashN) {
+            const life = this.flashLife[f] - dt;
+            if (life <= 0) {
+                const last = --this.flashN;
+                if (f !== last) {
+                    this.flashX[f] = this.flashX[last];
+                    this.flashY[f] = this.flashY[last];
+                    this.flashZ[f] = this.flashZ[last];
+                    this.flashLife[f] = this.flashLife[last];
+                    this.flashInv[f] = this.flashInv[last];
+                    this.flashSize[f] = this.flashSize[last];
+                    this.flashR[f] = this.flashR[last];
+                    this.flashG[f] = this.flashG[last];
+                    this.flashB[f] = this.flashB[last];
+                }
+                continue;
+            }
+            this.flashLife[f] = life;
+            const k = life * this.flashInv[f];      // 1 в начале, 0 в конце
+            if (this.glowOn) {
+                this.lamp(this.flashX[f], this.flashY[f], this.flashZ[f],
+                    this.flashSize[f] * (1.35 - k * 0.35),
+                    this.flashR[f] * k, this.flashG[f] * k, this.flashB[f] * k);
+            }
+            f++;
+        }
+
+        // --- выкладка ореолов: билборды к камере -----------------------------
+        this.flushLamps(rx, ry, rz, ux, uy, uz, bx, by, bz);
+
         // --- частицы --------------------------------------------------------
         this.stepPool(this.glow, this.glowMesh, dt, rx, ry, rz, ux, uy, uz, bx, by, bz, cxp, cyp, czp);
         this.stepPool(this.smoke, this.smokeMesh, dt, rx, ry, rz, ux, uy, uz, bx, by, bz, cxp, cyp, czp);
         this.activeParticles = this.glow.n + this.smoke.n;
+    }
+
+    /**
+     * Развернуть накопленные ореолы к камере и записать матрицы инстансов.
+     * Один draw call на всё свечение сцены; при нуле ореолов меш прячется и
+     * в renderer.info.render.calls не попадает вовсе.
+     */
+    flushLamps(rx, ry, rz, ux, uy, uz, bx, by, bz) {
+        const mesh = this.lampMesh;
+        const n = this.lampN;
+        if (n === 0) {
+            mesh.count = 0;
+            mesh.visible = false;
+            return;
+        }
+        const mArr = mesh.instanceMatrix.array;
+        const cArr = mesh.instanceColor.array;
+        for (let i = 0; i < n; i++) {
+            writeBillboard(mArr, i * 16, this.lampX[i], this.lampY[i], this.lampZ[i],
+                this.lampS[i], 0, rx, ry, rz, ux, uy, uz, bx, by, bz);
+            const o = i * 3;
+            cArr[o] = this.lampR[i];
+            cArr[o + 1] = this.lampG[i];
+            cArr[o + 2] = this.lampB[i];
+        }
+        mesh.count = n;
+        mesh.visible = true;
+        mesh.instanceMatrix.needsUpdate = true;
+        mesh.instanceColor.needsUpdate = true;
     }
 
     /** Вращение, покачивание и подсветка боксов (12.6). */
@@ -1149,7 +1530,10 @@ export class Effects {
         this.glow.clear();
         this.smoke.clear();
         this.projCount = 0;
+        this.projSeenN = 0;
         this.shieldCount = 0;
+        this.flashN = 0;
+        this.lampN = 0;
         this.accSmoke.fill(0);
         this.accSpark.fill(0);
         this.accBoost.fill(0);
@@ -1160,6 +1544,7 @@ export class Effects {
         this.rocketMesh.visible = false;
         this.mineMesh.visible = false;
         this.shieldMesh.visible = false;
+        this.lampMesh.visible = false;
     }
 
     /** Полное освобождение: геометрии, материалы, текстуры. */

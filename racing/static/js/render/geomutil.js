@@ -199,6 +199,39 @@ export class MeshBuilder {
         this.triRaw(ax, ay, az, cx, cy, cz, dx, dy, dz, r, g, b);
     }
 
+    /**
+     * Треугольник с ОТДЕЛЬНЫМ цветом на каждую вершину.
+     *
+     * flatShading влияет только на нормали: вершинные цвета шейдер
+     * интерполирует по грани в любом случае. Это и есть носитель запечённого
+     * затенения — плавный тёмный контакт получается без единого лишнего
+     * треугольника.
+     */
+    triVC(a, b, c, ca, cb, cc) {
+        const ux = b[0] - a[0],
+            uy = b[1] - a[1],
+            uz = b[2] - a[2];
+        const vx = c[0] - a[0],
+            vy = c[1] - a[1],
+            vz = c[2] - a[2];
+        let nx = uy * vz - uz * vy;
+        let ny = uz * vx - ux * vz;
+        let nz = ux * vy - uy * vx;
+        const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+        nx /= l;
+        ny /= l;
+        nz /= l;
+        this._push(a[0], a[1], a[2], nx, ny, nz, ca.r, ca.g, ca.b);
+        this._push(b[0], b[1], b[2], nx, ny, nz, cb.r, cb.g, cb.b);
+        this._push(c[0], c[1], c[2], nx, ny, nz, cc.r, cc.g, cc.b);
+    }
+
+    /** Четырёхугольник с отдельным цветом на каждую вершину. */
+    quadVC(a, b, c, d, ca, cb, cc, cd) {
+        this.triVC(a, b, c, ca, cb, cc);
+        this.triVC(a, c, d, ca, cc, cd);
+    }
+
     /** Выпуклый многоугольник веером. reverse — обойти в обратную сторону. */
     polygon(points, color, reverse) {
         const n = points.length;
@@ -445,6 +478,9 @@ export function primPoly(radius, detail, color, x, y, z) {
  * Сетка поверхности: rows точек вдоль пути на cols точек поперёк.
  * point(i, j, out3) заполняет out3 координатами узла,
  * color(i, j, outColor) задаёт цвет квада [i..i+1] x [j..j+1].
+ * vertexColor(i, j, outColor) — цвет УЗЛА (i, j); если задан, он главнее
+ * color и даёт плавный градиент поперёк и вдоль полосы: именно так в полотно
+ * и в рельеф запекается затенение у кромок.
  * closed — замкнуть последнюю строку с первой, flip — вывернуть лицевую сторону.
  *
  * Обход квада (i,j) -> (i+1,j) -> (i+1,j+1) -> (i,j+1) даёт нормаль вверх,
@@ -456,9 +492,19 @@ export function surfaceGrid(builder, opts) {
     const closed = !!opts.closed;
     const flip = !!opts.flip;
     const point = opts.point;
-    const color = opts.color;
+    const vertexColor = opts.vertexColor;
+    const color = opts.color || function (i, j, c) { c.setRGB(1, 1, 1); };
     const tmp = new THREE.Color(1, 1, 1);
     const out = [0, 0, 0];
+    // четыре угла квада в вершинных цветах: объекты переиспользуются
+    const vc00 = new THREE.Color(1, 1, 1);
+    const vc10 = new THREE.Color(1, 1, 1);
+    const vc11 = new THREE.Color(1, 1, 1);
+    const vc01 = new THREE.Color(1, 1, 1);
+    const pa = [0, 0, 0],
+        pb = [0, 0, 0],
+        pc = [0, 0, 0],
+        pd = [0, 0, 0];
 
     let cur = new Float32Array(cols * 3);
     let nxt = new Float32Array(cols * 3);
@@ -482,6 +528,20 @@ export function surfaceGrid(builder, opts) {
         for (let j = 0; j < cols - 1; j++) {
             const a = j * 3,
                 b = a + 3;
+            if (vertexColor) {
+                // (i, j) -> vc00, (i+1, j) -> vc10, (i+1, j+1) -> vc11, (i, j+1) -> vc01
+                vertexColor(i, j, vc00);
+                vertexColor(i2, j, vc10);
+                vertexColor(i2, j + 1, vc11);
+                vertexColor(i, j + 1, vc01);
+                pa[0] = cur[a]; pa[1] = cur[a + 1]; pa[2] = cur[a + 2];
+                pb[0] = nxt[a]; pb[1] = nxt[a + 1]; pb[2] = nxt[a + 2];
+                pc[0] = nxt[b]; pc[1] = nxt[b + 1]; pc[2] = nxt[b + 2];
+                pd[0] = cur[b]; pd[1] = cur[b + 1]; pd[2] = cur[b + 2];
+                if (flip) builder.quadVC(pa, pd, pc, pb, vc00, vc01, vc11, vc10);
+                else builder.quadVC(pa, pb, pc, pd, vc00, vc10, vc11, vc01);
+                continue;
+            }
             color(i, j, tmp);
             if (flip) {
                 builder.quadRaw(
@@ -548,7 +608,8 @@ export function ribbonStrip(builder, left, right, opts) {
                 out[2] = r[2];
             }
         },
-        color: o.color || function (i, j, c) { c.setRGB(1, 1, 1); }
+        color: o.color,
+        vertexColor: o.vertexColor
     });
 }
 
@@ -577,7 +638,8 @@ export function extrudeProfile(builder, opts) {
             out[1] = f[1] + f[4] * u + f[7] * v;
             out[2] = f[2] + f[5] * u + f[8] * v;
         },
-        color: opts.color
+        color: opts.color,
+        vertexColor: opts.vertexColor
     });
 }
 
@@ -657,6 +719,139 @@ export function paintVertices(geometry, paint) {
         c.setXYZ(i, tmp.r, tmp.g, tmp.b);
     }
     c.needsUpdate = true;
+    return geometry;
+}
+
+// ============================================================================
+// Запечённое затенение (ambient occlusion) в вершинных цветах
+// ============================================================================
+
+/**
+ * Приближение ambient occlusion, запекаемое в вершинные цвета ОДИН РАЗ при
+ * построении сцены. В кадре это стоит ноль: цвет уже лежит в буфере.
+ *
+ * Честная трассировка по полусфере при генерации слишком дорога (сцена
+ * собирается на старте гонки), поэтому берём два дешёвых приближения, которые
+ * вместе дают почти тот же результат на глаз:
+ *
+ *  1. ВЫСОТА НАД ОПОРОЙ. Чем ближе вершина к земле (или к поверхности, на
+ *     которой предмет стоит), тем больше её закрывает сама земля и соседние
+ *     предметы. Коэффициент растёт от floor у основания до единицы на высоте
+ *     height. Это и есть тёмный контакт у оснований столбов, отбойников,
+ *     зданий, деревьев и трибун.
+ *  2. НАКЛОН НОРМАЛИ. Грань, смотрящая вверх, видит всё небо; смотрящая вниз —
+ *     не видит ничего. Множитель (1 + ny) / 2, смягчённый параметром sky.
+ *
+ * Работает по месту: атрибут color домножается, а не переписывается, поэтому
+ * запекание можно применять к уже покрашенной геометрии и складывать несколько
+ * проходов подряд.
+ *
+ * @param {THREE.BufferGeometry} geometry неиндексированная, с атрибутами
+ *                                        position, normal и color
+ * @param {object} opts
+ *   base    y опорной поверхности (по умолчанию — низ ограничивающего бокса)
+ *   height  на какой высоте затенение сходит на нет, м
+ *   floor   множитель у самой опоры, 0..1 (0.55 — заметно, но не черно)
+ *   power   кривизна спада: >1 прижимает тень к земле
+ *   sky     вклад наклона нормали, 0..1
+ *   down    дополнительный множитель для граней, смотрящих строго вниз
+ */
+export function bakeContactAO(geometry, opts) {
+    const o = opts || {};
+    const pos = geometry.attributes.position;
+    const nrm = geometry.attributes.normal;
+    let col = geometry.attributes.color;
+    if (!pos) return geometry;
+    if (!col) {
+        col = new THREE.BufferAttribute(new Float32Array(pos.count * 3).fill(1), 3);
+        geometry.setAttribute('color', col);
+    }
+    let base = o.base;
+    if (base === undefined) {
+        if (!geometry.boundingBox) geometry.computeBoundingBox();
+        base = geometry.boundingBox.min.y;
+    }
+    const height = o.height === undefined ? 1.6 : o.height;
+    const floor = o.floor === undefined ? 0.55 : o.floor;
+    const power = o.power === undefined ? 0.85 : o.power;
+    const sky = o.sky === undefined ? 0.22 : o.sky;
+    const down = o.down === undefined ? 0.82 : o.down;
+    const invH = height > 1e-6 ? 1 / height : 0;
+    const pa = pos.array;
+    const na = nrm ? nrm.array : null;
+    const ca = col.array;
+
+    for (let i = 0, n = pos.count; i < n; i++) {
+        const i3 = i * 3;
+        let t = (pa[i3 + 1] - base) * invH;
+        if (t < 0) t = 0;
+        else if (t > 1) t = 1;
+        if (power !== 1) t = Math.pow(t, power);
+        let k = floor + (1 - floor) * t;
+        if (na) {
+            const ny = na[i3 + 1];
+            // полусферический вклад: грань вверх видит всё небо (множитель 1),
+            // грань вниз не видит ничего (множитель 1 - sky)
+            k *= 1 - sky + sky * (ny * 0.5 + 0.5);
+            if (ny < -0.5) k *= down;
+        }
+        if (k > 1) k = 1;
+        ca[i3] *= k;
+        ca[i3 + 1] *= k;
+        ca[i3 + 2] *= k;
+    }
+    col.needsUpdate = true;
+    return geometry;
+}
+
+/**
+ * Затенение вокруг заданных точек в системе координат геометрии: вершина
+ * тем темнее, чем ближе она к точке-окклюдеру. Этим темнеют колёсные арки и
+ * низ кузова у машины и ниши под ступенями трибун.
+ *
+ * @param {THREE.BufferGeometry} geometry
+ * @param {Float32Array|Array} points плоский список x, y, z, radius по четыре
+ * @param {number} strength насколько темнеет вершина в самом центре, 0..1
+ */
+export function bakeProximityAO(geometry, points, strength) {
+    const pos = geometry.attributes.position;
+    let col = geometry.attributes.color;
+    if (!pos || !points || !points.length) return geometry;
+    if (!col) {
+        col = new THREE.BufferAttribute(new Float32Array(pos.count * 3).fill(1), 3);
+        geometry.setAttribute('color', col);
+    }
+    const s = strength === undefined ? 0.35 : strength;
+    const pa = pos.array;
+    const ca = col.array;
+    const m = (points.length / 4) | 0;
+    for (let i = 0, n = pos.count; i < n; i++) {
+        const i3 = i * 3;
+        const x = pa[i3],
+            y = pa[i3 + 1],
+            z = pa[i3 + 2];
+        let dark = 0;
+        for (let p = 0; p < m; p++) {
+            const p4 = p * 4;
+            const dx = x - points[p4];
+            const dy = y - points[p4 + 1];
+            const dz = z - points[p4 + 2];
+            const r = points[p4 + 3];
+            const d2 = dx * dx + dy * dy + dz * dz;
+            const r2 = r * r;
+            if (d2 >= r2) continue;
+            // мягкий спад: 1 в центре, 0 на радиусе
+            const t = 1 - Math.sqrt(d2) / r;
+            const v = t * t * (3 - 2 * t);
+            if (v > dark) dark = v;
+        }
+        if (dark <= 0) continue;
+        const k = 1 - s * dark;
+        ca[i3] *= k;
+        ca[i3 + 1] *= k;
+        ca[i3 + 2] *= k;
+    }
+    col.needsUpdate = true;
     return geometry;
 }
 

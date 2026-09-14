@@ -49,7 +49,15 @@
  */
 
 import * as THREE from 'three';
-import { MeshBuilder, mergeGeometries, loft, solidify, toColor } from './geomutil.js';
+import {
+    MeshBuilder,
+    mergeGeometries,
+    loft,
+    solidify,
+    toColor,
+    bakeContactAO,
+    bakeProximityAO
+} from './geomutil.js';
 
 // ---------------------------------------------------------------------------
 // Значения по умолчанию для поля shape (12.2)
@@ -135,10 +143,14 @@ const _cacheBlueprints = new Map();
  * @param {string} quality   low | medium | high
  * @returns объект с узлами, материалами и dispose()
  */
-export function buildCarMesh(shape, bodyColor, quality) {
+export function buildCarMesh(shape, bodyColor, quality, opts) {
     const S = normalizeShape(shape);
     const q = QUALITY[quality] ? quality : 'medium';
-    const bp = getBlueprint(S, q);
+    // Запекание затенения — отдельная настройка графики. Она меняет атрибут
+    // color чертежа, поэтому входит в ключ кэша: машины с затенением и без
+    // него не должны делить один буфер вершин.
+    const ao = !opts || opts.ao !== false;
+    const bp = getBlueprint(S, q, ao);
     bp.refs++;
 
     const paint = toColor(bodyColor === undefined ? '#e5484d' : bodyColor);
@@ -246,6 +258,13 @@ export function buildCarMesh(shape, bodyColor, quality) {
         trackWidth: S.track_width,
         size: { length: S.length, width: S.width, height: S.height },
         materials: { body: bodyMat, wheel: bp.wheelMaterial, head: headMat, brake: brakeMat },
+        /**
+         * Якоря накладного свечения в системе координат машины: плоские
+         * массивы x, y, z, размер по четыре числа на лампу. Их читает
+         * renderer.js один раз при сборке гонки и раскладывает по CarView,
+         * чтобы в кадре не ходить по объектам модели.
+         */
+        lamps: { head: bp.headLamps, brake: bp.brakeLamps, exhaust: bp.exhaust },
         stats: { drawCalls: 4, triangles: bp.triangles },
 
         /** Перекрасить кузов (лобби, смена цвета). Геометрия не пересобирается. */
@@ -325,11 +344,11 @@ function releaseBlueprint(bp) {
 // Чертёж: общие атрибуты одной модели
 // ---------------------------------------------------------------------------
 
-function getBlueprint(S, quality) {
-    const key = S.style + '|' + quality + '|' + JSON.stringify(S);
+function getBlueprint(S, quality, ao) {
+    const key = S.style + '|' + quality + '|' + (ao ? 'ao' : 'flat') + '|' + JSON.stringify(S);
     let bp = _cacheBlueprints.get(key);
     if (bp) return bp;
-    bp = makeBlueprint(S, quality, key);
+    bp = makeBlueprint(S, quality, key, ao);
     _cacheBlueprints.set(key, bp);
     return bp;
 }
@@ -346,7 +365,7 @@ function attrsOf(geometry) {
     };
 }
 
-function makeBlueprint(S, quality, key) {
+function makeBlueprint(S, quality, key, ao) {
     const P = QUALITY[quality];
     const accent = toColor(S.accent);
 
@@ -357,28 +376,42 @@ function makeBlueprint(S, quality, key) {
     buildDriverHead(bb, S, accent, headPos[0], headPos[1], headPos[2]);
 
     const bodyGeom = bb.build();
+    if (ao) bakeCarAO(bodyGeom, S);
     const bodyAttrs = attrsOf(bodyGeom);
     const base = bodyGeom.attributes.color.array;
     const mask = bb.buildFlags();
 
     // --- колесо -------------------------------------------------------------
     const wheelGeom = buildWheel(S, P);
+    if (ao) {
+        // Колесо вращается, поэтому запекать в него направленное затенение
+        // нельзя — тень крутилась бы вместе с диском. Колесу достаётся ровное
+        // приглушение: оно и правда сидит в тени арки.
+        const wc = wheelGeom.attributes.color.array;
+        for (let i = 0; i < wc.length; i++) wc[i] *= 0.84;
+    }
     const wheelAttrs = attrsOf(wheelGeom);
     const wheelMaterial = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
     wheelMaterial.name = 'carWheel';
 
     // --- фары и стопы -------------------------------------------------------
     const hb = new MeshBuilder();
-    buildHeadLights(hb, S, ctx);
+    const headLamps = buildHeadLights(hb, S, ctx);
     const headGeomB = hb.build();
 
     const sb = new MeshBuilder();
-    buildBrakeLights(sb, S, ctx);
+    const brakeLamps = buildBrakeLights(sb, S, ctx);
     const brakeGeomB = sb.build();
 
     const halfTrack = S.track_width * 0.5;
     const halfBase = S.wheelbase * 0.5;
     const r = S.wheel_radius;
+
+    // Точки выхлопа для следа турбо: две трубы по бортам за кормой.
+    const exhaust = new Float32Array([
+        S.width * 0.22, S.ride_height + 0.1, -S.length * 0.5 - 0.06, 0.34,
+        -S.width * 0.22, S.ride_height + 0.1, -S.length * 0.5 - 0.06, 0.34
+    ]);
 
     return {
         key: key,
@@ -388,6 +421,10 @@ function makeBlueprint(S, quality, key) {
         wheelMaterial: wheelMaterial,
         head: attrsOf(headGeomB),
         brake: attrsOf(brakeGeomB),
+        // якоря накладного свечения (effects.js): x, y, z, размер — по четыре
+        headLamps: headLamps,
+        brakeLamps: brakeLamps,
+        exhaust: exhaust,
         driverPos: headPos,
         wheelPos: [
             [halfTrack, r, halfBase],
@@ -962,11 +999,53 @@ function buildDriverHead(b, S, accent, ox, oy, oz) {
     b.flag = flagSave;
 }
 
+// --- запечённое затенение кузова -------------------------------------------
+
+/**
+ * Затенение машины, посчитанное один раз на чертёж.
+ *
+ * Три слагаемых, и все три видны на глаз:
+ *  - низ кузова и пороги темнее: снизу вершину закрывает асфальт;
+ *  - днище (грани нормалью вниз) почти чёрное;
+ *  - колёсные арки: вершины рядом с колесом затемняются по близости, так что
+ *    крыло получает честную тень от колеса, а не ровную заливку.
+ *
+ * Затенение кладётся в БАЗОВЫЙ цвет чертежа. Перекрашиваемые панели хранят
+ * там коэффициент яркости, поэтому цвет игрока (setBodyColor) домножается на
+ * уже затенённую базу и тень никуда не девается при смене цвета.
+ */
+function bakeCarAO(geometry, S) {
+    const halfTrack = S.track_width * 0.5;
+    const halfBase = S.wheelbase * 0.5;
+    const r = S.wheel_radius;
+
+    // земля под машиной
+    bakeContactAO(geometry, {
+        base: 0,
+        height: S.height * 0.85,
+        floor: 0.58,
+        power: 0.75,
+        sky: 0.26,
+        down: 0.45
+    });
+
+    // четыре колеса как окклюдеры: их радиус и даёт тень в арке
+    const wheels = new Float32Array([
+        halfTrack, r, halfBase, r * 2.1,
+        -halfTrack, r, halfBase, r * 2.1,
+        halfTrack, r, -halfBase, r * 2.1,
+        -halfTrack, r, -halfBase, r * 2.1
+    ]);
+    bakeProximityAO(geometry, wheels, 0.34);
+    return geometry;
+}
+
 // --- фары и стопы ----------------------------------------------------------
 
 function buildHeadLights(b, S, ctx) {
     const L = S.length;
     const glass = toColor('#fff6d8');
+    _lampPoints.length = 0;
     const z = L * 0.5 + 0.02;
     // середина передней маски: между бампером и верхней кромкой носа
     const y = ctx.RH + (ctx.yNose - ctx.RH) * 0.62;
@@ -998,11 +1077,13 @@ function buildHeadLights(b, S, ctx) {
             lightQuad(b, s * hw * 0.64, y, z, 0.34, 0.17, glass, 1);
         }
     }
+    return new Float32Array(_lampPoints);
 }
 
 function buildBrakeLights(b, S, ctx) {
     const L = S.length;
     const lamp = toColor('#ff4d3d');
+    _lampPoints.length = 0;
     const z = -L * 0.5 - 0.02;
     const y = ctx.RH + (ctx.yTail - ctx.RH) * 0.66;
     const hw = ctx.hwTail;
@@ -1028,12 +1109,27 @@ function buildBrakeLights(b, S, ctx) {
             lightQuad(b, s * hw * 0.72, y + 0.05, z, 0.24, 0.22, lamp, -1);
         }
     }
+    return new Float32Array(_lampPoints);
 }
+
+/**
+ * Якоря накладного свечения: x, y, z, размер по четыре числа на лампу.
+ * Список общий и переиспользуемый — он живёт только на время сборки чертежа,
+ * в кадровый цикл ничего отсюда не попадает.
+ */
+const _lampPoints = [];
 
 /** Плоский светящийся прямоугольник. dir: +1 вперёд, -1 назад, 0 вверх. */
 function lightQuad(b, x, y, z, w, h, color, dir) {
     const hwq = w * 0.5,
         hhq = h * 0.5;
+    // точка свечения чуть впереди стекла, чтобы ореол не тонул в кузове
+    _lampPoints.push(
+        x,
+        y + (dir === 0 ? 0.02 : 0),
+        z + (dir === 0 ? 0 : dir * 0.04),
+        Math.max(w, h) * 1.9 + 0.12
+    );
     if (dir === 1) {
         b.quad([x - hwq, y - hhq, z], [x + hwq, y - hhq, z], [x + hwq, y + hhq, z], [x - hwq, y + hhq, z], color);
     } else if (dir === -1) {

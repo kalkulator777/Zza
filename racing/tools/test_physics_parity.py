@@ -19,12 +19,19 @@
 3. Если в системе есть ``node`` — прогоняет ТОТ ЖЕ сценарий и ТУ ЖЕ заглушку
    через static/js/physics.js и сравнивает траектории пошагово.
    Нет ``node`` — честно печатает, что сравнение пропущено, и не падает.
-4. Прогоняет второй сценарий: четыре машины съезжаются в одну точку —
-   это единственное, что проверяет ``resolve_collisions``, потому что
+4. Прогоняет сценарии столкновений: машины съезжаются в одну точку, догоняют
+   друг друга в лоб-в-корму и идут борт о борт по параллельным прямым.
+   Это единственное, что проверяет ``resolve_collisions``, потому что
    в первом сценарии машина одна, а столкновения считает только сервер.
+   Машина — КАПСУЛА (отрезок 2*CAR_AXIS_HALF плюс радиус CAR_RADIUS,
+   габарит 4,00 x 1,90 м), поэтому расстояние между машинами меряется
+   между отрезками, а не между центрами.
 5. Печатает максимальное расхождение по позиции и по курсу, сверяет события
    ускорения за занос, флаг «вне трассы» и круги, и меряет время одного шага
    на одну машину — чистого и вместе с обращениями к трассе.
+6. Печатает замеры ощущений, которые иначе проверять глазами: ручник против
+   сцепления (угол за 0,75 с, потеря скорости, время возврата) и контакт
+   тяжёлой машины с лёгкой.
 
 Сценарий обязан задеть все ветки шага: если какая-то (трава, стена, задний
 ход, дрифт, соприкосновение машин) не случилась, тест не молчит, а падает —
@@ -43,14 +50,15 @@ import subprocess
 import sys
 import tempfile
 import time
-from math import floor
+from math import atan2, cos, degrees, floor, hypot, sin
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from game import physics                                  # noqa: E402
-from game.physics import CarState, CarStats, WALL_BOUNCE   # noqa: E402
+from game.physics import (CarState, CarStats, WALL_BOUNCE,  # noqa: E402
+                          CAR_RADIUS, CAR_AXIS_HALF)
 
 # Допуски. sin/cos в Python и в V8 могут разойтись в младшем разряде, и за
 # несколько тысяч шагов интегрирования эта разница подрастает. Сантиметры на
@@ -69,22 +77,31 @@ GAS = physics.BTN_THROTTLE
 BRAKE = physics.BTN_BRAKE
 LEFT = physics.BTN_LEFT
 RIGHT = physics.BTN_RIGHT
-DRIFT = physics.BTN_DRIFT
+HANDBRAKE = physics.BTN_HANDBRAKE
+DRIFT = HANDBRAKE          # имя бита 4 из раздела 5.2
 
-# Характеристики «Хэтча» из раздела 6.5 контракта.
+# Характеристики «Хэтча» — копия записи из content/cars.json. Копия, а не
+# загрузка файла: тот же словарь уезжает в JS-драйвер вместе с планом, и тест
+# обязан проверять физику, а не чтение JSON. Числа раздела 6.5 контракта здесь
+# не годятся: с ними машина упирается в 20 м/с, а реальная езда идёт на 20..55,
+# то есть ровно там, где работает предел по сцеплению из шага 9.
 HATCH_STATS = {
-    "engine_force": 14.0,
-    "max_speed": 44.0,
-    "brake_force": 26.0,
+    "engine_force": 14.95,
+    "max_speed": 62.70,
+    "brake_force": 28.0,
     "reverse_force": 10.0,
-    "turn_rate": 2.5,
-    "grip_step": 0.17,
+    "turn_rate": 2.40,
+    "grip_step": 0.172,
     "drift_grip_step": 0.055,
-    "drag": 0.0016,
-    "roll": 0.35,
-    "boost_speed": 58.0,
+    "drag": 0.0004,
+    "roll": 0.027,
+    "boost_speed": 62.0,
     "mass": 1.0,
 }
+
+# Тяжёлая и лёгкая — для проверки, что масса решает контакт (Фургон и Багги).
+HEAVY_MASS = 1.6
+LIGHT_MASS = 0.7
 
 
 class StubTrack:
@@ -193,16 +210,50 @@ INJECT = (
 
 TOTAL_STEPS = 4200
 
-# Второй сценарий: четыре машины съезжаются в одну точку. Проверяет
-# resolve_collisions — расталкивание с учётом массы и обмен импульсом.
-# Столкновения считает только сервер, поэтому в первом сценарии их нет.
+# Сценарии столкновений. Проверяют resolve_collisions — форму (капсула),
+# расталкивание с учётом массы и обмен импульсом. Столкновения считает только
+# сервер, поэтому в первом сценарии их нет вовсе.
+#
+# Запись машины: x, z, yaw, vx, vz, масса, кнопки.
 COLLIDE_STEPS = 600
-COLLIDE_CARS = (
-    # x, z, yaw (носом к центру), масса, кнопки
-    (0.0, -12.0, 0.0, 1.0, GAS),
-    (0.0, 12.0, 3.141592653589793, 1.4, GAS),
-    (-12.0, 0.0, 1.5707963267948966, 0.8, GAS | LEFT),
-    (12.0, 0.0, -1.5707963267948966, 1.2, GAS | RIGHT),
+PI = 3.141592653589793
+HALF_PI = 1.5707963267948966
+
+COLLIDE_SETS = (
+    ("съезд в одну точку", (
+        (0.0, -12.0, 0.0, 0.0, 0.0, 1.0, GAS),
+        (0.0, 12.0, PI, 0.0, 0.0, 1.4, GAS),
+        (-12.0, 0.0, HALF_PI, 0.0, 0.0, 0.8, GAS | LEFT),
+        (12.0, 0.0, -HALF_PI, 0.0, 0.0, 1.2, GAS | RIGHT),
+    )),
+    ("догон в корму, 30 и 20 м/с", (
+        (0.0, 0.0, 0.0, 0.0, 20.0, 1.0, 0),
+        (0.0, -30.0, 0.0, 0.0, 30.0, 1.0, 0),
+    )),
+    ("удар в бок под 90°", (
+        (0.0, 0.0, 0.0, 0.0, 18.0, 1.0, 0),
+        (-18.0, 17.8, HALF_PI, 18.0, 0.0, 1.0, 0),
+    )),
+    ("тяжёлая догоняет лёгкую", (
+        (0.0, 0.0, 0.0, 0.0, 20.0, LIGHT_MASS, 0),
+        (0.0, -24.0, 0.0, 0.0, 30.0, HEAVY_MASS, 0),
+    )),
+    ("лёгкая догоняет тяжёлую", (
+        (0.0, 0.0, 0.0, 0.0, 20.0, HEAVY_MASS, 0),
+        (0.0, -24.0, 0.0, 0.0, 30.0, LIGHT_MASS, 0),
+    )),
+    # 2.05 м между центрами: старый круг радиусом 1.1 тут срабатывал бы
+    # постоянно, капсула шириной 1.90 не должна касаться никогда
+    ("борт о борт по параллельным прямым", (
+        (-1.025, 0.0, 0.0, 0.0, 30.0, 1.0, GAS),
+        (1.025, 0.0, 0.0, 0.0, 30.0, 1.0, GAS),
+    )),
+    # зажим: лёгкая машина между тяжёлой и стеной коридора (x = 60).
+    # Тяжёлая идёт быстрее и обгоняет вплотную, лёгкой деваться некуда
+    ("зажим между машиной и стеной", (
+        (58.2, 6.0, 0.0, 0.0, 20.0, LIGHT_MASS, GAS),
+        (56.6, 0.0, 0.0, 0.0, 30.0, HEAVY_MASS, GAS),
+    )),
 )
 
 
@@ -235,7 +286,7 @@ def build_plan():
         "stats": HATCH_STATS,
         "dt": physics.DT,
         "collide_steps": COLLIDE_STEPS,
-        "collide_cars": [list(car) for car in COLLIDE_CARS],
+        "collide_sets": [[list(car) for car in cars] for _name, cars in COLLIDE_SETS],
     }
 
 
@@ -286,41 +337,51 @@ def run_python(plan):
 
 
 def run_python_collisions(plan):
-    """Прогнать сценарий столкновений через resolve_collisions."""
-    rows = plan["collide_cars"]
-    count = len(rows)
-    cars = []
-    stats = []
-    tracks = []
-    buttons = []
-    for x, z, yaw, mass, mask in rows:
-        state = CarState(x, z, yaw)
-        cars.append(state)
-        car_stats = CarStats(**plan["stats"])
-        car_stats.mass = mass
-        stats.append(car_stats)
-        tracks.append(StubTrack())   # своя заглушка на машину: last_s у неё своя
-        buttons.append(int(mask))
+    """Прогнать все сценарии столкновений через resolve_collisions.
 
+    Возвращает список сценариев; сценарий — список машин; машина — плоская
+    траектория по пять чисел на шаг: x, z, vx, vz, yaw. Курс нужен потому,
+    что габарит теперь капсула, и расстояние между машинами без курса
+    не посчитать.
+    """
     dt = plan["dt"]
     steps = plan["collide_steps"]
     out = []
-    for _ in range(count):
-        out.append([0.0] * (steps * 4))
+    for rows in plan["collide_sets"]:
+        count = len(rows)
+        cars = []
+        stats = []
+        tracks = []
+        buttons = []
+        for x, z, yaw, vx, vz, mass, mask in rows:
+            state = CarState(x, z, yaw)
+            state.vx = vx
+            state.vz = vz
+            cars.append(state)
+            car_stats = CarStats(**plan["stats"])
+            car_stats.mass = mass
+            stats.append(car_stats)
+            tracks.append(StubTrack())   # своя заглушка: last_s у неё своя
+            buttons.append(int(mask))
 
-    for i in range(steps):
-        for c in range(count):
-            physics.step(cars[c], stats[c], buttons[c], dt, tracks[c],
-                         cars[c].sample_idx)
-        # между шагами: расталкивание и обмен импульсом для всех машин сразу
-        physics.resolve_collisions(cars, stats, count)
-        for c in range(count):
-            row = out[c]
-            base = i * 4
-            row[base] = cars[c].x
-            row[base + 1] = cars[c].z
-            row[base + 2] = cars[c].vx
-            row[base + 3] = cars[c].vz
+        scene = []
+        for _ in range(count):
+            scene.append([0.0] * (steps * 5))
+        for i in range(steps):
+            for c in range(count):
+                physics.step(cars[c], stats[c], buttons[c], dt, tracks[c],
+                             cars[c].sample_idx)
+            # между шагами: расталкивание и обмен импульсом для всех сразу
+            physics.resolve_collisions(cars, stats, count)
+            for c in range(count):
+                row = scene[c]
+                base = i * 5
+                row[base] = cars[c].x
+                row[base + 1] = cars[c].z
+                row[base + 2] = cars[c].vx
+                row[base + 3] = cars[c].vz
+                row[base + 4] = cars[c].yaw
+        out.append(scene)
     return out
 
 
@@ -446,39 +507,46 @@ for (let i = 0; i < n; i++) {
     offs[i] = state.offtrack ? 1 : 0;
 }
 
-/* второй сценарий: столкновения машина-машина */
-const rows = plan.collide_cars;
-const count = rows.length;
-const cars = [];
-const carStats = [];
-const tracks = [];
-const masks = [];
-for (let c = 0; c < count; c++) {
-    cars.push(createCarState(rows[c][0], rows[c][1], rows[c][2]));
-    const cs = createCarStats(plan.stats);
-    cs.mass = rows[c][3];
-    carStats.push(cs);
-    tracks.push(new StubTrack());
-    masks.push(rows[c][4]);
-}
+/* сценарии столкновений машина-машина */
 const collideSteps = plan.collide_steps;
 const collide = [];
-for (let c = 0; c < count; c++) {
-    collide.push(new Array(collideSteps * 4));
-}
-for (let i = 0; i < collideSteps; i++) {
+for (const rows of plan.collide_sets) {
+    const count = rows.length;
+    const cars = [];
+    const carStats = [];
+    const tracks = [];
+    const masks = [];
     for (let c = 0; c < count; c++) {
-        step(cars[c], carStats[c], masks[c], dt, tracks[c], cars[c].sampleIdx);
+        const state = createCarState(rows[c][0], rows[c][1], rows[c][2]);
+        state.vx = rows[c][3];
+        state.vz = rows[c][4];
+        cars.push(state);
+        const cs = createCarStats(plan.stats);
+        cs.mass = rows[c][5];
+        carStats.push(cs);
+        tracks.push(new StubTrack());
+        masks.push(rows[c][6]);
     }
-    resolveCollisions(cars, carStats, count);
+    const scene = [];
     for (let c = 0; c < count; c++) {
-        const row = collide[c];
-        const base = i * 4;
-        row[base] = cars[c].x;
-        row[base + 1] = cars[c].z;
-        row[base + 2] = cars[c].vx;
-        row[base + 3] = cars[c].vz;
+        scene.push(new Array(collideSteps * 5));
     }
+    for (let i = 0; i < collideSteps; i++) {
+        for (let c = 0; c < count; c++) {
+            step(cars[c], carStats[c], masks[c], dt, tracks[c], cars[c].sampleIdx);
+        }
+        resolveCollisions(cars, carStats, count);
+        for (let c = 0; c < count; c++) {
+            const row = scene[c];
+            const base = i * 5;
+            row[base] = cars[c].x;
+            row[base + 1] = cars[c].z;
+            row[base + 2] = cars[c].vx;
+            row[base + 3] = cars[c].vz;
+            row[base + 4] = cars[c].yaw;
+        }
+    }
+    collide.push(scene);
 }
 
 writeFileSync(process.argv[3], JSON.stringify({
@@ -592,45 +660,105 @@ def compare(py, js):
     return ok
 
 
-def collide_stats(rows):
-    """Минимальное расстояние между машинами за прогон и в конце прогона."""
+def _point_seg(px, pz, cx, cz, ux, uz):
+    """Расстояние от точки до отрезка ``c ± CAR_AXIS_HALF * u``."""
+    t = (px - cx) * ux + (pz - cz) * uz
+    if t > CAR_AXIS_HALF:
+        t = CAR_AXIS_HALF
+    elif t < -CAR_AXIS_HALF:
+        t = -CAR_AXIS_HALF
+    dx = px - (cx + ux * t)
+    dz = pz - (cz + uz * t)
+    return (dx * dx + dz * dz) ** 0.5
+
+
+def _side(ax, az, bx, bz, cx, cz):
+    return (bx - ax) * (cz - az) - (bz - az) * (cx - ax)
+
+
+def capsule_gap(ax, az, ayaw, bx, bz, byaw):
+    """Зазор между двумя капсулами, м. Ноль и меньше — они пересекаются.
+
+    Считается независимо от физики: расстояние между отрезками как минимум
+    из четырёх расстояний «конец одного до другого отрезка» (и ноль, если
+    отрезки пересеклись), минус два радиуса. Формулу из resolve_collisions
+    тест намеренно не переиспользует — иначе он сверял бы её саму с собой.
+    """
+    h = CAR_AXIS_HALF
+    ux, uz = sin(ayaw), cos(ayaw)
+    wx, wz = sin(byaw), cos(byaw)
+    a1x, a1z = ax - ux * h, az - uz * h
+    a2x, a2z = ax + ux * h, az + uz * h
+    b1x, b1z = bx - wx * h, bz - wz * h
+    b2x, b2z = bx + wx * h, bz + wz * h
+    d1 = _side(b1x, b1z, b2x, b2z, a1x, a1z)
+    d2 = _side(b1x, b1z, b2x, b2z, a2x, a2z)
+    d3 = _side(a1x, a1z, a2x, a2z, b1x, b1z)
+    d4 = _side(a1x, a1z, a2x, a2z, b2x, b2z)
+    if ((d1 > 0.0) != (d2 > 0.0)) and ((d3 > 0.0) != (d4 > 0.0)):
+        dist = 0.0                       # отрезки пересеклись
+    else:
+        dist = min(_point_seg(a1x, a1z, bx, bz, wx, wz),
+                   _point_seg(a2x, a2z, bx, bz, wx, wz),
+                   _point_seg(b1x, b1z, ax, az, ux, uz),
+                   _point_seg(b2x, b2z, ax, az, ux, uz))
+    return dist - (CAR_RADIUS + CAR_RADIUS)
+
+
+def _pair_gap(rows, a, b, i):
+    base = i * 5
+    return capsule_gap(rows[a][base], rows[a][base + 1], rows[a][base + 4],
+                       rows[b][base], rows[b][base + 1], rows[b][base + 4])
+
+
+def collide_stats(rows, sample=1):
+    """Минимальный зазор между капсулами за прогон и в конце прогона."""
     count = len(rows)
-    steps = len(rows[0]) // 4
+    steps = len(rows[0]) // 5
     closest = 1e9
     final_min = 1e9
-    for i in range(steps):
-        base = i * 4
+    for i in range(0, steps, sample):
         for a in range(count - 1):
             for b in range(a + 1, count):
-                dx = rows[a][base] - rows[b][base]
-                dz = rows[a][base + 1] - rows[b][base + 1]
-                d = (dx * dx + dz * dz) ** 0.5
+                d = _pair_gap(rows, a, b, i)
                 if d < closest:
                     closest = d
-                if i == steps - 1 and d < final_min:
-                    final_min = d
+    last = steps - 1
+    for a in range(count - 1):
+        for b in range(a + 1, count):
+            d = _pair_gap(rows, a, b, last)
+            if d < final_min:
+                final_min = d
     return closest, final_min
 
 
-def compare_collisions(py_rows, js_rows):
-    """Сравнить траектории сценария столкновений."""
+def compare_collisions(py_sets, js_sets):
+    """Сравнить траектории всех сценариев столкновений."""
+    if len(py_sets) != len(js_sets):
+        print("  РАСХОЖДЕНИЕ: число сценариев столкновений не совпало")
+        return False
     worst = 0.0
-    worst_car = 0
-    for c in range(len(py_rows)):
-        a = py_rows[c]
-        b = js_rows[c]
-        if len(a) != len(b):
-            print("  РАСХОЖДЕНИЕ: длина траектории машины %d не совпала" % c)
-            return False
-        for k in range(0, len(a), 4):
-            dx = a[k] - b[k]
-            dz = a[k + 1] - b[k + 1]
-            d = (dx * dx + dz * dz) ** 0.5
-            if d > worst:
-                worst = d
-                worst_car = c
-    print("  столкновения: расхождение позиции %.3e м (худшая машина %d)"
-          % (worst, worst_car))
+    worst_where = ""
+    for k in range(len(py_sets)):
+        py_rows = py_sets[k]
+        js_rows = js_sets[k]
+        name = COLLIDE_SETS[k][0]
+        for c in range(len(py_rows)):
+            a = py_rows[c]
+            b = js_rows[c]
+            if len(a) != len(b):
+                print("  РАСХОЖДЕНИЕ: длина траектории %s / машина %d"
+                      % (name, c))
+                return False
+            for m in range(0, len(a), 5):
+                dx = a[m] - b[m]
+                dz = a[m + 1] - b[m + 1]
+                d = (dx * dx + dz * dz) ** 0.5
+                if d > worst:
+                    worst = d
+                    worst_where = "%s, машина %d" % (name, c)
+    print("  столкновения: расхождение позиции %.3e м (%s)"
+          % (worst, worst_where))
     if worst > POS_TOL:
         print("  РАСХОЖДЕНИЕ: столкновения вышли за допуск %.3f м" % POS_TOL)
         return False
@@ -716,6 +844,103 @@ def report_feel(py):
     return missing
 
 
+def _speed_along(rows, car, i, ux, uz):
+    base = i * 5
+    return rows[car][base + 2] * ux + rows[car][base + 3] * uz
+
+
+def report_collisions(sets):
+    """Что именно проверено в столкновениях. Возвращает False, если сценарий
+    вырожден: не касались там, где обязаны, или коснулись там, где нельзя."""
+    print("  столкновения (габарит капсулы %.2f x %.2f м, %d шагов на сценарий):"
+          % (2.0 * (CAR_AXIS_HALF + CAR_RADIUS), 2.0 * CAR_RADIUS,
+             COLLIDE_STEPS))
+    ok = True
+    for k, (name, _cars) in enumerate(COLLIDE_SETS):
+        rows = sets[k]
+        closest, final_min = collide_stats(rows)
+        touched = closest <= 0.0
+        must_touch = "параллельным" not in name
+        extra = ""
+        if name.startswith("догон") or "догоняет" in name:
+            # скорости вдоль +Z до и после контакта
+            steps = len(rows[0]) // 5
+            hit = None
+            for i in range(steps):
+                if _pair_gap(rows, 0, 1, i) <= 0.0:
+                    hit = i
+                    break
+            if hit is not None and hit > 0:
+                before = (rows[0][(hit - 1) * 5 + 3], rows[1][(hit - 1) * 5 + 3])
+                after_i = min(hit + 2, steps - 1)
+                after = (rows[0][after_i * 5 + 3], rows[1][after_i * 5 + 3])
+                extra = (", догоняющий %.2f -> %.2f м/с, впереди идущий "
+                         "%.2f -> %.2f м/с"
+                         % (before[1], after[1], before[0], after[0]))
+        mark = "ок" if touched == must_touch else "ПРОВАЛ"
+        if touched != must_touch:
+            ok = False
+        print("    [%s] %-34s зазор минимум %+.3f м, в конце %+.3f м%s"
+              % (mark, name, closest, final_min, extra))
+    if not ok:
+        print("  ОШИБКА: сценарий столкновений вырожден, править тест")
+    return ok
+
+
+def report_handbrake():
+    """Ручник против сцепления: угол, потеря скорости, время возврата."""
+    stats = CarStats(**HATCH_STATS)
+    track = NullTrack()
+    dt = physics.DT
+
+    def drive(mask, seconds, state=None):
+        st = state
+        if st is None:
+            st = CarState(0.0, 0.0, 0.0)
+            st.vz = 30.0
+        for _ in range(int(seconds / dt + 0.5)):
+            physics.step(st, stats, mask, dt, track, 0)
+        return st
+
+    def slip_deg(st):
+        fwd = st.vx * sin(st.yaw) + st.vz * cos(st.yaw)
+        lat = st.vx * cos(st.yaw) - st.vz * sin(st.yaw)
+        return degrees(atan2(abs(lat), abs(fwd) if fwd else 1e-9))
+
+    grip = drive(GAS | LEFT, 0.75)
+    hand = drive(GAS | LEFT | HANDBRAKE, 0.75)
+    straight = drive(GAS | HANDBRAKE, 1.0)
+    coast = drive(HANDBRAKE, 1.0)
+
+    # снимаем показания ДО фазы возврата: дальше это же состояние докатывается
+    grip_yaw = degrees(grip.yaw)
+    grip_speed = hypot(grip.vx, grip.vz)
+    hand_yaw = degrees(hand.yaw)
+    hand_speed = hypot(hand.vx, hand.vz)
+    hand_slip = slip_deg(hand)
+
+    # сколько тиков до выхода из заноса после отпускания ручника
+    recovered = None
+    for i in range(int(2.0 / dt)):
+        physics.step(hand, stats, GAS, dt, track, 0)
+        if slip_deg(hand) < 3.0:
+            recovered = (i + 1) * dt
+            break
+
+    print("  ручник против сцепления (Хэтч, старт 30 м/с, полный руль, 0.75 с):")
+    print("    на сцеплении   поворот %5.1f°, скорость 30.0 -> %.1f м/с"
+          % (grip_yaw, grip_speed))
+    print("    по ручнику     поворот %5.1f°, скорость 30.0 -> %.1f м/с, "
+          "угол скольжения %.1f°" % (hand_yaw, hand_speed, hand_slip))
+    print("    ручник круче в %.2f раза, возврат в управляемое состояние за %s"
+          % (hand_yaw / grip_yaw,
+             ("%.2f с" % recovered) if recovered else "больше 2 с"))
+    print("    ручник на прямой 1 с: с газом 30.0 -> %.1f м/с, накатом "
+          "30.0 -> %.1f м/с; заряд за занос на прямой %.2f с (должен быть 0)"
+          % (hypot(straight.vx, straight.vz), hypot(coast.vx, coast.vz),
+             straight.drift_charge))
+
+
 def main():
     print("Проверка совпадения физики Python и JS")
     print("  шагов в сценарии: %d (%.1f с игрового времени)"
@@ -737,13 +962,7 @@ def main():
 
     print()
     py_collide = run_python_collisions(plan)
-    closest, final_min = collide_stats(py_collide)
-    print("  сценарий столкновений: %d машин, %d шагов, сблизились до %.3f м, "
-          "в конце ближайшая пара в %.3f м (диаметр %.1f м)"
-          % (len(py_collide), COLLIDE_STEPS, closest, final_min,
-             physics.CAR_RADIUS * 2.0))
-    if closest > physics.CAR_RADIUS * 2.0:
-        print("  ОШИБКА: машины не соприкоснулись, столкновения не проверены")
+    if not report_collisions(py_collide):
         return 1
 
     print()
@@ -761,6 +980,9 @@ def main():
             ok = compare(py, js)
             if not compare_collisions(py_collide, js["collide"]):
                 ok = False
+
+    print()
+    report_handbrake()
 
     print()
     pure = bench(plan, NullTrack())
