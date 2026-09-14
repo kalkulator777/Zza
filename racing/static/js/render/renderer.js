@@ -240,6 +240,11 @@ const BODY_LERP = 9.0;           // 1/с, сглаживание кренов
 const TERRAIN_LERP = 12.0;
 const SLOPE_SAMPLE = 1.4;        // м вперёд/назад для замера уклона
 
+// --- пятно света фар на асфальте (только ночью) ------------------------------
+const BEAM_AHEAD = 8.0;   // м, центр пятна перед машиной
+const BEAM_LENGTH = 17.0; // м, длина пятна вдоль курса
+const BEAM_WIDTH = 6.0;   // м, ширина пятна
+
 const CAM_GROUND_CLEARANCE = 0.75; // м, ниже рельефа камера не опускается
 const NEAR_PLANE = 0.12;
 
@@ -366,6 +371,7 @@ export class RaceRenderer {
         // значение; галочка `timeOfDay` в настройках графики может его
         // локально перебить.
         this.environment = normalizeEnvironment(null, ENV_DEFAULT);
+        this.envExplicit = false;   // приходило ли окружение снаружи хоть раз
         this.timeOfDay = 'day';
 
         // Отсечение по пирамиде видимости: один объект на рендер, в кадре
@@ -516,6 +522,9 @@ export class RaceRenderer {
         }
         // свечение включается на живой сцене, без пересборки
         if (this.effects) this.effects.setGlowEnabled(next.glow);
+        // дальность отрисовки — тоже без пересборки: она правит только
+        // туман, дальнюю плоскость камеры и предел отсечения
+        if (this.scenery) this.applyViewDistance();
 
         if (rebuild && this.raceReady) {
             const track = this.trackSource;
@@ -528,6 +537,55 @@ export class RaceRenderer {
         return false;
     }
 
+    /**
+     * Окружение гонки: время суток и (задел) погода. Приходит из настроек
+     * комнаты, а не из описания трассы.
+     *
+     * Принимает `{timeOfDay|time_of_day, weather}` или просто строку
+     * `'night'`. Если сцена уже собрана, она пересобирается: небо, свет,
+     * туман и ночные огни запечены в геометрию.
+     *
+     * @returns {boolean} состоялась ли пересборка
+     */
+    setEnvironment(env) {
+        const next = normalizeEnvironment(env, this.environment);
+        if (next.timeOfDay === this.environment.timeOfDay
+            && next.weather === this.environment.weather) return false;
+        this.environment = next;
+        if (!this.raceReady) return false;
+        const track = this.trackSource;
+        const players = this.playerSource;
+        const local = this.localSlot;
+        this.disposeRace();
+        this.createRace(track, players, { localSlot: local });
+        return true;
+    }
+
+    /** Время суток, которым реально собирается сцена (галочка главнее комнаты). */
+    resolveTimeOfDay() {
+        const forced = this.gfx.timeOfDay;
+        if (forced && forced !== 'auto') return forced;
+        return this.environment.timeOfDay;
+    }
+
+    /**
+     * Дальность тумана, дальняя плоскость камеры и предел отсечения.
+     * Всё три — одно и то же число: отсечение режет ровно там, где туман уже
+     * подменил цвет объекта своим, поэтому картинка не меняется.
+     */
+    applyViewDistance() {
+        const sc = this.scenery;
+        if (!sc) return;
+        const k = VIEW_DISTANCE_K[this.gfx.viewDistance] || 1;
+        const far = sc.fog.far * k;
+        this.fog.near = far * 0.35;
+        this.fog.far = far;
+        // запас в 12 м: на самой границе тумана объект ещё виден на пиксель
+        this.cullDistance = far + 12;
+        this.camera.far = far + 700;
+        this.camera.updateProjectionMatrix();
+    }
+
     // -----------------------------------------------------------------------
     // Сборка гонки
     // -----------------------------------------------------------------------
@@ -537,7 +595,10 @@ export class RaceRenderer {
      * @param {object} track   экземпляр Track из js/track.js либо объект
      *                         race_init.track формата 12.1
      * @param {Array}  players [{slot, color, car|shape}] — расстановка из race_init
-     * @param {object} opts    { localSlot }
+     * @param {object} opts    { localSlot, env }
+     *   env — окружение из настроек комнаты: {timeOfDay, weather}. Если не
+     *   задано, берётся ранее принятое setEnvironment(), а на первой гонке —
+     *   умолчание описания трассы.
      */
     createRace(track, players, opts) {
         const o = opts || {};
@@ -551,14 +612,31 @@ export class RaceRenderer {
         this.theme = this.track.theme || 'city';
         const quality = this.quality;
 
+        // Окружение: явно переданное > ранее принятое > умолчание трассы.
+        if (o.env !== undefined && o.env !== null) {
+            this.environment = normalizeEnvironment(o.env, trackDefaultEnvironment(track));
+        } else if (!this.envExplicit) {
+            this.environment = trackDefaultEnvironment(track);
+        }
+        if (o.env !== undefined && o.env !== null) this.envExplicit = true;
+        const todName = this.resolveTimeOfDay();
+        this.timeOfDay = todName;
+        this.nightK = todName === 'night' ? 1 : todName === 'dusk' ? 0.5 : 0;
+
         // 12.6: buildTrackMeshes и buildScenery ОБЯЗАНЫ получить один и тот же
         // quality, иначе декор всплывёт над землёй.
         const gfx = this.gfx;
-        this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality, { ao: gfx.ao });
+        const nightLights = NIGHT_LIGHT_K[gfx.nightLights] === undefined ? 1 : NIGHT_LIGHT_K[gfx.nightLights];
+        this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality, {
+            ao: gfx.ao,
+            timeOfDay: todName
+        });
         this.scenery = buildScenery(this.track, this.theme, this.track.decorSeed, quality, {
             ao: gfx.ao,
             decor: gfx.decor,
-            anim: gfx.decorAnim
+            anim: gfx.decorAnim,
+            env: { timeOfDay: todName, weather: this.environment.weather },
+            nightLights: nightLights
         });
         this.sampler = createTerrainSampler(this.track, this.theme, quality);
 
@@ -568,11 +646,8 @@ export class RaceRenderer {
         // туман, фон и свет — как отдаёт buildScenery (12.6)
         const sc = this.scenery;
         this.fog.color.copy(sc.fog.color);
-        this.fog.near = sc.fog.near;
-        this.fog.far = sc.fog.far;
         this.scene.background = sc.background;
-        this.camera.far = sc.fog.far + 700;
-        this.camera.updateProjectionMatrix();
+        this.applyViewDistance();
 
         this.ambient.color.copy(sc.light.ambient.color);
         this.ambient.intensity = sc.light.ambient.intensity;
@@ -584,6 +659,7 @@ export class RaceRenderer {
         this.sunTarget.position.set(0, 0, 0);
 
         this.buildShadows();
+        this.buildBeams(nightLights);
         this.buildBoxes();
 
         // --- эффекты ---------------------------------------------------------
@@ -592,7 +668,8 @@ export class RaceRenderer {
             particles: gfx.particles,
             glow: gfx.glow,
             fogColor: sc.fog.color,
-            heightAt: this._heightAt
+            heightAt: this._heightAt,
+            night: this.nightK * nightLights
         });
         this.scene.add(this.effects.root);
         if (this.boxMesh) {
@@ -700,6 +777,41 @@ export class RaceRenderer {
         mesh.count = 0;
         mesh.visible = false;
         this.shadowMesh = mesh;
+        this.scene.add(mesh);
+    }
+
+    /**
+     * Пятна света фар на асфальте: ОДИН InstancedMesh на все восемь машин.
+     *
+     * Ночью фары обязаны не просто светиться сами, а освещать дорогу впереди.
+     * Настоящего источника света здесь быть не может (раздел 1: один ambient
+     * и один directional, никаких теней), поэтому пятно рисуется вытянутым
+     * аддитивным билбордом, лежащим на поверхности перед машиной. Днём меш
+     * не строится вовсе — ни вызова, ни треугольника.
+     */
+    buildBeams(nightLights) {
+        if (this.nightK <= 0 || nightLights <= 0) return;
+        const geom = new THREE.PlaneGeometry(1, 1);
+        geom.rotateX(-Math.PI * 0.5);
+        this.beamTex = createRadialTexture(64, 0.08, 0.8);
+        const mat = new THREE.MeshBasicMaterial({
+            map: this.beamTex,
+            color: 0xfff0cc,
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            opacity: 0.55 * this.nightK * Math.min(1.45, nightLights),
+            depthWrite: false,
+            fog: true
+        });
+        mat.name = 'carBeam';
+        const mesh = new THREE.InstancedMesh(geom, mat, MAX_CARS);
+        mesh.name = 'carBeams';
+        mesh.frustumCulled = false;
+        mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+        mesh.renderOrder = 4;
+        mesh.count = 0;
+        mesh.visible = false;
+        this.beamMesh = mesh;
         this.scene.add(mesh);
     }
 
@@ -887,6 +999,8 @@ export class RaceRenderer {
 
         const shadowArr = this.shadowMesh.instanceMatrix.array;
         let shadowN = 0;
+        const beamArr = this.beamMesh ? this.beamMesh.instanceMatrix.array : null;
+        let beamN = 0;
 
         this.effects.beginFrame();
         // В виде из кокпита своя машина скрыта (12.11) — вместе с ней
@@ -909,12 +1023,27 @@ export class RaceRenderer {
                 v.shadowSx, 1, v.shadowSz);
             shadowN++;
 
+            // пятно фар: лежит перед машиной, тянется по её курсу
+            if (beamArr && (v.flags & FLAG_GHOST) === 0) {
+                const bx = v.x + Math.sin(v.yaw) * BEAM_AHEAD;
+                const bz = v.z + Math.cos(v.yaw) * BEAM_AHEAD;
+                writeScaleYaw(beamArr, beamN * 16,
+                    bx, this.heightAt(bx, bz, v) + 0.055, bz, v.yaw,
+                    BEAM_WIDTH, 1, BEAM_LENGTH);
+                beamN++;
+            }
+
             this.effects.emitFromCar(v, step);
         }
 
         this.shadowMesh.count = shadowN;
         this.shadowMesh.visible = shadowN > 0;
         if (shadowN > 0) this.shadowMesh.instanceMatrix.needsUpdate = true;
+        if (this.beamMesh) {
+            this.beamMesh.count = beamN;
+            this.beamMesh.visible = beamN > 0;
+            if (beamN > 0) this.beamMesh.instanceMatrix.needsUpdate = true;
+        }
 
         // камера
         const local = this.localSlot >= 0 ? this.views[this.localSlot] : null;
@@ -926,6 +1055,13 @@ export class RaceRenderer {
         this.scenery.updateSky(this.camera);
         // время вершинной анимации декора: одна запись числа на всю сцену
         this.scenery.updateAnim(this.time);
+
+        // Отсечение по пирамиде видимости: сначала перечитываем камеру,
+        // потом каждый владелец геометрии сам решает, что показать.
+        // Порядок важен — камера к этому моменту уже посчитала матрицы.
+        this.culler.update(this.camera, this.cullDistance);
+        this.trackMeshes.cull(this.culler);
+        this.scenery.cull(this.culler);
 
         this.effects.update(step, this.camera, target ? target.speed : 0);
     }
@@ -1322,6 +1458,13 @@ export class RaceRenderer {
             this.shadowTex.dispose();
             this.shadowMesh = null;
             this.shadowTex = null;
+        }
+        if (this.beamMesh) {
+            this.scene.remove(this.beamMesh);
+            disposeObject(this.beamMesh);
+            this.beamTex.dispose();
+            this.beamMesh = null;
+            this.beamTex = null;
         }
         if (this.boxMesh) {
             this.scene.remove(this.boxMesh);
