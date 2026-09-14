@@ -706,9 +706,199 @@ function scatter(ctx, rng, opts, cb) {
 }
 
 /**
+ * Поиск ближайшей выборки осевой линии по мировой точке.
+ *
+ * Нужен один раз при сборке: по нему каждый экземпляр декора получает свою
+ * корзину вдоль дуги. Сетка та же по духу, что у makeClearance, но шаг
+ * крупнее: точность до выборки здесь не важна, важно попасть в корзину.
+ * Возвращает -1, если рядом трассы нет (горные пики за краем карты) — такие
+ * объекты уходят в «свободный» хвост и проверяются поштучно.
+ */
+function makeLocator(T) {
+    const cell = 32.0;
+    const map = new Map();
+    for (let i = 0; i < T.count; i++) {
+        const key = Math.floor(T.x[i] / cell) * 100003 + Math.floor(T.z[i] / cell);
+        let arr = map.get(key);
+        if (!arr) {
+            arr = [];
+            map.set(key, arr);
+        }
+        arr.push(i);
+    }
+    return function (x, z) {
+        const cx = Math.floor(x / cell);
+        const cz = Math.floor(z / cell);
+        let best = -1;
+        let bestD2 = Infinity;
+        for (let ring = 1; ring <= 3; ring++) {
+            for (let dx = -ring; dx <= ring; dx++) {
+                for (let dz = -ring; dz <= ring; dz++) {
+                    const arr = map.get((cx + dx) * 100003 + (cz + dz));
+                    if (!arr) continue;
+                    for (let k = 0; k < arr.length; k++) {
+                        const i = arr[k];
+                        const ddx = x - T.x[i];
+                        const ddz = z - T.z[i];
+                        const d2 = ddx * ddx + ddz * ddz;
+                        if (d2 < bestD2) {
+                            bestD2 = d2;
+                            best = i;
+                        }
+                    }
+                }
+            }
+            if (best >= 0) return best;
+        }
+        return -1;
+    };
+}
+
+/**
+ * Один тип декора: источник матриц, раскладка по корзинам и покадровое
+ * отсечение.
+ *
+ * Экземпляры в источнике отсортированы по корзинам, поэтому видимая корзина
+ * копируется одним прогоном подряд идущих чисел. За корзинами идёт
+ * «свободный» хвост — объекты без привязки к дуге, они проверяются поштучно.
+ *
+ * В кадре: bucketCount проверок сферы плюс копирование только видимых
+ * матриц. Ни одной аллокации — в том числе диапазон загрузки в GPU
+ * (updateRanges) описывается заранее выделенным объектом.
+ */
+class InstancedSet {
+    constructor(mesh, total, bucketCount, far) {
+        this.mesh = mesh;
+        this.total = total;
+        this.bucketCount = bucketCount;
+        this.far = !!far;
+        this.srcM = new Float32Array(total * 16);
+        this.srcC = null;
+        this.sphere = new Float32Array(total * 4);
+        this.bucketStart = new Int32Array(bucketCount + 1);
+        this.bucketSphere = new Float32Array(bucketCount * 4);
+        this.freeStart = total;
+        this.rangeM = { start: 0, count: 0 };
+        this.rangeC = { start: 0, count: 0 };
+    }
+
+    /** Показать все экземпляры (отсечение выключено). */
+    showAll() {
+        const mesh = this.mesh;
+        const dst = mesh.instanceMatrix.array;
+        const src = this.srcM;
+        for (let k = 0, n = src.length; k < n; k++) dst[k] = src[k];
+        if (this.srcC && mesh.instanceColor) {
+            const dc = mesh.instanceColor.array;
+            const sc = this.srcC;
+            for (let k = 0, n = sc.length; k < n; k++) dc[k] = sc[k];
+        }
+        this.apply(this.total);
+    }
+
+    cull(culler) {
+        if (!culler || !culler.enabled) {
+            this.showAll();
+            return;
+        }
+        const mesh = this.mesh;
+        const dst = mesh.instanceMatrix.array;
+        const dstC = mesh.instanceColor ? mesh.instanceColor.array : null;
+        const srcM = this.srcM;
+        const srcC = this.srcC;
+        const bs = this.bucketStart;
+        const bsp = this.bucketSphere;
+        const far = this.far;
+        let n = 0;
+
+        for (let b = 0; b < this.bucketCount; b++) {
+            const a0 = bs[b];
+            const a1 = bs[b + 1];
+            if (a1 <= a0) continue;
+            const o = b * 4;
+            const r = bsp[o + 3];
+            if (r < 0) continue;
+            const ok = far
+                ? culler.inFrustum(bsp[o], bsp[o + 1], bsp[o + 2], r)
+                : culler.visible(bsp[o], bsp[o + 1], bsp[o + 2], r);
+            if (!ok) continue;
+            let so = a0 * 16;
+            let dofs = n * 16;
+            const cnt = (a1 - a0) * 16;
+            for (let k = 0; k < cnt; k++) dst[dofs + k] = srcM[so + k];
+            if (dstC) {
+                let sc = a0 * 3;
+                let dc = n * 3;
+                const c3 = (a1 - a0) * 3;
+                for (let k = 0; k < c3; k++) dstC[dc + k] = srcC[sc + k];
+            }
+            n += a1 - a0;
+        }
+
+        // «свободный» хвост: объекты вне дуги, проверяются по одному
+        const sph = this.sphere;
+        for (let i = this.freeStart; i < this.total; i++) {
+            const o = i * 4;
+            const r = sph[o + 3];
+            if (r < 0) continue;
+            const ok = far
+                ? culler.inFrustum(sph[o], sph[o + 1], sph[o + 2], r)
+                : culler.visible(sph[o], sph[o + 1], sph[o + 2], r);
+            if (!ok) continue;
+            const so = i * 16;
+            const dofs = n * 16;
+            for (let k = 0; k < 16; k++) dst[dofs + k] = srcM[so + k];
+            if (dstC) {
+                const sc = i * 3;
+                const dc = n * 3;
+                dstC[dc] = srcC[sc];
+                dstC[dc + 1] = srcC[sc + 1];
+                dstC[dc + 2] = srcC[sc + 2];
+            }
+            n++;
+        }
+
+        this.apply(n);
+    }
+
+    /**
+     * Выставить count и отметить к загрузке только занятую часть буфера.
+     *
+     * Диапазон загрузки важен: буфер матриц рассчитан на ВЕСЬ декор трассы,
+     * а видима обычно четверть. Без диапазона three.js гнал бы в GPU весь
+     * буфер каждый кадр и половина выигрыша ушла бы в шину.
+     */
+    apply(n) {
+        const mesh = this.mesh;
+        mesh.count = n;
+        mesh.visible = n > 0;
+        if (n === 0) return;
+        const im = mesh.instanceMatrix;
+        im.updateRanges.length = 0;
+        this.rangeM.start = 0;
+        this.rangeM.count = n * 16;
+        im.updateRanges.push(this.rangeM);
+        im.needsUpdate = true;
+        if (mesh.instanceColor) {
+            const ic = mesh.instanceColor;
+            ic.updateRanges.length = 0;
+            this.rangeC.start = 0;
+            this.rangeC.count = n * 3;
+            ic.updateRanges.push(this.rangeC);
+            ic.needsUpdate = true;
+        }
+    }
+}
+
+/**
  * Сборка InstancedMesh из списка размещений.
  * opts: { ao } — параметры запекания контактного затенения в вершинные цвета
- *       (см. bakeContactAO), { material } — свой материал вместо общего.
+ *       (см. bakeContactAO), { material } — свой материал вместо общего,
+ *       { far } — объект заведомо дальше тумана и отсекается только
+ *       по пирамиде (горные пики).
+ *
+ * Здесь же экземпляры раскладываются по корзинам вдоль дуги и считаются их
+ * ограничивающие сферы: всё, что нужно покадровому отсечению.
  */
 function addInstanced(ctx, name, geometry, placements, opts) {
     if (!placements.length) {
@@ -717,33 +907,97 @@ function addInstanced(ctx, name, geometry, placements, opts) {
     }
     const o = opts || {};
     if (ctx.ao && o.ao) bakeContactAO(geometry, o.ao);
-    const mesh = new THREE.InstancedMesh(geometry, o.material || ctx.material, placements.length);
+    if (!geometry.boundingSphere) geometry.computeBoundingSphere();
+
+    const n = placements.length;
+    const bucketCount = ctx.bucketCount;
+
+    // 1. корзина каждого размещения: -1 — вне дуги
+    const bucketOf = new Int32Array(n);
+    const counts = new Int32Array(bucketCount + 1); // последняя ячейка — свободные
+    for (let i = 0; i < n; i++) {
+        const p = placements[i];
+        const si = ctx.locate(p.x, p.z);
+        let b = bucketCount; // свободный хвост
+        if (si >= 0) {
+            const s = ctx.T.s ? ctx.T.s[si] : si * ctx.T.step;
+            b = Math.floor(s / ctx.bucketLen);
+            if (b < 0) b = 0;
+            else if (b >= bucketCount) b = bucketCount - 1;
+        }
+        bucketOf[i] = b;
+        counts[b]++;
+    }
+
+    // 2. префиксные суммы -> место каждого экземпляра в источнике
+    const start = new Int32Array(bucketCount + 2);
+    for (let b = 0; b <= bucketCount; b++) start[b + 1] = start[b] + counts[b];
+    const cursor = new Int32Array(bucketCount + 1);
+    for (let b = 0; b <= bucketCount; b++) cursor[b] = start[b];
+
+    const mesh = new THREE.InstancedMesh(geometry, o.material || ctx.material, n);
     mesh.name = name;
     mesh.frustumCulled = false;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.count = 0;
+    mesh.visible = false;
+
+    let anyColor = false;
+    for (let i = 0; i < n; i++) if (placements[i].color) { anyColor = true; break; }
+    if (anyColor) {
+        // 12.11: instanceColor доходит до шейдера только при vertexColors
+        mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(n * 3).fill(1), 3);
+        mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    }
+
+    const set = new InstancedSet(mesh, n, bucketCount, !!o.far);
+    set.freeStart = start[bucketCount];
+    for (let b = 0; b <= bucketCount; b++) set.bucketStart[b] = start[b];
+    if (anyColor) set.srcC = new Float32Array(n * 3).fill(1);
+
     const m = new THREE.Matrix4();
     const q = new THREE.Quaternion();
     const pos = new THREE.Vector3();
     const scl = new THREE.Vector3();
     const axis = new THREE.Vector3(0, 1, 0);
     const col = new THREE.Color();
-    let anyColor = false;
-    for (let i = 0; i < placements.length; i++) {
+    const sph = new THREE.Sphere();
+    const accums = [];
+    for (let b = 0; b < bucketCount; b++) accums.push(new SphereAccum());
+
+    for (let i = 0; i < n; i++) {
         const p = placements[i];
+        const b = bucketOf[i];
+        const slot = cursor[b]++;
+
         q.setFromAxisAngle(axis, p.yaw || 0);
         pos.set(p.x, p.y, p.z);
         scl.set(p.sx === undefined ? 1 : p.sx, p.sy === undefined ? 1 : p.sy, p.sz === undefined ? 1 : p.sz);
         m.compose(pos, q, scl);
-        mesh.setMatrixAt(i, m);
-        if (p.color) {
+        m.toArray(set.srcM, slot * 16);
+
+        // ограничивающая сфера экземпляра: сфера геометрии под его матрицей
+        sph.copy(geometry.boundingSphere).applyMatrix4(m);
+        const so = slot * 4;
+        set.sphere[so] = sph.center.x;
+        set.sphere[so + 1] = sph.center.y;
+        set.sphere[so + 2] = sph.center.z;
+        set.sphere[so + 3] = sph.radius;
+        if (b < bucketCount) accums[b].add(sph.center.x, sph.center.y, sph.center.z, sph.radius);
+
+        if (p.color && set.srcC) {
             toColor(p.color, col);
-            mesh.setColorAt(i, col);
-            anyColor = true;
+            set.srcC[slot * 3] = col.r;
+            set.srcC[slot * 3 + 1] = col.g;
+            set.srcC[slot * 3 + 2] = col.b;
         }
     }
-    mesh.instanceMatrix.needsUpdate = true;
-    if (anyColor && mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+    for (let b = 0; b < bucketCount; b++) accums[b].writeTo(set.bucketSphere, b * 4);
+
     ctx.group.add(mesh);
     ctx.instances[name] = mesh;
+    ctx.sets.push(set);
     return mesh;
 }
 
@@ -1222,7 +1476,9 @@ function buildPeaks(ctx, seed) {
             sz: h * rng.range(1.1, 1.9)
         });
     }
-    addInstanced(ctx, 'peaks', peak, list);
+    // Пики стоят за краем карты и за пределом тумана, но обязаны быть
+    // видны силуэтом на небе — значит отсекаются только по пирамиде.
+    addInstanced(ctx, 'peaks', peak, list, { far: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,11 +1895,11 @@ function buildSkyDome(env, Q) {
 }
 
 /** Плоские облака: несколько сплюснутых кластеров одной слитой геометрией. */
-function buildClouds(env, Q, rng) {
+function buildClouds(env, Q, rng, share) {
     const b = new MeshBuilder();
     const base = toColor(env.cloud);
     const shadow = new THREE.Color(base.r * 0.82, base.g * 0.85, base.b * 0.9);
-    const n = Q.clouds;
+    const n = Math.max(1, Math.round(Q.clouds * (share === undefined ? 1 : share)));
     for (let k = 0; k < n; k++) {
         const a = (k / n) * Math.PI * 2 + rng.spread(0.4);
         const dist = rng.range(280, 620);
