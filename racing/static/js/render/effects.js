@@ -136,8 +136,11 @@ export function createRadialTexture(size, hardness, softness) {
     g.fillRect(0, 0, size, size);
     const tex = new THREE.CanvasTexture(canvas);
     tex.colorSpace = THREE.SRGBColorSpace;
-    tex.generateMipmaps = true;
-    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    // Мипмапы частицам не нужны: они всегда крупные на экране, зато при
+    // выборе старшего уровня квад превращается в ровный светлый прямоугольник
+    // с жёсткими краями — этот артефакт ловился на взрывах.
+    tex.generateMipmaps = false;
+    tex.minFilter = THREE.LinearFilter;
     tex.magFilter = THREE.LinearFilter;
     tex.wrapS = THREE.ClampToEdgeWrapping;
     tex.wrapT = THREE.ClampToEdgeWrapping;
@@ -399,7 +402,7 @@ export class Effects {
             map: this.smokeTex,
             vertexColors: true,
             transparent: true,
-            opacity: 0.52,
+            opacity: 0.34,
             depthWrite: false,
             side: THREE.FrontSide,
             forceSinglePass: true
@@ -444,14 +447,20 @@ export class Effects {
         this.group.add(this.mineMesh);
 
         // --- щиты -----------------------------------------------------------
+        // Купол ярче по «экватору» и глуше к полюсу: аддитивная сфера с
+        // ровным цветом выглядит сплошным пятном, а так читается пузырь.
         this.shieldGeom = solidify(
             new THREE.IcosahedronGeometry(1, Q.shieldDetail),
-            toColor('#6fd0ff')
+            toColor('#6fd0ff'),
+            function (x, y, z, i, c) {
+                const k = 1 - Math.abs(y);
+                c.setRGB(0.28 + k * 0.5, 0.62 + k * 0.38, 0.9 + k * 0.1);
+            }
         );
         this.shieldMat = new THREE.MeshBasicMaterial({
             vertexColors: true,
             transparent: true,
-            opacity: 0.3,
+            opacity: 0.16,
             blending: THREE.AdditiveBlending,
             depthWrite: false,
             fog: false,
@@ -582,9 +591,9 @@ export class Effects {
                 SP.vx = -fx * speed * 0.12 + (Math.random() - 0.5) * 1.1 - view.vlat * 0.15 * lx;
                 SP.vy = 0.7 + Math.random() * 0.9;
                 SP.vz = -fz * speed * 0.12 + (Math.random() - 0.5) * 1.1 - view.vlat * 0.15 * lz;
-                SP.life = 0.75 + Math.random() * 0.45;
-                SP.s0 = 0.55;
-                SP.s1 = 2.4 + Math.random() * 1.0;
+                SP.life = 0.5 + Math.random() * 0.35;
+                SP.s0 = 0.32;
+                SP.s1 = 1.25 + Math.random() * 0.6;
                 SP.r0 = 0.93; SP.g0 = 0.93; SP.b0 = 0.95;
                 SP.r1 = this.fogR; SP.g1 = this.fogG; SP.b1 = this.fogB;
                 SP.damp = 1.6;
@@ -618,9 +627,9 @@ export class Effects {
                     SP.vx = -fx * sp + lx * side * (0.6 + Math.random() * 2.2) + (Math.random() - 0.5);
                     SP.vy = 1.4 + Math.random() * 3.0;
                     SP.vz = -fz * sp + lz * side * (0.6 + Math.random() * 2.2) + (Math.random() - 0.5);
-                    SP.life = 0.22 + Math.random() * 0.22;
-                    SP.s0 = 0.3 + level * 0.05;
-                    SP.s1 = 0.04;
+                    SP.life = 0.2 + Math.random() * 0.2;
+                    SP.s0 = 0.075 + level * 0.012;
+                    SP.s1 = 0.015;
                     SP.r0 = col[0]; SP.g0 = col[1]; SP.b0 = col[2];
                     SP.r1 = 0; SP.g1 = 0; SP.b1 = 0;
                     SP.damp = 1.1;
@@ -628,7 +637,7 @@ export class Effects {
                     SP.rot = 0;
                     SP.rotV = 0;
                     SP.mode = 1;
-                    SP.stretch = 2.6;
+                    SP.stretch = 9.0;
                     this.glow.spawn();
                 }
             }
@@ -649,9 +658,9 @@ export class Effects {
                 SP.vx = -fx * (5.0 + Math.random() * 5.0) + (Math.random() - 0.5) * 0.7;
                 SP.vy = 0.4 + Math.random() * 0.8;
                 SP.vz = -fz * (5.0 + Math.random() * 5.0) + (Math.random() - 0.5) * 0.7;
-                SP.life = 0.24 + Math.random() * 0.2;
-                SP.s0 = 0.62;
-                SP.s1 = 0.12;
+                SP.life = 0.22 + Math.random() * 0.18;
+                SP.s0 = 0.2;
+                SP.s1 = 0.04;
                 const hot = Math.random();
                 SP.r0 = 1.0;
                 SP.g0 = 0.5 + hot * 0.42;
@@ -662,7 +671,7 @@ export class Effects {
                 SP.rot = 0;
                 SP.rotV = 0;
                 SP.mode = 1;
-                SP.stretch = 3.4;
+                SP.stretch = 7.0;
                 this.glow.spawn();
             }
         } else {
@@ -681,9 +690,9 @@ export class Effects {
                 SP.vx = -fx * speed * 0.2 + (Math.random() - 0.5) * 1.4;
                 SP.vy = 0.9 + Math.random() * 1.1;
                 SP.vz = -fz * speed * 0.2 + (Math.random() - 0.5) * 1.4;
-                SP.life = 0.6 + Math.random() * 0.4;
-                SP.s0 = 0.6;
-                SP.s1 = 2.6;
+                SP.life = 0.45 + Math.random() * 0.3;
+                SP.s0 = 0.35;
+                SP.s1 = 1.5;
                 SP.r0 = 0.64; SP.g0 = 0.56; SP.b0 = 0.42;
                 SP.r1 = this.fogR; SP.g1 = this.fogG; SP.b1 = this.fogB;
                 SP.damp = 1.8;
@@ -709,9 +718,9 @@ export class Effects {
                 SP.vx = (Math.random() - 0.5) * 1.6;
                 SP.vy = 1.2 + Math.random() * 1.2;
                 SP.vz = (Math.random() - 0.5) * 1.6;
-                SP.life = 0.55 + Math.random() * 0.3;
-                SP.s0 = 0.5;
-                SP.s1 = 1.9;
+                SP.life = 0.45 + Math.random() * 0.25;
+                SP.s0 = 0.3;
+                SP.s1 = 1.1;
                 SP.r0 = 0.32; SP.g0 = 0.32; SP.b0 = 0.34;
                 SP.r1 = this.fogR; SP.g1 = this.fogG; SP.b1 = this.fogB;
                 SP.damp = 1.5;
@@ -731,7 +740,7 @@ export class Effects {
                 this.shieldCount++;
                 const flash = this.shieldFlash[slot];
                 const pulse = 1 + Math.sin(this.time * 5.0 + slot) * 0.035 + flash * 0.25;
-                const r = (view.halfLength + 0.55) * pulse;
+                const r = (view.halfLength + 0.2) * pulse;
                 const arr = this.shieldMesh.instanceMatrix.array;
                 const o = idx * 16;
                 writeScaleYaw(arr, o, view.x, view.y + view.halfLength * 0.42, view.z,
@@ -763,8 +772,8 @@ export class Effects {
             SP.vy = 1.4 + Math.random() * 1.6;
             SP.vz = ca * 5.5;
             SP.life = 0.3 + Math.random() * 0.18;
-            SP.s0 = 0.5;
-            SP.s1 = 0.05;
+            SP.s0 = 0.12;
+            SP.s1 = 0.02;
             SP.r0 = 0.5; SP.g0 = 0.85; SP.b0 = 1.0;
             SP.r1 = 0; SP.g1 = 0; SP.b1 = 0;
             SP.damp = 2.6;
@@ -772,7 +781,7 @@ export class Effects {
             SP.rot = 0;
             SP.rotV = 0;
             SP.mode = 1;
-            SP.stretch = 2.2;
+            SP.stretch = 7.5;
             this.glow.spawn();
         }
     }
@@ -785,16 +794,29 @@ export class Effects {
         const p = power === undefined ? 1 : power;
         const scale = this.Q.explosionScale * p;
 
-        // ядро вспышки
-        SP.x = x; SP.y = y + 0.6; SP.z = z;
-        SP.vx = 0; SP.vy = 1.2; SP.vz = 0;
-        SP.life = 0.26;
-        SP.s0 = 1.6 * scale;
-        SP.s1 = 5.2 * scale;
+        // Ядро вспышки. Билборд вертикальный, поэтому его нижняя половина
+        // уходит под полотно и обрезается по глубине ровной прямой линией.
+        // Чтобы этот срез не читался как прямоугольник поперёк дороги,
+        // вспышка поднята выше кузова и заметно компактнее.
+        SP.x = x; SP.y = y + 1.15; SP.z = z;
+        SP.vx = 0; SP.vy = 1.6; SP.vz = 0;
+        SP.life = 0.24;
+        SP.s0 = 1.0 * scale;
+        SP.s1 = 2.9 * scale;
         SP.r0 = 1.0; SP.g0 = 0.92; SP.b0 = 0.7;
-        SP.r1 = 0.4; SP.g1 = 0.1; SP.b1 = 0.0;
+        SP.r1 = 0.3; SP.g1 = 0.06; SP.b1 = 0.0;
         SP.damp = 3.0; SP.grav = 0;
         SP.rot = 0; SP.rotV = 0; SP.mode = 0; SP.stretch = 1;
+        this.glow.spawn();
+
+        // вторая, короткая и очень яркая вспышка в самой точке попадания
+        SP.y = y + 0.75;
+        SP.vy = 0.6;
+        SP.life = 0.12;
+        SP.s0 = 0.5 * scale;
+        SP.s1 = 1.5 * scale;
+        SP.r0 = 1.0; SP.g0 = 1.0; SP.b0 = 0.95;
+        SP.r1 = 1.0; SP.g1 = 0.5; SP.b1 = 0.1;
         this.glow.spawn();
 
         const sparks = Math.round(22 * scale);
@@ -807,14 +829,14 @@ export class Effects {
             SP.vy = Math.sin(e) * sp * 0.8 + 2;
             SP.vz = Math.cos(a) * Math.cos(e) * sp;
             SP.life = 0.35 + Math.random() * 0.4;
-            SP.s0 = 0.42;
-            SP.s1 = 0.05;
+            SP.s0 = 0.13;
+            SP.s1 = 0.02;
             SP.r0 = 1.0; SP.g0 = 0.55 + Math.random() * 0.3; SP.b0 = 0.15;
             SP.r1 = 0.3; SP.g1 = 0.05; SP.b1 = 0;
             SP.damp = 1.2;
             SP.grav = -11.0;
             SP.rot = 0; SP.rotV = 0;
-            SP.mode = 1; SP.stretch = 3.0;
+            SP.mode = 1; SP.stretch = 8.0;
             this.glow.spawn();
         }
 
@@ -828,9 +850,9 @@ export class Effects {
             SP.vx = Math.sin(a) * sp;
             SP.vy = 1.6 + Math.random() * 2.4;
             SP.vz = Math.cos(a) * sp;
-            SP.life = 0.9 + Math.random() * 0.7;
-            SP.s0 = 1.0 * scale;
-            SP.s1 = 4.4 * scale;
+            SP.life = 0.7 + Math.random() * 0.5;
+            SP.s0 = 0.6 * scale;
+            SP.s1 = 2.6 * scale;
             SP.r0 = 0.26; SP.g0 = 0.24; SP.b0 = 0.24;
             SP.r1 = this.fogR; SP.g1 = this.fogG; SP.b1 = this.fogB;
             SP.damp = 1.4;
@@ -957,14 +979,14 @@ export class Effects {
                     SP.vx = -fx * 3.0 + (Math.random() - 0.5) * 1.2;
                     SP.vy = 0.6 + Math.random() * 0.8;
                     SP.vz = -fz * 3.0 + (Math.random() - 0.5) * 1.2;
-                    SP.life = 0.3 + Math.random() * 0.2;
-                    SP.s0 = 0.5;
-                    SP.s1 = 0.08;
+                    SP.life = 0.28 + Math.random() * 0.18;
+                    SP.s0 = 0.17;
+                    SP.s1 = 0.03;
                     SP.r0 = 1.0; SP.g0 = 0.62; SP.b0 = 0.2;
                     SP.r1 = 0.2; SP.g1 = 0.04; SP.b1 = 0;
                     SP.damp = 2.4; SP.grav = 1.2;
                     SP.rot = 0; SP.rotV = 0;
-                    SP.mode = 1; SP.stretch = 2.6;
+                    SP.mode = 1; SP.stretch = 6.5;
                     this.glow.spawn();
                 }
             }
@@ -1024,7 +1046,7 @@ export class Effects {
             const bob = Math.sin(t * 2.0 + i * 0.9) * 0.13;
             const s = g * (0.92 + Math.sin(t * 4.0 + i) * 0.05);
             writeScaleYaw(arr, n * 16,
-                this.boxX[i], this.boxY[i] + 1.05 + bob, this.boxZ[i],
+                this.boxX[i], this.boxY[i] + 0.78 + bob, this.boxZ[i],
                 t * 1.5 + i * 0.7, s, s, s);
             n++;
         }

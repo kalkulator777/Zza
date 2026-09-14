@@ -61,9 +61,9 @@ import {
 // ---------------------------------------------------------------------------
 
 export const QUALITY_PRESETS = {
-    low: { renderScale: 0.5, shadowSeg: 8, cockpitDetail: 0, shadowOpacity: 0.34 },
-    medium: { renderScale: 0.75, shadowSeg: 14, cockpitDetail: 1, shadowOpacity: 0.4 },
-    high: { renderScale: 1.0, shadowSeg: 22, cockpitDetail: 2, shadowOpacity: 0.44 }
+    low: { renderScale: 0.5, cockpitDetail: 0, shadowOpacity: 0.5 },
+    medium: { renderScale: 0.75, cockpitDetail: 1, shadowOpacity: 0.56 },
+    high: { renderScale: 1.0, cockpitDetail: 2, shadowOpacity: 0.6 }
 };
 
 export const CAMERA_CHASE = 0;
@@ -456,8 +456,10 @@ export class RaceRenderer {
             view.halfLength = mesh.shape.length * 0.5;
             view.rearZ = -mesh.shape.wheelbase * 0.5 - 0.1;
             view.wheelRadius = mesh.shape.wheel_radius;
-            view.shadowSx = mesh.shape.width * 0.78;
-            view.shadowSz = mesh.shape.length * 0.62;
+            // Пятно тени чуть ШИРЕ габарита: иначе оно целиком скрывается под
+            // кузовом и машина выглядит висящей в воздухе.
+            view.shadowSx = mesh.shape.width * 1.8;
+            view.shadowSz = mesh.shape.length * 1.3;
             view.hint = -1;
             view.wheelSpin = 0;
             view.roll = 0;
@@ -481,7 +483,7 @@ export class RaceRenderer {
     buildShadows() {
         const geom = new THREE.PlaneGeometry(1, 1);
         geom.rotateX(-Math.PI * 0.5); // в плоскость XZ, лицом вверх
-        this.shadowTex = createRadialTexture(64, 0.4, 0.78);
+        this.shadowTex = createRadialTexture(64, 0.6, 0.94);
         const mat = new THREE.MeshBasicMaterial({
             map: this.shadowTex,
             color: 0x06080c,
@@ -526,17 +528,18 @@ export class RaceRenderer {
         }
 
         // восьмигранник с градиентом: читается как аркадный бонус-куб
-        const geom = solidify(new THREE.OctahedronGeometry(0.92, 0), toColor('#ffd24a'),
+        const geom = solidify(new THREE.OctahedronGeometry(0.5, 0), toColor('#ffd24a'),
             function (x, y, z, i, c) {
+                // нижние грани иначе уходят в тень и бокс читается как камень
                 const t = y > 0 ? 1 : 0;
-                c.setRGB(1.0, 0.82 + t * 0.16, 0.28 + t * 0.42);
+                c.setRGB(1.0, 0.88 + t * 0.1, 0.42 + t * 0.36);
             });
-        geom.scale(1, 1.2, 1);
+        geom.scale(1, 1.22, 1);
         const mat = new THREE.MeshLambertMaterial({
             vertexColors: true,
             flatShading: true,
-            emissive: new THREE.Color('#ffae1a'),
-            emissiveIntensity: 0.55
+            emissive: new THREE.Color('#ffa010'),
+            emissiveIntensity: 0.8
         });
         mat.name = 'itemBox';
         const mesh = new THREE.InstancedMesh(geom, mat, n);
@@ -568,7 +571,6 @@ export class RaceRenderer {
         const panel = new THREE.Mesh(panelGeom, panelMat);
         panel.name = 'cockpitDash';
         panel.frustumCulled = false;
-        panel.position.set(0, -0.34, -0.52);
         dash.add(panel);
         root.add(dash);
 
@@ -579,8 +581,8 @@ export class RaceRenderer {
         const wheel = new THREE.Mesh(wheelGeom, wheelMat);
         wheel.name = 'cockpitWheel';
         wheel.frustumCulled = false;
-        wheel.position.set(0, -0.26, -0.44);
-        wheel.rotation.x = -0.34;
+        wheel.position.set(0, -0.5, -0.84);
+        wheel.rotation.x = -0.36;
         root.add(wheel);
 
         this.camera.add(root);
@@ -1163,99 +1165,99 @@ export class RaceRenderer {
 // ---------------------------------------------------------------------------
 
 /**
- * Панель приборов: изогнутый козырёк, два круглых прибора и стойки по краям.
- * Одна геометрия — один draw call.
+ * Панель приборов, стойки и линия крыши. Одна геометрия — один draw call.
+ *
+ * Все детали строятся сразу в СИСТЕМЕ КАМЕРЫ: начало координат — глаз
+ * водителя, -Z смотрит вперёд, +Y вверх. Узел висит на камере, поэтому в
+ * кадре его не надо ни двигать, ни пересчитывать. Размеры подобраны под
+ * вертикальный угол обзора около 58 градусов: панель занимает нижнюю
+ * четверть кадра, стойки стоят по краям, крыша срезает верх.
  */
 function buildDashGeometry(detail) {
     const geoms = [];
     const mats = [];
-    const dark = toColor('#15181e');
-    const plastic = toColor('#23272f');
-    const glow = toColor('#48d1a0');
+    const dark = toColor('#14171d');
+    const plastic = toColor('#262b33');
+    const glow = toColor('#4de3a8');
     const m = new THREE.Matrix4();
 
-    // основной массив панели
-    const body = solidify(new THREE.BoxGeometry(1.5, 0.3, 0.5), plastic);
-    m.makeRotationX(0.22);
-    m.setPosition(0, -0.08, 0.02);
-    geoms.push(body);
-    mats.push(m.clone());
+    function part(geom, x, y, z, rx) {
+        const mm = new THREE.Matrix4().makeRotationX(rx || 0);
+        mm.setPosition(x, y, z);
+        geoms.push(geom);
+        mats.push(mm);
+    }
+
+    // верхняя плоскость панели и её передняя стенка
+    part(solidify(new THREE.BoxGeometry(2.6, 0.1, 0.8), plastic), 0, -0.56, -1.16, 0.12);
+    part(solidify(new THREE.BoxGeometry(2.6, 0.6, 0.12), dark), 0, -0.9, -0.8, 0);
 
     // козырёк над приборами
-    const hood = solidify(new THREE.BoxGeometry(0.72, 0.06, 0.3), dark);
-    m.makeRotationX(-0.35);
-    m.setPosition(0, 0.14, 0.06);
-    geoms.push(hood);
-    mats.push(m.clone());
+    part(solidify(new THREE.BoxGeometry(0.82, 0.05, 0.28), dark), 0, -0.36, -1.0, -0.4);
 
-    // два прибора
-    const seg = detail > 0 ? 12 : 6;
+    // два круглых прибора, повёрнутых лицом к водителю
+    const seg = detail > 0 ? 14 : 7;
     for (let k = -1; k <= 1; k += 2) {
-        const face = solidify(new THREE.CylinderGeometry(0.12, 0.12, 0.02, seg), dark);
-        m.makeRotationX(Math.PI * 0.5 + 0.22);
-        m.setPosition(k * 0.17, 0.04, 0.2);
-        geoms.push(face);
-        mats.push(m.clone());
-
-        const ring = solidify(new THREE.TorusGeometry(0.12, 0.015, 4, seg), glow);
-        m.makeRotationX(0.22);
-        m.setPosition(k * 0.17, 0.045, 0.21);
-        geoms.push(ring);
-        mats.push(m.clone());
+        part(solidify(new THREE.CylinderGeometry(0.1, 0.1, 0.02, seg), dark),
+            k * 0.17, -0.47, -0.96, Math.PI * 0.5 + 0.2);
+        part(solidify(new THREE.TorusGeometry(0.1, 0.012, 4, seg), glow),
+            k * 0.17, -0.47, -0.95, 0.2);
     }
 
     if (detail > 0) {
-        // стойки по краям кадра
+        // Стойки лобового стекла. Стоят далеко и узко: вблизи они съедали бы
+        // треть кадра, а кокпит должен рамку намекать, а не закрывать дорогу.
         for (let k = -1; k <= 1; k += 2) {
-            const pillar = solidify(new THREE.BoxGeometry(0.1, 1.1, 0.1), dark);
-            m.makeRotationZ(k * 0.2);
-            m.setPosition(k * 0.82, 0.5, 0.1);
+            const pillar = solidify(new THREE.BoxGeometry(0.1, 1.7, 0.1), dark);
+            const mm = new THREE.Matrix4().makeRotationZ(k * 0.13);
+            mm.setPosition(k * 1.26, 0.05, -1.6);
             geoms.push(pillar);
-            mats.push(m.clone());
+            mats.push(mm);
         }
     }
     if (detail > 1) {
-        // центральная консоль
-        const console3 = solidify(new THREE.BoxGeometry(0.28, 0.12, 0.16), dark);
-        m.makeRotationX(0.22);
-        m.setPosition(0, 0.02, 0.24);
-        geoms.push(console3);
-        mats.push(m.clone());
+        // центральная консоль и два дефлектора обдува
+        part(solidify(new THREE.BoxGeometry(0.3, 0.1, 0.14), dark), 0, -0.52, -0.92, 0.12);
+        for (let k = -1; k <= 1; k += 2) {
+            part(solidify(new THREE.BoxGeometry(0.14, 0.05, 0.08), plastic),
+                k * 0.56, -0.52, -0.94, 0.12);
+        }
     }
 
+    void m;
     const merged = mergeGeometries(geoms, mats);
     for (let i = 0; i < geoms.length; i++) geoms[i].dispose();
     return merged;
 }
 
-/** Руль: обод, три спицы и ступица. */
+/**
+ * Руль: обод, три спицы и ступица. Строится в плоскости XY с осью вдоль Z,
+ * то есть уже «лицом» к водителю; наклон задаёт rotation.x узла.
+ */
 function buildSteeringWheelGeometry(detail) {
     const geoms = [];
     const mats = [];
-    const rim = toColor('#1b1e24');
-    const trim = toColor('#c2c8d2');
-    const m = new THREE.Matrix4();
-    const seg = detail > 0 ? 16 : 8;
+    const rim = toColor('#181b21');
+    const trim = toColor('#b9c0ca');
+    const seg = detail > 0 ? 18 : 9;
 
-    const ring = solidify(new THREE.TorusGeometry(0.17, 0.022, 4, seg), rim);
-    geoms.push(ring);
+    geoms.push(solidify(new THREE.TorusGeometry(0.19, 0.024, 4, seg), rim));
     mats.push(new THREE.Matrix4());
 
     for (let k = 0; k < 3; k++) {
         const a = -Math.PI * 0.5 + (k / 3) * Math.PI * 2;
-        const spoke = solidify(new THREE.BoxGeometry(0.145, 0.022, 0.02), rim);
-        m.makeRotationZ(a);
-        const off = new THREE.Matrix4().makeTranslation(0.085, 0, 0);
-        m.multiply(off);
+        const spoke = solidify(new THREE.BoxGeometry(0.16, 0.025, 0.022), rim);
+        const mm = new THREE.Matrix4().makeRotationZ(a);
+        mm.multiply(new THREE.Matrix4().makeTranslation(0.095, 0, 0));
         geoms.push(spoke);
-        mats.push(m.clone());
+        mats.push(mm);
     }
 
-    const hub = solidify(new THREE.CylinderGeometry(0.045, 0.045, 0.03, seg > 8 ? 8 : 6), trim);
-    m.makeRotationX(Math.PI * 0.5);
-    m.setPosition(0, 0, 0.01);
+    const hub = solidify(new THREE.CylinderGeometry(0.05, 0.05, 0.03, seg > 9 ? 8 : 6), trim);
+    const hm = new THREE.Matrix4().makeRotationX(Math.PI * 0.5);
+    hm.setPosition(0, 0, 0.012);
     geoms.push(hub);
-    mats.push(m.clone());
+    mats.push(hm);
 
     const merged = mergeGeometries(geoms, mats);
     for (let i = 0; i < geoms.length; i++) geoms[i].dispose();

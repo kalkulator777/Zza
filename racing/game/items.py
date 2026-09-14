@@ -163,10 +163,20 @@ _ALL_MASK = (1 << ITEM_COUNT) - 1
 #   инструмент возврата в гонку. Мина и щит последнему почти не нужны:
 #   позади него никого нет, а стрелять в него будут мало.
 #
-# Веса выверены прогоном серий по восемь ботов (tools/test_sim.py --tune):
-# смен лидера за гонку без бонусов ~3, с бонусами ~8. Ровно то, что нужно
-# офисной аркаде: отставший реально догоняет, лидера не сносят каждые
-# десять секунд.
+# Веса выверены сериями по восемь ботов на трёх трассах
+# (``tools/test_sim.py --balance``, 24 гонки по три круга):
+#
+#   смен лидера за гонку      без бонусов 1,96   с бонусами 2,79
+#   сдвиг мест от середины
+#   дистанции к финишу        без бонусов 0,12   с бонусами 1,57
+#   раскруток за гонку        всего 11,8; в лидера 0,67, ещё 0,50 гасит его щит
+#                             (то есть лидера сбивают раз в четыре минуты, а не
+#                              раз в десять секунд)
+#
+# То есть бонусы решают (порядок к финишу перетасовывается на полтора места
+# против одной десятой без них), но лидера при этом не сносят каждые десять
+# секунд: его выручают щит из строки 0 и то, что стрелять в него может
+# только идущий вторым.
 #
 #                         boost rocket mine shield storm
 ITEM_WEIGHTS = (
@@ -348,11 +358,13 @@ class ItemSystem(object):
 
         settings = settings or {}
         enabled_flag = settings.get('items_enabled', True)
-        self.mask = enabled_mask(settings.get('items', ITEM_IDS))
+        # Маска разрешённых в комнате бонусов: считается один раз, в тик
+        # разбор списка строк не попадает.
+        self.item_mask = enabled_mask(settings.get('items', ITEM_IDS))
         if not enabled_flag:
-            self.mask = 0
+            self.item_mask = 0
         # Бонусов нет вовсе — боксы не показываем и не подбираем.
-        self.enabled = self.mask != 0
+        self.enabled = self.item_mask != 0
 
         # --- плоские копии осевой линии: обращение по индексу в списке float
         #     заметно дешевле, чем атрибут у TrackSample в горячем цикле
@@ -365,7 +377,6 @@ class ItemSystem(object):
         self._stz = [s.tangent_z for s in samples]
         self._ss = [s.s for s in samples]
         self._step = track.length / count if count else 1.0
-        self._length = track.length
 
         # --- корзины вдоль дуги -------------------------------------------
         bins = int(track.length / BIN_SIZE) + 1
@@ -758,25 +769,30 @@ class ItemSystem(object):
             cz = state.z
             base = self._bin_of_s(ss[state.sample_idx])
             b = base - _BIN_LOOKUP
-            while b <= base + _BIN_LOOKUP:
+            # Одна машина — одно попадание за тик: иначе наехавший на мину
+            # под ракетой сжигал бы за один кадр и щит, и половину арсенала.
+            hit_index = -1
+            hit_kind = 0
+            hit_owner = -1
+            while b <= base + _BIN_LOOKUP and hit_index < 0:
                 index = head[b % bins]
                 while index >= 0:
                     proj = pool[index]
-                    follow = nxt[index]
                     if proj.arm <= 0.0 and not (
                             proj.kind == ITEM_ROCKET and proj.owner == car.slot):
                         dx = cx - proj.x
                         dz = cz - proj.z
                         radius = proj.radius
                         if dx * dx + dz * dz <= radius * radius:
-                            kind = proj.kind
-                            owner = proj.owner
-                            self._kill(index)
-                            self._apply_hit(sim, car, owner, kind)
-                            index = follow
-                            continue
-                    index = follow
+                            hit_index = index
+                            hit_kind = proj.kind
+                            hit_owner = proj.owner
+                            break
+                    index = nxt[index]
                 b += 1
+            if hit_index >= 0:
+                self._kill(hit_index)
+                self._apply_hit(sim, car, hit_owner, hit_kind)
 
     def _apply_hit(self, sim, car, by_slot, kind):
         """Попадание: щит гасит ровно одно и при этом тратится (раздел 8)."""
@@ -819,7 +835,7 @@ class ItemSystem(object):
         box_z = self.box_z
         ss = self._ss
         radius2 = self._pickup_r2
-        mask = self.mask
+        mask = self.item_mask
         rng = self.rng
         total = sim.racer_count
         for car in sim.cars:

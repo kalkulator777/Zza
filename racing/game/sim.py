@@ -41,8 +41,7 @@ import os
 
 from . import physics
 from . import protocol
-from .items import (ItemSystem, ITEM_ID_BY_CODE, ITEM_MINE, ITEM_ROCKET,
-                    ITEM_SHIELD, ITEM_STORM, ITEM_BOOST)
+from .items import ItemSystem, ITEM_ID_BY_CODE
 
 __all__ = ['Simulation', 'RaceCar', 'GHOST_TIME', 'set_car_catalog',
            'car_catalog']
@@ -73,6 +72,12 @@ _quantize_drift_charge = protocol.quantize_drift_charge
 # Сервер отдаёт симуляции только ``car_id`` (раздел 12.4), а характеристики
 # лежат в content/cars.json. Каталог читается один раз на процесс и кэшируется:
 # в гонке к диску не обращается никто.
+#
+# Дыра в контракте: ``Simulation(track, settings, players)`` не получает ни
+# каталога машин, ни пути к контенту, поэтому файл ищется рядом с пакетом.
+# Если сервер запущен с ``--content`` на другой каталог, характеристики машин
+# возьмутся не оттуда. Шов для этого случая — ``set_car_catalog(catalog)``:
+# достаточно позвать её один раз при старте процесса.
 
 _CATALOG = None
 _CATALOG_TRIED = False
@@ -308,7 +313,9 @@ class Simulation(object):
         race_time = self.race_time
         laps_total = self.laps_total
         for car in self.cars:
-            if car.removed or car.finished:
+            if car.removed or car.finished or car.dnf:
+                # Сошедший доживает призраком и может по инерции пересечь
+                # линию: круга и тем более финиша ему за это не полагается.
                 continue
             lap = car.state.lap
             if lap <= car.laps:

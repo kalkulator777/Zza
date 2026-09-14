@@ -172,6 +172,15 @@ class ContentLibrary(object):
         self.cars = catalog.to_client()
         self.car_ids = tuple(catalog.ids)
         self._ensure_car_style()
+        # Симуляция иначе читает content/cars.json рядом с пакетом и при
+        # запуске с --content на другой каталог разъедется с тем, что мы
+        # раздаём клиентам. Отдаём ей ровно наш каталог.
+        try:
+            from game.sim import set_car_catalog
+        except ImportError:
+            pass                         # game.sim ещё нет — работает заглушка
+        else:
+            set_car_catalog(catalog)
         return True
 
     def _load_cars_plain(self):
