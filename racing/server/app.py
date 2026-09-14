@@ -280,6 +280,9 @@ class GameSocket(tornado.websocket.WebSocketHandler):
         self.ctx.manager.attach(player)
         player.send_event({
             't': 'welcome',
+            # Слот выдаётся при входе в комнату, а welcome приходит раньше:
+            # здесь он почти всегда null, боевое значение — в room.you (§12.6).
+            'slot': player.slot if player.slot >= 0 else None,
             'slot_token': player.slot_token,
             'is_host': player.is_host,
             'server_name': self.ctx.server_name,

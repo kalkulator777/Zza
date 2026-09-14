@@ -134,13 +134,14 @@ class ContentLibrary(object):
             self._geometry[(track.id, False)] = track
             self._geometry[(track.id, True)] = mirrored
             ids.append(track.id)
+            # Поле preview из схемы welcome убрано (§12.6): файлов-картинок
+            # в проекте нет, силуэт трассы интерфейс рисует сам по теме.
             catalog.append({
                 'id': track.id,
                 'name': track.name,
                 'desc': track.desc,
                 'difficulty': track.difficulty,
                 'theme': track.theme,
-                'preview': track.preview_path(),
             })
         catalog.sort(key=lambda item: (item['difficulty'], item['id']))
         self.tracks = catalog
@@ -170,6 +171,7 @@ class ContentLibrary(object):
         self.car_catalog = catalog
         self.cars = catalog.to_client()
         self.car_ids = tuple(catalog.ids)
+        self._ensure_car_style()
         return True
 
     def _load_cars_plain(self):
@@ -199,8 +201,29 @@ class ContentLibrary(object):
             })
         self.cars = cars
         self.car_ids = tuple(car['id'] for car in cars)
+        self._ensure_car_style()
         if not cars:
             self.issues.append('cars.json: ни одной пригодной машины')
+
+    def _ensure_car_style(self):
+        """Поле style в welcome.content.cars[] (§12.6): силуэт нужен уже в лобби.
+
+        Источник — shape.style из cars.json. game.cars отдаёт shape целиком,
+        а интерфейсу нужен плоский style, поэтому он поднимается наверх здесь,
+        в чужой модуль ради этого не лезем.
+        """
+        for car in self.cars:
+            style = car.get('style')
+            if not isinstance(style, str):
+                shape = car.get('shape')
+                style = shape.get('style') if isinstance(shape, dict) else None
+            if isinstance(style, str) and style in config.CAR_STYLES:
+                car['style'] = style
+            else:
+                car['style'] = None
+                self.issues.append(
+                    'машина %r: нет shape.style из списка %s — силуэт в лобби '
+                    'будет обобщённым' % (car.get('id'), ', '.join(config.CAR_STYLES)))
 
     # --- доступ -------------------------------------------------------------
 
@@ -340,10 +363,16 @@ class Room(object):
             'state': self.state,
         }
 
-    def state_payload(self):
-        """Событие room (§9): полное состояние комнаты."""
+    def state_payload(self, you=-1):
+        """Событие room (§9): полное состояние комнаты.
+
+        ``you`` — слот получателя. Слот выдаётся при входе в комнату, то есть
+        уже после welcome, поэтому «какая строка в players моя» клиент узнаёт
+        именно отсюда (§12.6).
+        """
         return {
             't': 'room',
+            'you': you,
             'id': self.id,
             'name': self.name,
             'owner_slot': self.owner_slot,
@@ -362,7 +391,16 @@ class Room(object):
             player.send_text(payload)
 
     def broadcast_state(self):
-        self.broadcast(self.state_payload())
+        """Разослать состояние комнаты: поле you у каждого своё.
+
+        Общая часть строится один раз, на получателя меняется одно поле —
+        сериализация на каждого нужна только из-за него. Событие редкое
+        (изменения лобби, чат, смена состояния), в тик оно не попадает.
+        """
+        payload = self.state_payload()
+        for player in self.order:
+            payload['you'] = player.slot
+            player.send_event(payload)
 
     # --- вход и выход -------------------------------------------------------
 

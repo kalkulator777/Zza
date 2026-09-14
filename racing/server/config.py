@@ -69,6 +69,9 @@ START_PLAYERS_MIN = 1         # с одним игроком старт разр
 
 ITEM_IDS = ('boost', 'rocket', 'mine', 'shield', 'storm')   # §8
 
+# Силуэты машин (§12.2): поле style уходит в welcome.content.cars[] (§12.6).
+CAR_STYLES = ('hatch', 'muscle', 'buggy', 'van', 'wedge')
+
 DEFAULT_SETTINGS = {
     'track': '',              # подставляется первой трассой каталога
     'laps': 3,
