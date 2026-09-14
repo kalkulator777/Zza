@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Точка входа: один процесс — и сервер, и игрок.
+
+    python3 run.py                 # сервер + Firefox на localhost
+    python3 run.py --no-browser    # только сервер
+    python3 run.py --port 8000
+    python3 run.py --guest-rooms   # комнаты может создавать любой клиент
+    python3 run.py --name "Комп Васи"
+
+Запустивший получает ссылку с токеном хоста; остальные заходят на
+http://<ip-этой-машины>:<порт>. Адреса, которые надо диктовать соседям,
+печатаются при старте крупно и по одному на строку.
+"""
+
+import argparse
+import asyncio
+import os
+import secrets
+import signal
+import socket
+import sys
+import webbrowser
+
+# Чтобы `game` и `server` импортировались независимо от текущего каталога.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+import tornado.log
+
+from server import config
+from server.app import ServerContext, make_app
+from server.discovery import Discovery, local_addresses
+from server.room import ContentLibrary, RoomManager, simulation_is_stub
+
+
+def parse_args(argv=None):
+    """Разбор аргументов командной строки (§2)."""
+    parser = argparse.ArgumentParser(
+        prog='run.py',
+        description='Браузерные гонки для локальной сети: сервер и игра в одном процессе.')
+    parser.add_argument('--port', type=int, default=config.DEFAULT_PORT,
+                        help='порт HTTP и WebSocket (по умолчанию %d)' % config.DEFAULT_PORT)
+    parser.add_argument('--bind', default=config.DEFAULT_BIND,
+                        help='адрес для прослушивания (по умолчанию все интерфейсы)')
+    parser.add_argument('--no-browser', action='store_true',
+                        help='не открывать браузер')
+    parser.add_argument('--guest-rooms', action='store_true',
+                        help='разрешить создание комнат любому клиенту')
+    parser.add_argument('--name', default=None,
+                        help='имя сервера, видное соседям по сети')
+    parser.add_argument('--content', default=os.path.join(BASE_DIR, 'content'),
+                        help='каталог с трассами и машинами (по умолчанию ./content)')
+    args = parser.parse_args(argv)
+    if not 1 <= args.port <= 65535:
+        parser.error('порт вне диапазона 1..65535')
+    if args.name is None:
+        args.name = 'Гонки на %s' % socket.gethostname()
+    return args
+
+
+def print_banner(args, host_url, addresses, notes):
+    """Крупно и понятно: куда идти хозяину и что диктовать соседям."""
+    line = '=' * 64
+    print('')
+    print(line)
+    print('  ГОНКИ ЗАПУЩЕНЫ:  %s' % args.name)
+    print(line)
+    print('')
+    print('  ВЫ (хозяин сервера, только вам можно создавать комнаты):')
+    print('')
+    print('      %s' % host_url)
+    print('')
+    if addresses:
+        print('  ДИКТУЙТЕ СОСЕДЯМ ПО СЕТИ:')
+        print('')
+        for address in addresses:
+            print('      >>>   %s:%d   <<<' % (address, args.port))
+        print('')
+    else:
+        print('  Адрес в локальной сети определить не удалось:')
+        print('  похоже, машина сейчас без сети. Соседи подключиться не смогут.')
+        print('')
+    print('  Обнаружение других серверов: UDP %d' % config.DISCOVERY_PORT)
+    if args.guest_rooms:
+        print('  Комнаты разрешено создавать всем (--guest-rooms)')
+    for note in notes:
+        print('  ! %s' % note)
+    print('')
+    print('  Остановить: Ctrl+C')
+    print(line)
+    print('', flush=True)
+
+
+def open_browser(url):
+    """Открыть Firefox на странице игры; если его нет — браузер по умолчанию."""
+    try:
+        browser = webbrowser.get('firefox')
+    except webbrowser.Error:
+        browser = None
+    try:
+        if browser is not None:
+            browser.open_new_tab(url)
+        else:
+            webbrowser.open_new_tab(url)
+    except Exception as exc:
+        print('  Браузер открыть не удалось (%s), откройте вручную: %s' % (exc, url),
+              flush=True)
+
+
+async def serve(args):
+    """Поднять всё хозяйство и ждать Ctrl+C."""
+    tornado.log.enable_pretty_logging()
+    loop = asyncio.get_running_loop()
+    notes = []
+
+    def log(message):
+        print('  [сервер] %s' % message, flush=True)
+
+    content = ContentLibrary(args.content, log=log).load()
+    notes.extend(content.issues)
+
+    discovery = Discovery(args.name, args.port, log=log)
+    manager = RoomManager(content, servers_provider=discovery.servers, log=log)
+    if simulation_is_stub():
+        notes.append('game/sim.py ещё нет: работает временная заглушка симуляции '
+                     '(тик идёт, машины не едут)')
+    discovery.set_stats_provider(manager.stats)
+
+    host_token = secrets.token_urlsafe(config.TOKEN_BYTES)
+    ctx = ServerContext(
+        manager=manager,
+        content=content,
+        host_token=host_token,
+        guest_rooms=args.guest_rooms,
+        server_name=args.name,
+        port=args.port,
+        static_dir=os.path.join(BASE_DIR, 'static'),
+        discovery=discovery,
+        log=log,
+    )
+    application = make_app(ctx)
+    try:
+        http_server = application.listen(args.port, address=args.bind or None)
+    except OSError as exc:
+        print('Не удалось занять порт %d: %s' % (args.port, exc), file=sys.stderr)
+        return 1
+
+    manager.start()
+    await discovery.start(loop)
+
+    addresses = local_addresses() if not args.bind else [args.bind]
+    host_url = 'http://localhost:%d/?host=%s' % (args.port, host_token)
+    print_banner(args, host_url, addresses, notes)
+
+    if not args.no_browser:
+        loop.call_later(0.25, open_browser, host_url)
+
+    stop = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            # Платформа без поддержки — останется обычный KeyboardInterrupt.
+            pass
+    try:
+        await stop.wait()
+    except asyncio.CancelledError:
+        pass
+
+    print('\n  Остановка...', flush=True)
+    discovery.stop()
+    manager.stop()
+    http_server.stop()
+    await http_server.close_all_connections()
+    print('  Сервер остановлен.', flush=True)
+    return 0
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        return asyncio.run(serve(args))
+    except KeyboardInterrupt:
+        print('\n  Сервер остановлен.', flush=True)
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

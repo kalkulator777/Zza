@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Гонки — локальная сеть</title>
+
+<!-- Иконка вкладки: инлайновый SVG в data-URI. Файлов-картинок в проекте нет. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2310131e'/%3E%3Cpath d='M5 20h22l-3 5H8z' fill='%23ffc93c'/%3E%3Cpath d='M7 19l4-8h10l4 8z' fill='%23ff5a5f'/%3E%3Ccircle cx='11' cy='24' r='3' fill='%230a0c14'/%3E%3Ccircle cx='21' cy='24' r='3' fill='%230a0c14'/%3E%3C/svg%3E">
+
+<link rel="stylesheet" href="./css/style.css">
+
+<!-- Раздел 3 контракта: three подключается только через import map, без сборщика. -->
+<script type="importmap">
+{"imports": {"three": "./vendor/three.module.min.js"}}
+</script>
+</head>
+<body>
+
+<!-- Канвас рендера. Лежит под всеми слоями интерфейса, размером во всё окно. -->
+<canvas id="gl"></canvas>
+
+<!--
+  Слои интерфейса. Разметку каждого экрана строит свой модуль из js/ui/ —
+  здесь только пустые корни, чтобы структура жила в одном месте с логикой.
+  Сам #ui прозрачен для мыши, ловят события только активные экраны.
+-->
+<div id="ui">
+    <div id="screen-menu" class="screen" hidden></div>
+    <div id="screen-lobby" class="screen" hidden></div>
+    <div id="screen-hud" class="layer" hidden></div>
+    <div id="screen-results" class="screen" hidden></div>
+    <div id="overlay-countdown" class="layer" hidden></div>
+    <div id="overlay-perf" class="layer" hidden></div>
+    <div id="toast" class="toast" hidden></div>
+</div>
+
+<!--
+  Точка входа клиента. main.js импортирует модули интерфейса, рендер и сеть,
+  раздаёт им корни выше и склеивает всё вместе.
+-->
+<script type="module" src="./js/main.js"></script>
+
+</body>
+</html>
