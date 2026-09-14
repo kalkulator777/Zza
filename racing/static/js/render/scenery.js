@@ -942,8 +942,12 @@ function addInstanced(ctx, name, geometry, placements, opts) {
     mesh.count = 0;
     mesh.visible = false;
 
+    // ignoreColor: размещения переиспользуются другим типом (окна берут
+    // расстановку зданий), и цвет бетона там только испортил бы свет
     let anyColor = false;
-    for (let i = 0; i < n; i++) if (placements[i].color) { anyColor = true; break; }
+    if (!o.ignoreColor) {
+        for (let i = 0; i < n; i++) if (placements[i].color) { anyColor = true; break; }
+    }
     if (anyColor) {
         // 12.11: instanceColor доходит до шейдера только при vertexColors
         mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(n * 3).fill(1), 3);
@@ -985,7 +989,7 @@ function addInstanced(ctx, name, geometry, placements, opts) {
         set.sphere[so + 3] = sph.radius;
         if (b < bucketCount) accums[b].add(sph.center.x, sph.center.y, sph.center.z, sph.radius);
 
-        if (p.color && set.srcC) {
+        if (p.color && set.srcC && !o.ignoreColor) {
             toColor(p.color, col);
             set.srcC[slot * 3] = col.r;
             set.srcC[slot * 3 + 1] = col.g;
@@ -1241,6 +1245,12 @@ function buildCityTheme(ctx, seed) {
         // задаётся в долях куба, иначе тень у основания уползёт на пол-этажа
         ao: { base: 0, height: 0.15, floor: 0.36, power: 0.75, sky: 0.26 }
     });
+    // ночью в зданиях горят окна: тот же набор размещений, своя геометрия
+    if (ctx.lights && buildings.length) {
+        addInstanced(ctx, 'windows',
+            windowsGeometry(new Rng(seed ^ 0x00b7), 4, 7, ctx.lampK),
+            buildings, { material: emitMaterial(ctx), ignoreColor: true });
+    }
 
     // фонари вдоль кромки
     const rngL = new Rng(seed ^ 0x00c2);
@@ -1251,6 +1261,14 @@ function buildCityTheme(ctx, seed) {
     addInstanced(ctx, 'lamps', lampGeometry(pal, seg), lamps, {
         ao: { base: 0, height: 1.5, floor: 0.42, power: 0.65, sky: 0.3 }
     });
+    if (ctx.lights && lamps.length) {
+        // конус света и пятно на асфальте — один меш на все фонари
+        addInstanced(ctx, 'lampGlow', lampGlowGeometry(seg, ctx.lampK), lamps,
+            { material: glowMaterial(ctx) });
+        // сам плафон светится: иначе фонарь издали выглядит потухшим
+        addInstanced(ctx, 'lampBulbs', lampBulbGeometry(ctx.lampK), lamps,
+            { material: emitMaterial(ctx) });
+    }
 
     // отбойники: сплошные участки по 6 м
     const rngG = new Rng(seed ^ 0x00d3);
@@ -1279,6 +1297,14 @@ function buildCityTheme(ctx, seed) {
     addInstanced(ctx, 'billboards', billboardGeometry(pal), boards, {
         ao: { base: 0, height: 2.0, floor: 0.46, power: 0.7, sky: 0.28 }
     });
+    if (ctx.lights && boards.length) {
+        // подсветка щита: самосветящееся полотно плюс мягкий ореол перед ним.
+        // Полотно красится инстансным цветом — щиты остаются разными.
+        addInstanced(ctx, 'billboardGlow', billboardGlowGeometry(ctx.lampK), boards,
+            { material: emitMaterial(ctx) });
+        addInstanced(ctx, 'billboardHalo', billboardHaloGeometry(ctx.lampK), boards,
+            { material: glowMaterial(ctx) });
+    }
 
     // уличные деревья вдоль тротуара: город перестаёт быть голыми коробками
     const rngT = new Rng(seed ^ 0x00f5);
@@ -1514,6 +1540,13 @@ function buildIndustrialTheme(ctx, seed) {
     addInstanced(ctx, 'hangars', hangar, hangars, {
         ao: { base: 0, height: 0.22, floor: 0.36, power: 0.75, sky: 0.26 }
     });
+    if (ctx.lights && hangars.length) {
+        // ангар — тот же единичный куб, что и здание в городе, поэтому
+        // сетка окон подходит без правок; рядов меньше, здание низкое
+        addInstanced(ctx, 'windows',
+            windowsGeometry(new Rng(seed ^ 0x1a07), 5, 2, ctx.lampK * 0.85),
+            hangars, { material: emitMaterial(ctx), ignoreColor: true });
+    }
 
     // цистерны
     const tank = mergeGeometries([
@@ -1947,6 +1980,277 @@ function buildClouds(env, Q, rng, share) {
     mesh.frustumCulled = false;
     mesh.renderOrder = -9;
     return mesh;
+}
+
+
+// ---------------------------------------------------------------------------
+// Ночное небо: звёзды и луна
+// ---------------------------------------------------------------------------
+
+/**
+ * Звёздное небо одной геометрией: маленькие квадраты, развёрнутые к центру
+ * купола, плюс диск луны с ореолом. Один меш, один draw call, ни одной
+ * текстуры-файла. Днём не строится вовсе.
+ */
+function buildStars(Q, rng, tod) {
+    const b = new MeshBuilder();
+    const n = Math.max(12, Math.round(Q.stars * tod.stars));
+    const R = 860;
+    const c = new THREE.Color();
+
+    // базис квадрата, перпендикулярного направлению на звезду
+    const ux = [0, 0, 0];
+    const vx = [0, 0, 0];
+    const pa = [0, 0, 0], pb = [0, 0, 0], pc = [0, 0, 0], pd = [0, 0, 0];
+
+    function quadAt(dx, dy, dz, size, color, edge) {
+        // орт «вправо» — векторное произведение направления и оси Y
+        let rx = dz, ry = 0, rz = -dx;
+        let l = Math.sqrt(rx * rx + rz * rz);
+        if (l < 1e-6) { rx = 1; rz = 0; l = 1; }
+        rx /= l; rz /= l;
+        // орт «вверх» — направление на звезду, векторно на «вправо»
+        const uxx = dy * rz - dz * 0;
+        const uyy = dz * rx - dx * rz;
+        const uzz = dx * 0 - dy * rx;
+        const ul = Math.sqrt(uxx * uxx + uyy * uyy + uzz * uzz) || 1;
+        ux[0] = rx * size; ux[1] = 0; ux[2] = rz * size;
+        vx[0] = (uxx / ul) * size; vx[1] = (uyy / ul) * size; vx[2] = (uzz / ul) * size;
+        const cx = dx * R, cy = dy * R, cz = dz * R;
+        pa[0] = cx - ux[0] - vx[0]; pa[1] = cy - ux[1] - vx[1]; pa[2] = cz - ux[2] - vx[2];
+        pb[0] = cx + ux[0] - vx[0]; pb[1] = cy + ux[1] - vx[1]; pb[2] = cz + ux[2] - vx[2];
+        pc[0] = cx + ux[0] + vx[0]; pc[1] = cy + ux[1] + vx[1]; pc[2] = cz + ux[2] + vx[2];
+        pd[0] = cx - ux[0] + vx[0]; pd[1] = cy - ux[1] + vx[1]; pd[2] = cz - ux[2] + vx[2];
+        if (edge) b.quadVC(pa, pb, pc, pd, edge, edge, edge, edge);
+        else b.quad(pa, pb, pc, pd, color);
+    }
+
+    for (let k = 0; k < n; k++) {
+        // равномерно по верхней полусфере, но гуще к зениту: у горизонта
+        // звёзды всё равно съест туман
+        const u = rng.range(0.06, 1.0);
+        const y = Math.pow(u, 0.7);
+        const r = Math.sqrt(Math.max(0, 1 - y * y));
+        const a = rng.range(0, Math.PI * 2);
+        const dx = Math.cos(a) * r;
+        const dz = Math.sin(a) * r;
+        const bright = rng.range(0.35, 1.0);
+        const warm = rng.next() < 0.25;
+        c.setRGB(bright * (warm ? 1.0 : 0.82), bright * 0.9, bright * (warm ? 0.78 : 1.0));
+        quadAt(dx, y, dz, rng.range(1.4, 3.6) + bright * 2.2, c, null);
+    }
+
+    // луна: диск и мягкий ореол вокруг
+    if (tod.moon > 0.01) {
+        const ma = 2.15;
+        const my = 0.46;
+        const mr = Math.sqrt(Math.max(0, 1 - my * my));
+        const mx = Math.cos(ma) * mr;
+        const mz = Math.sin(ma) * mr;
+        const halo = new THREE.Color(0.13 * tod.moon, 0.16 * tod.moon, 0.24 * tod.moon);
+        quadAt(mx, my, mz, 62, halo, halo);
+        const mid = new THREE.Color(0.3 * tod.moon, 0.33 * tod.moon, 0.42 * tod.moon);
+        quadAt(mx, my, mz, 34, mid, mid);
+        const disc = new THREE.Color(0.93 * tod.moon, 0.94 * tod.moon, 0.88 * tod.moon);
+        quadAt(mx, my, mz, 17, disc, disc);
+        // кратер: чуть тусклее, сдвинут от центра
+        const crater = new THREE.Color(0.74 * tod.moon, 0.76 * tod.moon, 0.72 * tod.moon);
+        quadAt(mx + 0.006, my + 0.004, mz - 0.003, 5, crater, crater);
+    }
+
+    const mat = new THREE.MeshBasicMaterial({
+        vertexColors: true,
+        fog: false,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        // 12.11: прозрачный двусторонний материал иначе рисуется в два прохода
+        forceSinglePass: true
+    });
+    mat.name = 'stars';
+    const mesh = new THREE.Mesh(b.build(), mat);
+    mesh.name = 'stars';
+    mesh.frustumCulled = false;
+    mesh.renderOrder = -8;
+    return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// Ночные огни: конусы фонарей, окна, подсветка щитов
+// ---------------------------------------------------------------------------
+//
+// Никакой постобработки и никаких источников света сверх одного ambient и
+// одного directional (раздел 10.3) — свет рисуется ГЕОМЕТРИЕЙ:
+//   * конус под плафоном и пятно на асфальте — аддитивные, гаснут к краю
+//     вершинными цветами (чёрное в аддитивном смешивании невидимо);
+//   * окна и полотна щитов — обычный MeshBasicMaterial, то есть НЕ зависят
+//     от освещения: ночью они и должны быть единственным, что светится само.
+// Обе группы — такие же InstancedMesh, как весь декор, и отсекаются вместе
+// с ним по тем же корзинам.
+
+/** Общий аддитивный материал ореолов, один на сцену. */
+function glowMaterial(ctx) {
+    if (!ctx.glowMat) {
+        const m = new THREE.MeshBasicMaterial({
+            vertexColors: true,
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            fog: true,
+            side: THREE.DoubleSide,
+            forceSinglePass: true
+        });
+        m.name = 'sceneryGlow';
+        ctx.glowMat = m;
+        ctx.materials.push(m);
+    }
+    return ctx.glowMat;
+}
+
+/** Общий неосвещаемый материал самосветящихся поверхностей (окна, щиты). */
+function emitMaterial(ctx) {
+    if (!ctx.emitMat) {
+        const m = new THREE.MeshBasicMaterial({ vertexColors: true, fog: true });
+        m.name = 'sceneryEmissive';
+        ctx.emitMat = m;
+        ctx.materials.push(m);
+    }
+    return ctx.emitMat;
+}
+
+/**
+ * Свет уличного фонаря: конус от плафона к земле плюс пятно на асфальте.
+ * Геометрия строится в тех же локальных координатах, что lampGeometry:
+ * плафон висит на кронштейне в точке (0.78, 5.9).
+ */
+function lampGlowGeometry(seg, k) {
+    const b = new MeshBuilder();
+    const n = Math.max(6, seg);
+    const cx = 0.78;
+    const yTop = 5.84;
+    const rTop = 0.34;
+    const rBot = 4.6;
+    const yBot = 0.07;
+    const hot = new THREE.Color(0.55 * k, 0.47 * k, 0.30 * k);
+    const mid = new THREE.Color(0.20 * k, 0.17 * k, 0.10 * k);
+    const zero = new THREE.Color(0, 0, 0);
+    const a = [0, 0, 0], b2 = [0, 0, 0], c2 = [0, 0, 0], d2 = [0, 0, 0];
+
+    for (let i = 0; i < n; i++) {
+        const t0 = (i / n) * Math.PI * 2;
+        const t1 = ((i + 1) / n) * Math.PI * 2;
+        a[0] = cx + Math.cos(t0) * rTop; a[1] = yTop; a[2] = Math.sin(t0) * rTop;
+        b2[0] = cx + Math.cos(t1) * rTop; b2[1] = yTop; b2[2] = Math.sin(t1) * rTop;
+        c2[0] = cx + Math.cos(t1) * rBot; c2[1] = yBot; c2[2] = Math.sin(t1) * rBot;
+        d2[0] = cx + Math.cos(t0) * rBot; d2[1] = yBot; d2[2] = Math.sin(t0) * rBot;
+        b.quadVC(a, b2, c2, d2, hot, hot, zero, zero);
+    }
+
+    // пятно на земле: веер от яркой середины к нулю по краю
+    const centre = [cx, yBot, 0];
+    const p1 = [0, 0, 0], p2 = [0, 0, 0];
+    for (let i = 0; i < n; i++) {
+        const t0 = (i / n) * Math.PI * 2;
+        const t1 = ((i + 1) / n) * Math.PI * 2;
+        p1[0] = cx + Math.cos(t0) * rBot; p1[1] = yBot; p1[2] = Math.sin(t0) * rBot;
+        p2[0] = cx + Math.cos(t1) * rBot; p2[1] = yBot; p2[2] = Math.sin(t1) * rBot;
+        b.triVC(centre, p1, p2, mid, zero, zero);
+    }
+
+    // сам плафон: маленький яркий квадрат, чтобы источник читался издали
+    const g = b.build();
+    return g;
+}
+
+/** Ореол вокруг плафона: восьмигранник, видимый с любой стороны. */
+function lampBulbGeometry(k) {
+    const c = new THREE.Color(0.9 * k, 0.78 * k, 0.5 * k);
+    const g = solidify(new THREE.OctahedronGeometry(0.55, 0), c);
+    g.translate(0.78, 5.88, 0);
+    return g;
+}
+
+/**
+ * Светящиеся окна на гранях единичного куба (здания строятся именно так).
+ * Рисунок детерминирован: тот же seed — те же горящие окна у всех клиентов.
+ */
+function windowsGeometry(rng, cols, rows, k) {
+    const b = new MeshBuilder();
+    const c = new THREE.Color();
+    const warm = [
+        [1.0, 0.86, 0.55],
+        [1.0, 0.92, 0.72],
+        [0.86, 0.9, 1.0],
+        [1.0, 0.74, 0.42]
+    ];
+    const wq = [0, 0, 0], wb = [0, 0, 0], wc = [0, 0, 0], wd = [0, 0, 0];
+    const off = 0.503;
+    const wq2 = 0.62 / cols;   // ширина окна в долях грани
+    const hq = 0.66 / rows;
+
+    for (let face = 0; face < 4; face++) {
+        for (let r = 0; r < rows; r++) {
+            for (let cix = 0; cix < cols; cix++) {
+                if (rng.next() > 0.42) continue;
+                const tint = warm[(rng.next() * warm.length) | 0];
+                const bright = rng.range(0.55, 1.0) * k;
+                c.setRGB(Math.min(1, tint[0] * bright), Math.min(1, tint[1] * bright), Math.min(1, tint[2] * bright));
+                const u0 = -0.5 + (cix + 0.5) / cols - wq2 * 0.5;
+                const u1 = u0 + wq2;
+                const y0 = 0.06 + (r + 0.5) * ((1 - 0.12) / rows) - hq * 0.5;
+                const y1 = y0 + hq;
+                if (face === 0) {        // +Z
+                    wq[0] = u0; wq[1] = y0; wq[2] = off;
+                    wb[0] = u1; wb[1] = y0; wb[2] = off;
+                    wc[0] = u1; wc[1] = y1; wc[2] = off;
+                    wd[0] = u0; wd[1] = y1; wd[2] = off;
+                } else if (face === 1) { // -Z
+                    wq[0] = u1; wq[1] = y0; wq[2] = -off;
+                    wb[0] = u0; wb[1] = y0; wb[2] = -off;
+                    wc[0] = u0; wc[1] = y1; wc[2] = -off;
+                    wd[0] = u1; wd[1] = y1; wd[2] = -off;
+                } else if (face === 2) { // +X
+                    wq[0] = off; wq[1] = y0; wq[2] = -u0;
+                    wb[0] = off; wb[1] = y0; wb[2] = -u1;
+                    wc[0] = off; wc[1] = y1; wc[2] = -u1;
+                    wd[0] = off; wd[1] = y1; wd[2] = -u0;
+                } else {                 // -X
+                    wq[0] = -off; wq[1] = y0; wq[2] = u0;
+                    wb[0] = -off; wb[1] = y0; wb[2] = u1;
+                    wc[0] = -off; wc[1] = y1; wc[2] = u1;
+                    wd[0] = -off; wd[1] = y1; wd[2] = u0;
+                }
+                b.quad(wq, wb, wc, wd, c);
+            }
+        }
+    }
+    return b.build();
+}
+
+/** Подсвеченное полотно рекламного щита (координаты billboardGeometry). */
+function billboardGlowGeometry(k) {
+    const b = new MeshBuilder();
+    const face = new THREE.Color(0.95 * k, 0.92 * k, 0.85 * k);
+    const a = [-2.35, 3.86, 0.17];
+    const b2 = [2.35, 3.86, 0.17];
+    const c2 = [2.35, 6.14, 0.17];
+    const d2 = [-2.35, 6.14, 0.17];
+    b.quad(a, b2, c2, d2, face);
+    return b.build();
+}
+
+/** Мягкий ореол перед щитом: аддитивная плоскость чуть больше полотна. */
+function billboardHaloGeometry(k) {
+    const b = new MeshBuilder();
+    const hot = new THREE.Color(0.24 * k, 0.22 * k, 0.17 * k);
+    const zero = new THREE.Color(0, 0, 0);
+    const a = [-3.3, 3.1, 0.5];
+    const b2 = [3.3, 3.1, 0.5];
+    const c2 = [3.3, 6.9, 0.5];
+    const d2 = [-3.3, 6.9, 0.5];
+    b.quadVC(a, b2, c2, d2, zero, zero, hot, hot);
+    return b.build();
 }
 
 export default buildScenery;
