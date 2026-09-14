@@ -36,7 +36,7 @@
 const HISTORY = 122;             // столбиков на графике
 const TEXT_PERIOD = 200;         // мс между обновлениями текста
 const FRAME_BUDGET = 16.67;      // мс на кадр при 60 fps
-const GRAPH_MAX = 50;            // мс, верх графика (три кадровых бюджета)
+const GRAPH_MAX = 33.4;          // мс, верх графика (два кадровых бюджета)
 
 function el(tag, cls, text) {
     const node = document.createElement(tag);
@@ -125,7 +125,7 @@ export class PerfOverlay {
         this.fpsNode.className = 'perf-fps' + (fpsInt >= 58 ? '' : fpsInt >= 45 ? ' warn' : ' bad');
 
         this._setValue(this.frameNode, avg.toFixed(2) + ' мс',
-            avg <= FRAME_BUDGET ? 0 : avg <= 22 ? 1 : 2);
+            avg <= 17.6 ? 0 : avg <= 22.5 ? 1 : 2);
 
         // Пик за окно истории — именно он съедает плавность.
         let peak = 0;
@@ -190,8 +190,10 @@ export class PerfOverlay {
             if (value <= 0) continue;
             let bar = (value / GRAPH_MAX) * h;
             if (bar > h) bar = h;
-            ctx.fillStyle = value <= FRAME_BUDGET ? '#3ddc84'
-                : value <= 22 ? '#ffc93c' : '#ff5a5f';
+            // Зелёный — стабильные 60 fps (rAF даёт 16,6..17,5 мс), жёлтый —
+            // просадка, красный — потерянный кадр.
+            ctx.fillStyle = value <= 17.6 ? '#3ddc84'
+                : value <= 22.5 ? '#ffc93c' : '#ff5a5f';
             ctx.fillRect(i * barW, h - bar, barW - 0.5 * dpr, bar);
         }
     }
@@ -237,7 +239,7 @@ export class PerfOverlay {
         this.pingNode = this._addRow(grid, 'ping');
         this.snapNode = this._addRow(grid, 'снапшот');
         this.memNode = this._addRow(grid, 'память');
-        this._addRow(grid, 'бюджет').textContent = '60 / 150k';
+        this._addRow(grid, 'лимит').textContent = '60/150k';
         wrap.appendChild(grid);
 
         this.footNode = el('div', 'perf-foot', 'F3 — скрыть');

@@ -116,14 +116,6 @@ class Player(object):
         if future is not None:
             future.add_done_callback(_drop_write_error)
 
-    def close(self, code=1000, reason=''):
-        """Закрыть соединение со своей стороны."""
-        self.connected = False
-        try:
-            self.conn.close(code, reason)
-        except Exception:
-            pass
-
     # --- ping --------------------------------------------------------------
 
     def start_ping(self, now):

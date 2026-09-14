@@ -157,7 +157,12 @@ export class LobbyScreen {
 
     // --- жизненный цикл ----------------------------------------------------
 
-    show() { this.root.hidden = false; this.visible = true; }
+    show() {
+        this.root.hidden = false;
+        this.visible = true;
+        // Прокрутка возможна только когда элемент уже имеет высоту.
+        this.chatLog.scrollTop = this.chatLog.scrollHeight;
+    }
 
     hide() { this.root.hidden = true; this.visible = false; }
 
@@ -331,13 +336,44 @@ export class LobbyScreen {
     _buildCenterColumn() {
         const col = el('div', 'lobby-col');
 
-        // Машины
+        // Машины: ряд компактных карточек и подробности по выбранной
         const carsPanel = el('div', 'panel');
         const carsHead = el('div', 'panel-head');
         carsHead.appendChild(el('h2', null, 'Машина'));
         carsPanel.appendChild(carsHead);
         this.carsGrid = el('div', 'cars-grid');
         carsPanel.appendChild(this.carsGrid);
+
+        const detail = el('div', 'car-detail');
+        this.detailArt = el('div', 'cd-art');
+        detail.appendChild(this.detailArt);
+        const info = el('div', 'cd-info');
+        this.detailName = el('div', 'cd-name', '');
+        this.detailDesc = el('div', 'cd-desc', '');
+        info.appendChild(this.detailName);
+        info.appendChild(this.detailDesc);
+
+        // Полоски характеристик: пять сегментов на каждую, значения 1..5
+        this.detailBars = [];
+        const bars = el('div', 'bars');
+        for (let b = 0; b < BAR_LABELS.length; b++) {
+            const row = el('div', 'bar-row');
+            row.dataset.bar = BAR_LABELS[b][0];
+            row.appendChild(el('div', 'bar-name', BAR_LABELS[b][1]));
+            const track = el('div', 'bar-track');
+            const segs = [];
+            for (let k = 0; k < 5; k++) {
+                const seg = el('div', 'bar-seg');
+                track.appendChild(seg);
+                segs.push(seg);
+            }
+            row.appendChild(track);
+            bars.appendChild(row);
+            this.detailBars.push({ key: BAR_LABELS[b][0], segs: segs });
+        }
+        info.appendChild(bars);
+        detail.appendChild(info);
+        carsPanel.appendChild(detail);
         col.appendChild(carsPanel);
 
         // Цвета
@@ -469,8 +505,7 @@ export class LobbyScreen {
         this.chatInput.maxLength = 140;
         this.chatInput.placeholder = 'Сообщение…';
         form.appendChild(this.chatInput);
-        const send = el('button', 'btn btn-sm', 'Send');
-        send.textContent = 'Отправить';
+        const send = el('button', 'btn btn-sm', 'Отправить');
         send.type = 'submit';
         form.appendChild(send);
         form.addEventListener('submit', (e) => {
@@ -535,32 +570,14 @@ export class LobbyScreen {
             const car = this.cars[i];
             const card = el('button', 'car-card');
             card.type = 'button';
-
             const art = el('div', 'c-art');
             card.appendChild(art);
             card.appendChild(el('div', 'c-name', car.name || car.id));
-            card.appendChild(el('div', 'c-desc', car.desc || ''));
-
-            const bars = el('div', 'bars');
-            for (let b = 0; b < BAR_LABELS.length; b++) {
-                const key = BAR_LABELS[b][0];
-                const row = el('div', 'bar-row');
-                row.dataset.bar = key;
-                row.appendChild(el('div', 'bar-name', BAR_LABELS[b][1]));
-                const track = el('div', 'bar-track');
-                const value = (car.bars && car.bars[key]) | 0;
-                for (let s = 1; s <= 5; s++) {
-                    track.appendChild(el('div', s <= value ? 'bar-seg on' : 'bar-seg'));
-                }
-                row.appendChild(track);
-                bars.appendChild(row);
-            }
-            card.appendChild(bars);
-
             card.addEventListener('click', () => this._selectCar(car.id));
             this.carsGrid.appendChild(card);
-            this.carCards.push({ id: car.id, index: i, node: card, art: art });
+            this.carCards.push({ id: car.id, index: i, node: card, art: art, car: car });
         }
+        if (!this.myCar && this.cars.length) this.myCar = this.cars[0].id;
         this._syncCarCards();
     }
 
@@ -636,12 +653,28 @@ export class LobbyScreen {
     _syncCarCards() {
         if (!this.carCards) return;
         const bodyColor = this.myColor || '#ffc93c';
+        let selected = null;
         for (let i = 0; i < this.carCards.length; i++) {
             const entry = this.carCards[i];
             const active = entry.id === this.myCar;
+            if (active) selected = entry;
             entry.node.classList.toggle('is-active', active);
             entry.art.innerHTML = carIconSvg(entry.id, entry.index,
-                active ? bodyColor : '#4d587a', 76);
+                active ? bodyColor : '#4d587a', 68);
+        }
+        if (!selected) selected = this.carCards[0];
+        if (!selected) return;
+
+        const car = selected.car;
+        this.detailArt.innerHTML = carIconSvg(selected.id, selected.index, bodyColor, 148);
+        this.detailName.textContent = car.name || car.id;
+        this.detailDesc.textContent = car.desc || '';
+        for (let b = 0; b < this.detailBars.length; b++) {
+            const bar = this.detailBars[b];
+            const value = (car.bars && car.bars[bar.key]) | 0;
+            for (let k = 0; k < bar.segs.length; k++) {
+                bar.segs[k].className = k < value ? 'bar-seg on' : 'bar-seg';
+            }
         }
     }
 

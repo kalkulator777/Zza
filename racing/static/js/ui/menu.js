@@ -96,8 +96,8 @@ for (let i = 0; i < ITEM_DEFS.length; i++) {
 
 // Тела иконок в системе координат 0..48. Обводка рисуется общим stroke.
 const ITEM_PATHS = {
-    // Турбо: двойной шеврон вперёд
-    boost: '<path d="M6 24 20 8v10L32 8v10L44 8v32L32 30v10L20 30v10z"/>',
+    // Турбо: тройной шеврон, остриём вперёд
+    boost: '<path d="M44 24 30 8v10L18 8v10L6 8v32l12-10v10l12-10v10z"/>',
     // Ракета: корпус с носом и стабилизаторами
     rocket: '<path d="M24 4c7 6 10 13 10 21v9H14v-9c0-8 3-15 10-21z"/>'
           + '<path d="M14 26 6 36v8l8-6zM34 26l8 10v8l-8-6z"/>'
@@ -286,10 +286,12 @@ export class MenuScreen {
         // Шапка с логотипом
         const brand = el('div', 'brand');
         const mark = el('div', 'brand-mark');
-        mark.innerHTML = '<svg viewBox="0 0 48 48" width="38" height="38" fill="#080a12">'
-            + '<path d="M4 30h40l-5 8H9z"/>'
-            + '<path d="M9 28l7-13h16l7 13z" fill="#ff5a5f" stroke="#080a12" stroke-width="3" stroke-linejoin="round"/>'
-            + '<circle cx="15" cy="37" r="5"/><circle cx="33" cy="37" r="5"/>'
+        mark.innerHTML = '<svg viewBox="0 0 80 40" width="46" height="23" fill="none"'
+            + ' stroke="#080a12" stroke-width="3.4" stroke-linejoin="round" stroke-linecap="round">'
+            + '<path d="M5 30 6 19H33L40 11H59L63 19H76L77 30Z" fill="#ff5a5f"/>'
+            + '<path d="M36 18 41 13H57L60 18Z" fill="#141826"/>'
+            + '<circle cx="20" cy="30" r="7" fill="#141826"/>'
+            + '<circle cx="62" cy="30" r="7" fill="#141826"/>'
             + '</svg>';
         const titles = el('div');
         titles.appendChild(el('div', 'brand-title', 'Гонки'));

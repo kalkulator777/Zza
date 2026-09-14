@@ -40,13 +40,16 @@
  *   headLights  1  эмиссивные плоскости фар
  *   brakeLights 1  стоп-сигналы отдельным материалом, зажигаются по флагу
  * Восемь машин — 32 draw call, ровно как требует бюджет раздела 1.
- * На пресете high голова водителя выносится отдельным мешем (пятый вызов на
- * машину), на low и medium она слита с кузовом, а узел driver остаётся на
- * месте — рендер анимирует его всегда и без проверок на null.
+ *
+ * Голова водителя намеренно слита с кузовом: отдельный меш стоил бы ещё восемь
+ * draw call на восьмерых игроков (13 % всего кадрового бюджета) ради детали
+ * высотой в несколько пикселей. Узел driver при этом возвращается всегда — это
+ * точка головы водителя в системе координат машины: рендер вешает на него
+ * камеру из кокпита (10.3) и всё, что должно ехать вместе с головой.
  */
 
 import * as THREE from 'three';
-import { MeshBuilder, mergeGeometries, loft, solidify, toColor, disposeObject } from './geomutil.js';
+import { MeshBuilder, mergeGeometries, loft, solidify, toColor } from './geomutil.js';
 
 // ---------------------------------------------------------------------------
 // Значения по умолчанию для поля shape (12.2)
@@ -75,9 +78,9 @@ const SHAPE_DEFAULTS = {
 };
 
 const QUALITY = {
-    low: { wheelSeg: 8, mirrors: false, extras: 0, separateDriver: false },
-    medium: { wheelSeg: 12, mirrors: true, extras: 1, separateDriver: false },
-    high: { wheelSeg: 16, mirrors: true, extras: 2, separateDriver: true }
+    low: { wheelSeg: 8, mirrors: false, extras: 0 },
+    medium: { wheelSeg: 12, mirrors: true, extras: 1 },
+    high: { wheelSeg: 16, mirrors: true, extras: 2 }
 };
 
 /**
@@ -90,7 +93,7 @@ const STYLE_RANGE = {
     hatch: { cabin_start: [0.3, 0.42], cabin_end: [0.72, 0.88] },
     muscle: { cabin_start: [0.44, 0.58], cabin_end: [0.78, 0.93] },
     van: { cabin_start: [0.1, 0.22], cabin_end: [0.88, 0.97] },
-    wedge: { cabin_start: [0.4, 0.54], cabin_end: [0.82, 0.95] },
+    wedge: { cabin_start: [0.38, 0.54], cabin_end: [0.7, 0.95] },
     buggy: { cabin_start: [0.3, 0.55], cabin_end: [0.7, 0.9] }
 };
 
@@ -219,21 +222,11 @@ export function buildCarMesh(shape, bodyColor, quality) {
     brakeLights.frustumCulled = false;
     root.add(brakeLights);
 
-    // --- водитель -----------------------------------------------------------
+    // --- водитель: узел-якорь в точке головы (сама голова слита с кузовом) ---
     const driver = new THREE.Object3D();
+    driver.name = 'driver';
     driver.position.set(bp.driverPos[0], bp.driverPos[1], bp.driverPos[2]);
     root.add(driver);
-    let driverMesh = null;
-    if (bp.driverHead) {
-        const dg = new THREE.BufferGeometry();
-        dg.setAttribute('position', bp.driverHead.position);
-        dg.setAttribute('normal', bp.driverHead.normal);
-        dg.setAttribute('color', bp.driverHead.color);
-        dg.boundingSphere = bp.driverHead.boundingSphere;
-        driverMesh = new THREE.Mesh(dg, bp.driverMaterial);
-        driverMesh.name = 'driverHead';
-        driver.add(driverMesh);
-    }
 
     const _brakeOn = new THREE.Color('#ff2a18');
     const _brakeOff = new THREE.Color('#5a0d0d');
@@ -246,7 +239,6 @@ export function buildCarMesh(shape, bodyColor, quality) {
         brakeLights: brakeLights,
         headLights: headLights,
         driver: driver,
-        driverMesh: driverMesh,
         style: S.style,
         shape: S,
         wheelRadius: S.wheel_radius,
@@ -254,7 +246,7 @@ export function buildCarMesh(shape, bodyColor, quality) {
         trackWidth: S.track_width,
         size: { length: S.length, width: S.width, height: S.height },
         materials: { body: bodyMat, wheel: bp.wheelMaterial, head: headMat, brake: brakeMat },
-        stats: { drawCalls: driverMesh ? 5 : 4, triangles: bp.triangles + (driverMesh ? bp.driverTris : 0) },
+        stats: { drawCalls: 4, triangles: bp.triangles },
 
         /** Перекрасить кузов (лобби, смена цвета). Геометрия не пересобирается. */
         setBodyColor: function (color) {
@@ -302,7 +294,6 @@ export function buildCarMesh(shape, bodyColor, quality) {
             wheelGeom.dispose();
             headGeom.dispose();
             brakeGeom.dispose();
-            if (driverMesh) driverMesh.geometry.dispose();
             bodyMat.dispose();
             headMat.dispose();
             brakeMat.dispose();
@@ -319,7 +310,6 @@ export function buildCarMesh(shape, bodyColor, quality) {
 export function disposeCarCache() {
     _cacheBlueprints.forEach(function (bp) {
         bp.wheelMaterial.dispose();
-        if (bp.driverMaterial) bp.driverMaterial.dispose();
     });
     _cacheBlueprints.clear();
 }
@@ -329,7 +319,6 @@ function releaseBlueprint(bp) {
     if (bp.refs > 0) return;
     _cacheBlueprints.delete(bp.key);
     bp.wheelMaterial.dispose();
-    if (bp.driverMaterial) bp.driverMaterial.dispose();
 }
 
 // ---------------------------------------------------------------------------
@@ -364,22 +353,8 @@ function makeBlueprint(S, quality, key) {
     // --- кузов --------------------------------------------------------------
     const bb = new MeshBuilder();
     const ctx = buildBody(bb, S, P, accent);
-
-    let driverHead = null;
-    let driverTris = 0;
-    let driverMaterial = null;
     const headPos = ctx.driverPos;
-    if (P.separateDriver) {
-        const db = new MeshBuilder();
-        buildDriverHead(db, S, accent, 0, 0, 0);
-        const dg = db.build();
-        driverHead = attrsOf(dg);
-        driverTris = db.triangleCount;
-        driverMaterial = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
-        driverMaterial.name = 'carDriver';
-    } else {
-        buildDriverHead(bb, S, accent, headPos[0], headPos[1], headPos[2]);
-    }
+    buildDriverHead(bb, S, accent, headPos[0], headPos[1], headPos[2]);
 
     const bodyGeom = bb.build();
     const bodyAttrs = attrsOf(bodyGeom);
@@ -413,9 +388,6 @@ function makeBlueprint(S, quality, key) {
         wheelMaterial: wheelMaterial,
         head: attrsOf(headGeomB),
         brake: attrsOf(brakeGeomB),
-        driverHead: driverHead,
-        driverMaterial: driverMaterial,
-        driverTris: driverTris,
         driverPos: headPos,
         wheelPos: [
             [halfTrack, r, halfBase],
@@ -487,7 +459,12 @@ function buildBody(b, S, P, accent) {
     const belt = H - S.cabin_height; // линия подоконника (верх кузова)
     const tRear = 0.5 - S.wheelbase / (2 * L);
     const tFront = 0.5 + S.wheelbase / (2 * L);
-    const fenderHw = Math.max(hwMax, S.track_width * 0.5 + S.wheel_width * 0.5 + 0.03);
+    const fenderHw = Math.max(hwMax, S.track_width * 0.5 + S.wheel_width * 0.5 + 0.04);
+
+    // Доли cabin_start/cabin_end в 12.2 отсчитываются ОТ НОСА, а станции кузова
+    // здесь нумеруются от кормы (t = 0) к носу (t = 1) — переводим.
+    const tCabRear = 1 - S.cabin_end;
+    const tCabFront = 1 - S.cabin_start;
 
     const dark = toColor('#15171b');
     const paintTop = new THREE.Color(PAINT_TOP, PAINT_TOP, PAINT_TOP);
@@ -501,110 +478,134 @@ function buildBody(b, S, P, accent) {
         W: W,
         H: H,
         belt: belt,
+        RH: RH,
         tRear: tRear,
         tFront: tFront,
+        tCabRear: tCabRear,
+        tCabFront: tCabFront,
         hwNose: hwMax * S.taper_front,
         hwTail: hwMax * S.taper_rear,
         yNose: belt - S.nose_drop,
         yTail: belt - S.tail_drop,
+        rockerX: hwMax * 0.72,
         accent: accent,
         driverPos: [0, belt + 0.34, 0]
     };
 
     // ---- таблицы силуэта по стилям ----
+    // botK — ширина низа кузова. Она заметно меньше ширины по «талии»: именно
+    // за счёт этого колёса видны в арках, а не утоплены заподлицо в борт.
     let stations = [];
     let cabin = null;
 
     if (style === 'buggy') {
         // багги: короткий узкий корпус, высокий клиренс, открытый верх
-        const bh = hwMax * 0.66;
+        const bh = hwMax * 0.64;
         const yb = RH + 0.06;
         const yt = RH + 0.46;
         stations = [
-            section(0.02, L, bh * 0.74, yb + 0.06, yt - 0.06),
-            section(0.14, L, bh * 0.96, yb, yt + 0.02),
-            section(0.36, L, bh, yb, yt + 0.06),
-            section(0.62, L, bh, yb, yt + 0.04),
-            section(0.84, L, bh * 0.9, yb + 0.02, yt - 0.06),
-            section(0.97, L, bh * 0.6, yb + 0.1, yt - 0.16)
+            section(0.02, L, bh * 0.74, yb + 0.06, yt - 0.06, 0.9, 0.86, 0.6),
+            section(0.14, L, bh * 0.96, yb, yt + 0.02, 0.9, 0.86, 0.6),
+            section(0.36, L, bh, yb, yt + 0.06, 0.9, 0.86, 0.6),
+            section(0.62, L, bh, yb, yt + 0.04, 0.9, 0.86, 0.6),
+            section(0.84, L, bh * 0.9, yb + 0.02, yt - 0.06, 0.9, 0.86, 0.6),
+            section(0.97, L, bh * 0.6, yb + 0.1, yt - 0.16, 0.9, 0.86, 0.6)
         ];
         ctx.yNose = yt - 0.16;
         ctx.yTail = yt - 0.06;
         ctx.hwNose = bh * 0.6;
         ctx.hwTail = bh * 0.74;
-        ctx.driverPos = [0, yt + 0.42, -0.02 * L];
+        ctx.rockerX = bh * 0.9;
+        ctx.driverPos = [0, yt + 0.44, -0.03 * L];
     } else if (style === 'van') {
         // фургон: высокий, почти без сужений, кабина начинается сразу за носом
         const yt = belt;
+        const bk = 0.85;
         stations = [
-            section(0.0, L, hwMax * S.taper_rear, RH + 0.02, yt - S.tail_drop, 0.97, 0.9),
-            section(0.06, L, hwMax * 0.99, RH, yt, 0.97, 0.9),
-            section(tRear, L, fenderHw, RH, yt, 0.96, 0.88),
-            section(0.5, L, hwMax, RH, yt, 0.96, 0.88),
-            section(tFront, L, fenderHw, RH, yt, 0.96, 0.88),
-            section(0.94, L, hwMax * 0.98, RH + 0.02, yt - S.nose_drop * 0.5, 0.95, 0.88),
-            section(1.0, L, hwMax * S.taper_front, RH + 0.06, yt - S.nose_drop, 0.94, 0.86)
+            section(0.0, L, hwMax * S.taper_rear, RH + 0.02, yt - S.tail_drop, 0.97, bk, 0.6),
+            section(0.06, L, hwMax * 0.99, RH, yt, 0.97, bk, 0.6),
+            section(tRear, L, fenderHw, RH, yt, 0.96, bk, 0.6),
+            section(0.5, L, hwMax, RH, yt, 0.96, bk, 0.6),
+            section(tFront, L, fenderHw, RH, yt, 0.96, bk, 0.6),
+            section(0.94, L, hwMax * 0.98, RH + 0.02, yt - S.nose_drop * 0.5, 0.95, bk, 0.6),
+            section(1.0, L, hwMax * S.taper_front, RH + 0.06, yt - S.nose_drop, 0.94, bk - 0.04, 0.6)
         ];
+        ctx.rockerX = hwMax * bk;
         cabin = [
-            { t: S.cabin_start, hwK: 0.9, yt: belt + 0.06 },
-            { t: S.cabin_start + 0.07, hwK: 0.96, yt: H },
-            { t: S.cabin_end - 0.03, hwK: 0.97, yt: H },
-            { t: S.cabin_end, hwK: 0.95, yt: H - 0.06 }
+            { t: tCabRear, hwK: 0.95, yt: H - 0.08 },
+            { t: tCabRear + 0.04, hwK: 0.97, yt: H },
+            { t: tCabFront - 0.08, hwK: 0.96, yt: H },
+            { t: tCabFront, hwK: 0.9, yt: belt + 0.06 }
         ];
     } else if (style === 'wedge') {
         // клин: нос почти у земли, единая линия до кормы
         const lowNose = RH + 0.1;
+        const bk = 0.7;
         stations = [
-            section(0.0, L, hwMax * S.taper_rear, RH + 0.02, belt - S.tail_drop, 0.8, 0.82),
-            section(0.1, L, hwMax * 1.01, RH, belt, 0.8, 0.82),
-            section(tRear, L, fenderHw * 1.02, RH, belt, 0.78, 0.82),
-            section(0.48, L, hwMax * 0.99, RH, belt - 0.05, 0.74, 0.8),
-            section(tFront, L, fenderHw, RH, belt - 0.14, 0.7, 0.78),
-            section(0.9, L, hwMax * 0.86, RH + 0.02, lowNose + 0.1, 0.62, 0.72),
-            section(1.0, L, hwMax * S.taper_front * 0.72, RH + 0.08, lowNose, 0.5, 0.6)
+            section(0.0, L, hwMax * S.taper_rear, RH + 0.02, belt - S.tail_drop, 0.82, bk, 0.68),
+            section(0.1, L, hwMax * 1.01, RH, belt, 0.82, bk, 0.68),
+            section(tRear, L, fenderHw * 1.04, RH, belt, 0.8, bk, 0.68),
+            section(0.48, L, hwMax * 0.99, RH, belt - 0.05, 0.76, bk, 0.68),
+            section(tFront, L, fenderHw, RH, belt - 0.14, 0.72, bk, 0.68),
+            section(0.9, L, hwMax * 0.86, RH + 0.02, lowNose + 0.1, 0.64, bk - 0.04, 0.68),
+            section(1.0, L, hwMax * S.taper_front * 0.72, RH + 0.08, lowNose, 0.52, bk - 0.1, 0.68)
         ];
         ctx.yNose = lowNose;
         ctx.hwNose = hwMax * S.taper_front * 0.72;
+        ctx.rockerX = hwMax * bk;
         cabin = [
-            { t: S.cabin_start, hwK: 0.8, yt: belt - 0.06 },
-            { t: S.cabin_start + 0.16, hwK: 0.85, yt: H },
-            { t: S.cabin_end - 0.04, hwK: 0.86, yt: H },
-            { t: S.cabin_end, hwK: 0.84, yt: belt + 0.02 }
+            { t: tCabRear, hwK: 0.84, yt: belt + 0.02 },
+            { t: tCabRear + 0.05, hwK: 0.86, yt: H },
+            { t: tCabFront - 0.16, hwK: 0.85, yt: H },
+            { t: tCabFront, hwK: 0.78, yt: belt - 0.07 }
         ];
     } else if (style === 'muscle') {
         // маслкар: длинный плоский капот, широкая корма
+        const bk = 0.74;
         stations = [
-            section(0.0, L, hwMax * S.taper_rear, RH + 0.04, belt - S.tail_drop, 0.9, 0.84),
-            section(0.08, L, hwMax * 1.03, RH, belt, 0.9, 0.84),
-            section(tRear, L, fenderHw * 1.06, RH, belt + 0.02, 0.88, 0.84),
-            section(0.46, L, hwMax * 0.98, RH, belt, 0.86, 0.82),
-            section(tFront, L, fenderHw * 1.02, RH, belt - 0.02, 0.86, 0.82),
-            section(0.92, L, hwMax * 0.95, RH + 0.02, belt - S.nose_drop * 0.7, 0.86, 0.8),
-            section(1.0, L, hwMax * S.taper_front, RH + 0.06, belt - S.nose_drop, 0.84, 0.78)
+            section(0.0, L, hwMax * S.taper_rear, RH + 0.04, belt - S.tail_drop, 0.92, bk, 0.64),
+            section(0.08, L, hwMax * 1.03, RH, belt, 0.92, bk, 0.64),
+            section(tRear, L, fenderHw * 1.07, RH, belt + 0.02, 0.9, bk, 0.64),
+            section(0.46, L, hwMax * 0.98, RH, belt, 0.88, bk, 0.64),
+            section(tFront, L, fenderHw * 1.03, RH, belt - 0.02, 0.88, bk, 0.64),
+            section(0.92, L, hwMax * 0.95, RH + 0.02, belt - S.nose_drop * 0.7, 0.88, bk, 0.64),
+            section(1.0, L, hwMax * S.taper_front, RH + 0.06, belt - S.nose_drop, 0.86, bk - 0.04, 0.64)
         ];
+        ctx.rockerX = hwMax * bk;
         cabin = [
-            { t: S.cabin_start, hwK: 0.82, yt: belt + 0.02 },
-            { t: S.cabin_start + 0.12, hwK: 0.87, yt: H },
-            { t: S.cabin_end - 0.05, hwK: 0.87, yt: H },
-            { t: S.cabin_end, hwK: 0.8, yt: belt + 0.04 }
+            { t: tCabRear, hwK: 0.8, yt: belt + 0.05 },
+            { t: tCabRear + 0.06, hwK: 0.87, yt: H },
+            { t: tCabFront - 0.13, hwK: 0.87, yt: H },
+            { t: tCabFront, hwK: 0.82, yt: belt + 0.02 }
         ];
     } else {
         // hatch и всё незнакомое: компактный трёхдверный силуэт
+        const bk = 0.72;
         stations = [
-            section(0.0, L, hwMax * S.taper_rear, RH + 0.05, belt - S.tail_drop, 0.88, 0.82),
-            section(0.07, L, hwMax * 0.99, RH, belt, 0.88, 0.82),
-            section(tRear, L, fenderHw, RH, belt + 0.01, 0.87, 0.82),
-            section(0.5, L, hwMax * 0.97, RH, belt, 0.86, 0.8),
-            section(tFront, L, fenderHw, RH, belt, 0.86, 0.8),
-            section(0.93, L, hwMax * 0.93, RH + 0.02, belt - S.nose_drop * 0.6, 0.85, 0.8),
-            section(1.0, L, hwMax * S.taper_front, RH + 0.07, belt - S.nose_drop, 0.82, 0.76)
+            section(0.0, L, hwMax * S.taper_rear, RH + 0.05, belt - S.tail_drop, 0.9, bk, 0.62),
+            section(0.07, L, hwMax * 0.99, RH, belt, 0.9, bk, 0.62),
+            section(tRear, L, fenderHw, RH, belt + 0.01, 0.88, bk, 0.62),
+            section(0.5, L, hwMax * 0.97, RH, belt, 0.88, bk, 0.62),
+            section(tFront, L, fenderHw, RH, belt, 0.88, bk, 0.62),
+            section(0.93, L, hwMax * 0.93, RH + 0.02, belt - S.nose_drop * 0.6, 0.86, bk, 0.62),
+            section(1.0, L, hwMax * S.taper_front, RH + 0.07, belt - S.nose_drop, 0.84, bk - 0.04, 0.62)
         ];
+        ctx.rockerX = hwMax * bk;
         cabin = [
-            { t: S.cabin_start, hwK: 0.84, yt: belt + 0.04 },
-            { t: S.cabin_start + 0.13, hwK: 0.89, yt: H },
-            { t: S.cabin_end - 0.02, hwK: 0.88, yt: H },
-            { t: S.cabin_end, hwK: 0.8, yt: belt + 0.1 }
+            { t: Math.max(0.08, tCabRear - 0.07), hwK: 0.8, yt: belt + 0.12 },
+            { t: tCabRear + 0.06, hwK: 0.88, yt: H },
+            { t: tCabFront - 0.14, hwK: 0.89, yt: H },
+            { t: tCabFront, hwK: 0.84, yt: belt + 0.04 }
         ];
+    }
+
+    if (cabin) {
+        // страховка от вырожденной кабины, если cars.json пришлёт крайние доли
+        for (let i = 1; i < cabin.length; i++) {
+            if (cabin[i].t <= cabin[i - 1].t + 0.01) cabin[i].t = cabin[i - 1].t + 0.01;
+        }
+        const tMid = cabin[0].t * 0.55 + cabin[cabin.length - 1].t * 0.45;
+        ctx.driverPos = [0, belt + (H - belt) * 0.42, (tMid - 0.5) * L];
     }
 
     // ---- лофт кузова ----
@@ -615,14 +616,13 @@ function buildBody(b, S, P, accent) {
         capEnd: true,
         color: function (i, k, c) {
             if (i < 0) {
-                // кормовой торец: крышка багажника / задние двери
-                b.flag = 0;
-                c.copy(accent);
+                b.flag = PAINT_FLAG; // кормовая панель — в цвет игрока
+                c.copy(paintLow);
                 return;
             }
             if (i >= stations.length) {
                 b.flag = 0;
-                c.copy(accent);
+                c.copy(accent); // передняя маска с решёткой
                 return;
             }
             if (k === 3) {
@@ -645,36 +645,35 @@ function buildBody(b, S, P, accent) {
     // ---- кабина ----
     if (cabin) {
         const secs = [];
+        const hwTable = stations.map(function (s) {
+            return [s.t, s.hw];
+        });
+        const ytTable = stations.map(function (s) {
+            return [s.t, s.yt];
+        });
         for (let i = 0; i < cabin.length; i++) {
             const cdef = cabin[i];
-            const bodyHw = curve(
-                stations.map(function (s) {
-                    return [s.t, s.hw];
-                }),
-                cdef.t
-            );
-            const bodyTop = curve(
-                stations.map(function (s) {
-                    return [s.t, s.yt];
-                }),
-                cdef.t
-            );
-            secs.push(section(cdef.t, L, bodyHw * cdef.hwK, bodyTop - 0.03, cdef.yt, 0.9, 0.98, 0.6));
+            const bodyHw = curve(hwTable, cdef.t);
+            const bodyTop = curve(ytTable, cdef.t);
+            secs.push(section(cdef.t, L, bodyHw * cdef.hwK, bodyTop - 0.03, cdef.yt, 0.9, 0.98, 0.62));
         }
         const nl = secs.length - 1;
         loft(b, secs, {
-            capStart: false,
-            capEnd: false,
+            capStart: true,
+            capEnd: true,
             color: function (i, k, c) {
+                b.flag = 0;
+                if (i < 0 || i >= secs.length) {
+                    c.copy(accent); // торцы теплицы: заднее стекло и лобовое
+                    return;
+                }
                 if (k === 3) {
-                    b.flag = 0;
                     c.copy(dark);
                     return;
                 }
                 if (k === 0) {
                     if (i === 0 || i === nl - 1) {
-                        b.flag = 0;
-                        c.copy(accent); // лобовое и заднее стекло
+                        c.copy(accent); // скаты: заднее стекло и лобовое
                     } else {
                         b.flag = PAINT_FLAG;
                         c.copy(paintTop); // крыша
@@ -682,7 +681,6 @@ function buildBody(b, S, P, accent) {
                     return;
                 }
                 if ((k === 1 || k === 5) && i > 0 && i < nl - 1) {
-                    b.flag = 0;
                     c.copy(accent); // боковые стёкла
                     return;
                 }
@@ -717,21 +715,20 @@ function addCommonExtras(b, S, P, ctx, accent, dark, paintSide) {
 
     b.flag = 0;
     // передний бампер
-    b.box(0, RH + 0.13, zNose - 0.1, ctx.hwNose * 1.9, 0.26, 0.3, accent);
+    b.box(0, RH + 0.11, zNose - 0.12, ctx.hwNose * 1.8, 0.22, 0.26, accent);
     // задний бампер
-    b.box(0, RH + 0.13, zTail + 0.1, ctx.hwTail * 1.9, 0.26, 0.3, accent);
-    // пороги между колёсами
-    const rockerZ = 0;
-    const rockerLen = S.wheelbase * 0.78;
-    b.box(S.width * 0.47, RH + 0.04, rockerZ, 0.1, 0.12, rockerLen, dark);
-    b.box(-S.width * 0.47, RH + 0.04, rockerZ, 0.1, 0.12, rockerLen, dark);
+    b.box(0, RH + 0.11, zTail + 0.12, ctx.hwTail * 1.8, 0.22, 0.26, accent);
+    // пороги идут по фактической ширине низа кузова, а не по габариту
+    const rockerLen = S.wheelbase * 0.8;
+    b.box(ctx.rockerX + 0.03, RH + 0.05, 0, 0.08, 0.14, rockerLen, dark);
+    b.box(-(ctx.rockerX + 0.03), RH + 0.05, 0, 0.08, 0.14, rockerLen, dark);
 
-    // зеркала
+    // зеркала у основания лобового стекла
     if (P.mirrors && S.style !== 'wedge') {
-        const zm = (S.cabin_start - 0.5) * L + 0.16;
+        const zm = (ctx.tCabFront - 0.5) * L - 0.1;
         const hwm = S.width * 0.5;
-        b.box(hwm * 1.02, ctx.belt + 0.16, zm, 0.18, 0.09, 0.07, accent);
-        b.box(-hwm * 1.02, ctx.belt + 0.16, zm, 0.18, 0.09, 0.07, accent);
+        b.box(hwm * 0.99, ctx.belt + 0.14, zm, 0.2, 0.09, 0.07, accent);
+        b.box(-hwm * 0.99, ctx.belt + 0.14, zm, 0.2, 0.09, 0.07, accent);
     }
 
     // выхлоп
@@ -744,27 +741,23 @@ function addHatchExtras(b, S, P, ctx, accent, dark) {
     const L = S.length;
     b.flag = 0;
     // решётка радиатора
-    b.box(0, ctx.yNose - 0.12, L * 0.5 - 0.02, ctx.hwNose * 1.1, 0.14, 0.06, dark);
+    b.box(0, ctx.RH + (ctx.yNose - ctx.RH) * 0.62, L * 0.5 - 0.02, ctx.hwNose * 1.15, 0.16, 0.06, dark);
     if (S.spoiler) {
-        // козырёк над задним стеклом
-        const zr = (S.cabin_end - 0.5) * L - 0.02;
+        // козырёк над задним стеклом, на задней кромке крыши
+        const zr = (ctx.tCabRear - 0.5) * L + 0.16;
         b.flag = PAINT_FLAG;
-        b.box(0, S.height + 0.03, zr, S.width * 0.72, 0.07, 0.3, new THREE.Color(PAINT_TOP, PAINT_TOP, PAINT_TOP));
+        b.box(0, S.height + 0.02, zr, S.width * 0.7, 0.06, 0.28, new THREE.Color(PAINT_TOP, PAINT_TOP, PAINT_TOP));
         b.flag = 0;
     }
     if (P.extras > 0) {
-        // накладки на арки
-        const fh = S.track_width * 0.5 + S.wheel_width * 0.5;
+        // ручки дверей
         for (let s = -1; s <= 1; s += 2) {
-            b.box(s * fh, S.wheel_radius + 0.26, S.wheelbase * 0.5, 0.09, 0.1, S.wheel_radius * 2.1, dark);
-            b.box(s * fh, S.wheel_radius + 0.26, -S.wheelbase * 0.5, 0.09, 0.1, S.wheel_radius * 2.1, dark);
+            b.box(s * S.width * 0.49, ctx.belt - 0.08, (ctx.tCabRear - 0.5) * L + 0.5, 0.04, 0.05, 0.22, dark);
         }
     }
     if (P.extras > 1) {
-        // ручки дверей
-        for (let s = -1; s <= 1; s += 2) {
-            b.box(s * S.width * 0.5, ctx.belt - 0.06, 0.05, 0.04, 0.05, 0.22, dark);
-        }
+        // антенна на крыше
+        b.box(0, S.height + 0.11, (ctx.tCabRear - 0.5) * L + 0.12, 0.04, 0.22, 0.04, dark);
     }
 }
 
@@ -773,11 +766,11 @@ function addMuscleExtras(b, S, P, ctx, accent, dark) {
     const W = S.width;
     b.flag = 0;
     // воздухозаборник на капоте
-    const zh = (S.cabin_start - 0.5) * L + L * 0.22;
+    const zh = (ctx.tCabFront - 0.5) * L + L * 0.16;
     b.box(0, ctx.belt + 0.07, zh, W * 0.42, 0.14, L * 0.22, dark);
     b.box(0, ctx.belt + 0.14, zh + L * 0.06, W * 0.3, 0.06, L * 0.08, toColor('#0d0e10'));
     // массивная решётка и «клыки»
-    b.box(0, ctx.yNose - 0.14, L * 0.5 - 0.01, ctx.hwNose * 1.5, 0.2, 0.07, toColor('#0d0e10'));
+    b.box(0, ctx.RH + (ctx.yNose - ctx.RH) * 0.62, L * 0.5 - 0.01, ctx.hwNose * 1.5, 0.22, 0.07, toColor('#0d0e10'));
     // боковые патрубки
     for (let s = -1; s <= 1; s += 2) {
         b.box(s * W * 0.52, S.ride_height + 0.1, 0, 0.12, 0.12, S.wheelbase * 0.72, toColor('#b9bec4'));
@@ -837,7 +830,7 @@ function addBuggyExtras(b, S, P, ctx, accent, dark) {
             b.flag = PAINT_FLAG;
             b.box(
                 s * fx,
-                S.wheel_radius + 0.2,
+                S.wheel_radius * 1.16,
                 f * S.wheelbase * 0.5,
                 S.wheel_width + 0.12,
                 0.09,
@@ -851,6 +844,16 @@ function addBuggyExtras(b, S, P, ctx, accent, dark) {
     b.box(0, RH + 0.24, L * 0.5 - 0.04, W * 0.66, 0.09, 0.09, tube);
     for (let s = -1; s <= 1; s += 2) {
         b.box(s * W * 0.3, RH + 0.14, L * 0.5 - 0.04, 0.08, 0.28, 0.08, tube);
+    }
+    if (S.spoiler) {
+        // антикрыло на каркасе
+        const yw = cageTop + S.spoiler_height * 0.5;
+        for (let s = -1; s <= 1; s += 2) {
+            b.box(s * hw * 0.8, (yw + cageTop) * 0.5, zBack - 0.3, 0.06, yw - cageTop, 0.08, tube);
+        }
+        b.flag = PAINT_FLAG;
+        b.box(0, yw, zBack - 0.3, hw * 1.9, 0.06, 0.3, new THREE.Color(PAINT_TOP, PAINT_TOP, PAINT_TOP));
+        b.flag = 0;
     }
     if (P.extras > 0) {
         // рычаги подвески
@@ -867,7 +870,7 @@ function addVanExtras(b, S, P, ctx, accent, dark) {
     const W = S.width;
     b.flag = 0;
     // широкая решётка и фартук
-    b.box(0, ctx.yNose - 0.1, L * 0.5 - 0.01, ctx.hwNose * 1.8, 0.18, 0.05, dark);
+    b.box(0, ctx.RH + (ctx.yNose - ctx.RH) * 0.62, L * 0.5 - 0.01, ctx.hwNose * 1.8, 0.24, 0.05, dark);
     // багажник на крыше
     const rackY = S.height + 0.06;
     for (let s = -1; s <= 1; s += 2) {
@@ -892,10 +895,10 @@ function addWedgeExtras(b, S, P, ctx, accent, dark) {
     b.flag = 0;
     // боковые воздухозаборники
     for (let s = -1; s <= 1; s += 2) {
-        b.box(s * W * 0.49, ctx.belt - 0.14, -L * 0.04, 0.06, 0.16, L * 0.2, toColor('#0d0e10'));
+        b.box(s * W * 0.46, ctx.belt - 0.13, (ctx.tCabRear - 0.5) * L + 0.1, 0.05, 0.14, L * 0.14, toColor('#0d0e10'));
     }
     // сплиттер
-    b.box(0, S.ride_height + 0.02, L * 0.5 - 0.14, W * 0.92, 0.05, 0.34, dark);
+    b.box(0, S.ride_height + 0.02, L * 0.5 - 0.2, W * 0.62, 0.05, 0.3, dark);
     // диффузор
     b.box(0, S.ride_height + 0.03, -L * 0.5 + 0.16, W * 0.86, 0.08, 0.3, dark);
     // антикрыло
@@ -912,7 +915,7 @@ function addWedgeExtras(b, S, P, ctx, accent, dark) {
     }
     // корпуса фар заподлицо
     for (let s = -1; s <= 1; s += 2) {
-        b.box(s * ctx.hwNose * 0.62, ctx.yNose + 0.01, L * 0.5 - 0.34, 0.3, 0.06, 0.4, dark);
+        b.box(s * ctx.hwNose * 0.66, ctx.yNose + 0.1, L * 0.5 - 0.36, 0.32, 0.07, 0.42, dark);
     }
 }
 
@@ -964,8 +967,9 @@ function buildDriverHead(b, S, accent, ox, oy, oz) {
 function buildHeadLights(b, S, ctx) {
     const L = S.length;
     const glass = toColor('#fff6d8');
-    const z = L * 0.5 + 0.012;
-    const y = ctx.yNose - 0.1;
+    const z = L * 0.5 + 0.02;
+    // середина передней маски: между бампером и верхней кромкой носа
+    const y = ctx.RH + (ctx.yNose - ctx.RH) * 0.62;
     const hw = ctx.hwNose;
 
     if (S.style === 'muscle') {
@@ -983,15 +987,15 @@ function buildHeadLights(b, S, ctx) {
         }
     } else if (S.style === 'wedge') {
         for (let s = -1; s <= 1; s += 2) {
-            lightQuad(b, s * hw * 0.62, ctx.yNose + 0.045, L * 0.5 - 0.34, 0.26, 0.36, glass, 0);
+            lightQuad(b, s * hw * 0.66, ctx.yNose + 0.145, L * 0.5 - 0.36, 0.26, 0.36, glass, 0);
         }
     } else if (S.style === 'van') {
         for (let s = -1; s <= 1; s += 2) {
-            lightQuad(b, s * hw * 0.7, y + 0.04, z, 0.34, 0.2, glass, 1);
+            lightQuad(b, s * hw * 0.68, y, z, 0.36, 0.22, glass, 1);
         }
     } else {
         for (let s = -1; s <= 1; s += 2) {
-            lightQuad(b, s * hw * 0.66, y, z, 0.32, 0.15, glass, 1);
+            lightQuad(b, s * hw * 0.64, y, z, 0.34, 0.17, glass, 1);
         }
     }
 }
@@ -999,8 +1003,8 @@ function buildHeadLights(b, S, ctx) {
 function buildBrakeLights(b, S, ctx) {
     const L = S.length;
     const lamp = toColor('#ff4d3d');
-    const z = -L * 0.5 - 0.012;
-    const y = ctx.yTail - 0.1;
+    const z = -L * 0.5 - 0.02;
+    const y = ctx.RH + (ctx.yTail - ctx.RH) * 0.66;
     const hw = ctx.hwTail;
 
     if (S.style === 'muscle') {
@@ -1046,28 +1050,31 @@ function buildWheel(S, P) {
     const w = S.wheel_width;
     const seg = P.wheelSeg;
     const tire = toColor('#1b1c1f');
-    const rim = toColor('#c6cbd1');
-    const hub = toColor('#54585e');
+    const rim = toColor('#cdd2d8');
+    const hub = toColor('#4e535a');
 
     // протектор: открытый цилиндр вдоль оси X
     const tread = solidify(new THREE.CylinderGeometry(r, r, w, seg, 1, true), tire, function (x, y, z, i, c) {
         // лёгкая грань между блоками протектора
-        if ((i >> 1) % 3 === 0) c.setRGB(c.r * 1.25, c.g * 1.25, c.b * 1.25);
+        if ((i >> 1) % 3 === 0) c.setRGB(c.r * 1.3, c.g * 1.3, c.b * 1.3);
     });
     tread.applyMatrix4(new THREE.Matrix4().makeRotationZ(Math.PI * 0.5));
 
     const parts = [tread];
     const mats = [null];
-    for (let s = -1; s <= 1; s += 2) {
-        const disc = solidify(new THREE.CircleGeometry(r * 0.995, seg), rim, function (x, y, z, i, c) {
-            const d = Math.sqrt(x * x + y * y) / r;
-            if (d < 0.35) c.copy(hub);
-            else if (d > 0.86) c.setRGB(c.r * 0.55, c.g * 0.55, c.b * 0.55);
+    for (let side = -1; side <= 1; side += 2) {
+        // боковина покрышки — тёмное кольцо, диск — светлый круг с тёмной ступицей
+        const wall = solidify(new THREE.RingGeometry(r * 0.62, r * 0.998, seg, 1), tire);
+        const disc = solidify(new THREE.CircleGeometry(r * 0.63, seg), rim, function (x, y, z, i, c) {
+            const d = Math.sqrt(x * x + y * y) / (r * 0.63);
+            if (d < 0.42) c.copy(hub);
         });
-        const m = new THREE.Matrix4().makeRotationY((s * Math.PI) / 2);
-        m.setPosition(s * (w * 0.5 - 0.012), 0, 0);
-        parts.push(disc);
-        mats.push(m);
+        const mWall = new THREE.Matrix4().makeRotationY((side * Math.PI) / 2);
+        mWall.setPosition(side * (w * 0.5 - 0.004), 0, 0);
+        const mDisc = new THREE.Matrix4().makeRotationY((side * Math.PI) / 2);
+        mDisc.setPosition(side * (w * 0.5 - 0.03), 0, 0);
+        parts.push(wall, disc);
+        mats.push(mWall, mDisc);
     }
     return mergeGeometries(parts, mats);
 }

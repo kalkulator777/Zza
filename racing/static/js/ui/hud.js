@@ -59,9 +59,9 @@ for (let i = 0; i <= 100; i++) SCALE_X[i] = 'scaleX(' + (i / 100) + ')';
 
 // Геометрия дуги тахометра (совпадает с path в разметке ниже)
 const TACH_CX = 120;
-const TACH_CY = 116;
+const TACH_CY = 106;
 const TACH_R = 84;
-const TACH_SWEEP = 200;                   // градусов, от -100 до +100
+const TACH_SWEEP = 180;                   // градусов, от -90 до +90 (полукруг)
 const TACH_LEN = 2 * Math.PI * TACH_R * (TACH_SWEEP / 360);
 
 // stroke-dashoffset заполненной части дуги: 101 шаг
@@ -74,7 +74,7 @@ for (let i = 0; i <= TACH_SWEEP; i++) {
     NEEDLE_ROT[i] = 'rotate(' + (i - TACH_SWEEP / 2) + ' ' + TACH_CX + ' ' + TACH_CY + ')';
 }
 
-const SPEED_MAX_KMH = 230;                // потолок шкалы: max_speed 44 м/с + буст
+const SPEED_MAX_KMH = 230;                // потолок шкалы по умолчанию: буст 58 м/с + запас
 const MS_TO_KMH = 3.6;
 const TAU = Math.PI * 2;
 
@@ -84,8 +84,16 @@ const FEED_LIFETIME = 4200;               // мс жизни строки
 const STANDINGS_PERIOD = 125;             // мс между пересчётами таблицы Tab
 
 // Пороги уровней заряда дрифта (раздел 6.3)
-const DRIFT_L1 = 0.7;
 const DRIFT_L3 = 2.4;
+
+// Флаги машины из снапшота (раздел 5.3) — нужны только эти три.
+const FLAG_SHIELD = 1 << 4;
+const FLAG_FINISHED = 1 << 5;
+const FLAG_GHOST = 1 << 6;
+
+// Готовые строки статуса для таблицы позиций: в кадре только присваиваются.
+const STATUS_TEXT = ['', 'финиш', 'вышел', 'щит'];
+const STATUS_CLASS = ['st-gap', 'st-gap fin', 'st-gap out', 'st-gap'];
 
 // --- иконки ленты событий --------------------------------------------------
 
@@ -119,9 +127,9 @@ function el(tag, cls, text) {
  * Поля:
  *   speed        м/с, модуль скорости своей машины
  *   lap          текущий круг, 1..laps
- *   laps         всего кругов в гонке
+ *   laps         всего кругов; 0 — оставить значение из race_init
  *   place        место, 1..8
- *   total        машин в гонке
+ *   total        машин в гонке; 0 — оставить значение из race_init
  *   lapTime      с, время текущего круга
  *   bestLap      с, лучший круг, 0 — ещё нет
  *   gap          с, отставание от лидера, 0 у лидера
@@ -131,13 +139,13 @@ function el(tag, cls, text) {
  *   driftLevel   0..3, уровень заряда для цвета полосы
  *   wrongWay     едет против направления трассы
  *   carCount, carSlot, carX, carZ  — из снапшота, раздел 12.3, для мини-карты
- *   carPlace, carLap               — из снапшота, для таблицы по Tab
+ *   carPlace, carLap, carFlags     — из снапшота, для таблицы по Tab
  */
 export function createHudState() {
     return {
         speed: 0,
-        lap: 1, laps: 3,
-        place: 1, total: 1,
+        lap: 1, laps: 0,
+        place: 1, total: 0,
         lapTime: 0, bestLap: 0, gap: 0,
         item: 0, itemReady: false,
         driftCharge: 0, driftLevel: 0,
@@ -148,6 +156,7 @@ export function createHudState() {
         carZ: new Float32Array(MAX_SLOTS),
         carPlace: new Uint8Array(MAX_SLOTS),
         carLap: new Uint8Array(MAX_SLOTS),
+        carFlags: new Uint8Array(MAX_SLOTS),
     };
 }
 
@@ -205,6 +214,7 @@ export class Hud {
         const opts = options || {};
 
         this.localSlot = -1;
+        this.speedMaxKmh = SPEED_MAX_KMH;
         this.mapScale = 1;
         this.mapOffX = 0;
         this.mapOffY = 0;
@@ -271,8 +281,22 @@ export class Hud {
         this._drawTrackOutline(raceInit.track);
 
         this.reset();
-        this.lapsTotal.textContent = INT_STR[Math.min(999, raceInit.laps | 0)];
-        this.placeTotal.textContent = INT_STR[Math.min(999, players.length)];
+        // Значения из race_init становятся текущими; update() перезапишет их
+        // только если main.js явно положит в state.laps / state.total > 0.
+        this.cLaps = Math.min(999, raceInit.laps | 0);
+        this.cTotal = Math.min(999, players.length);
+        this.lapsTotal.textContent = INT_STR[this.cLaps];
+        this.placeTotal.textContent = INT_STR[this.cTotal];
+    }
+
+    /**
+     * Потолок шкалы тахометра, м/с. Стоит выставить по boost_speed выбранной
+     * машины из cars.json, чтобы стрелка доходила до конца именно на бусте.
+     */
+    setSpeedScale(maxSpeedMs) {
+        const kmh = maxSpeedMs * MS_TO_KMH;
+        this.speedMaxKmh = kmh > 20 ? kmh : SPEED_MAX_KMH;
+        this.cSpeedKmh = -1;              // пересчитать дугу и стрелку на следующем кадре
     }
 
     /** Сбросить кэш и показания между заездами. */
@@ -298,7 +322,9 @@ export class Hud {
         this.cNeedle = -1;
         this.cTachHot = -1;
         this.cLap = -1;
+        this.cLaps = -1;
         this.cPlace = -1;
+        this.cTotal = -1;
         this.cItem = -1;
         this.cItemReady = -1;
         this.cDriftStep = -1;
@@ -334,6 +360,18 @@ export class Hud {
         if (lap !== this.cLap) {
             this.cLap = lap;
             this.lapValue.textContent = INT_STR[lap < 0 ? 0 : (lap > 999 ? 999 : lap)];
+        }
+
+        const laps = state.laps | 0;
+        if (laps > 0 && laps !== this.cLaps) {
+            this.cLaps = laps;
+            this.lapsTotal.textContent = INT_STR[laps > 999 ? 999 : laps];
+        }
+
+        const total = state.total | 0;
+        if (total > 0 && total !== this.cTotal) {
+            this.cTotal = total;
+            this.placeTotal.textContent = INT_STR[total > 999 ? 999 : total];
         }
 
         const place = state.place | 0;
@@ -384,7 +422,7 @@ export class Hud {
             this.speedValue.textContent = INT_STR[kmh];
 
             // Дуга: 101 шаг, стрелка: 201 шаг. Пересчёт только при смене шага.
-            let norm = kmh / SPEED_MAX_KMH;
+            let norm = kmh / this.speedMaxKmh;
             if (norm > 1) norm = 1;
 
             const step = (norm * 100 + 0.5) | 0;
@@ -584,12 +622,16 @@ export class Hud {
             if (!this.standingsVisible) this.setStandingsVisible(true);
         };
         this._onKeyUp = (e) => {
-            if (e.code !== 'Tab') return;
+            // Пока таблица не показана, Tab остаётся обычной навигацией по форме.
+            if (e.code !== 'Tab' || !this.standingsVisible) return;
             e.preventDefault();
             this.setStandingsVisible(false);
         };
+        // Уход со страницы с зажатым Tab не должен оставлять таблицу висеть.
+        this._onBlur = () => this.setStandingsVisible(false);
         window.addEventListener('keydown', this._onKeyDown);
         window.addEventListener('keyup', this._onKeyUp);
+        window.addEventListener('blur', this._onBlur);
     }
 
     // --- лента -------------------------------------------------------------
@@ -677,6 +719,16 @@ export class Hud {
                 row.cachedLap = lap;
                 row.lap.textContent = INT_STR[lap > 999 ? 999 : lap];
             }
+            // Статус из флагов снапшота (раздел 5.3): финиш, призрак, щит.
+            const flags = state.carFlags ? state.carFlags[idx] : 0;
+            const status = (flags & FLAG_FINISHED) ? 1
+                : (flags & FLAG_GHOST) ? 2
+                : (flags & FLAG_SHIELD) ? 3 : 0;
+            if (row.cachedStatus !== status) {
+                row.cachedStatus = status;
+                row.gap.textContent = STATUS_TEXT[status];
+                row.gap.className = STATUS_CLASS[status];
+            }
         }
         if (this.standingsCount !== shown) {
             this.standingsCount = shown;
@@ -689,6 +741,7 @@ export class Hud {
             const row = this.standingsRows[p];
             row.cachedSlot = -1;
             row.cachedLap = -1;
+            row.cachedStatus = -1;
             row.node.hidden = p >= players.length;
         }
         this.standingsCount = -1;
@@ -742,7 +795,7 @@ export class Hud {
         const ctx = this.staticCtx;
         ctx.clearRect(0, 0, pixels, pixels);
 
-        const widthPx = Math.max(5 * dpr, Math.min(16 * dpr, hwAvg * 2 * scale));
+        const widthPx = Math.max(7 * dpr, Math.min(16 * dpr, hwAvg * 2 * scale));
 
         ctx.lineJoin = 'round';
         ctx.lineCap = 'round';
@@ -756,7 +809,7 @@ export class Hud {
         ctx.strokeStyle = '#080a12';
         ctx.lineWidth = widthPx + 5 * dpr;
         ctx.stroke();
-        ctx.strokeStyle = '#3b456a';
+        ctx.strokeStyle = '#57649a';
         ctx.lineWidth = widthPx;
         ctx.stroke();
 
@@ -780,7 +833,7 @@ export class Hud {
 
     _showItem(kind, ready) {
         for (let i = 0; i < this.itemIcons.length; i++) {
-            this.itemIcons[i].hidden = this.itemIcons[i].dataset.kind !== String(kind);
+            this.itemIcons[i].node.hidden = this.itemIcons[i].kind !== kind;
         }
         this.itemEmpty.hidden = kind !== 0;
         this.itemBox.className = kind !== 0 && ready ? 'hud-box hud-item ready' : 'hud-box hud-item';
@@ -857,11 +910,10 @@ export class Hud {
         for (let i = 0; i < ITEM_DEFS.length; i++) {
             const def = ITEM_DEFS[i];
             const holder = el('div', 'icon-wrap');
-            holder.dataset.kind = String(def.kind);
             holder.innerHTML = itemIconSvg(def.id, 62);
             holder.hidden = true;
             this.itemBox.appendChild(holder);
-            this.itemIcons.push(holder);
+            this.itemIcons.push({ node: holder, kind: def.kind });
         }
         this.itemHint = el('div', 'hint-key', 'E');
         this.itemHint.hidden = true;
@@ -873,9 +925,11 @@ export class Hud {
         speedo.innerHTML = this._tachSvg();
         this.tachFill = speedo.querySelector('.tach-fill');
         this.needle = speedo.querySelector('.tach-needle');
-        this.speedValue = el('div', 'hud-speed-val num', '0');
-        speedo.appendChild(this.speedValue);
-        speedo.appendChild(el('div', 'hud-speed-unit', 'КМ/Ч'));
+        const speedRow = el('div', 'hud-speed-val num');
+        this.speedValue = el('span', null, '0');
+        speedRow.appendChild(this.speedValue);
+        speedRow.appendChild(el('span', 'unit', 'км/ч'));
+        speedo.appendChild(speedRow);
         wrap.appendChild(speedo);
 
         // Заряд дрифта
@@ -951,7 +1005,7 @@ export class Hud {
             body.appendChild(row);
             this.standingsRows.push({
                 node: row, color: color, name: name, lap: lap, gap: gap,
-                cachedSlot: -1, cachedLap: -1,
+                cachedSlot: -1, cachedLap: -1, cachedStatus: -1,
             });
         }
         this.standingsNode.appendChild(body);
@@ -982,7 +1036,7 @@ export class Hud {
                 + '" stroke-width="' + (major ? 4 : 2.5) + '" stroke-linecap="round"/>';
         }
 
-        return '<svg viewBox="0 0 240 150" preserveAspectRatio="xMidYMax meet">'
+        return '<svg viewBox="0 0 240 190" preserveAspectRatio="xMidYMid meet">'
             + '<path d="' + arc + '" fill="none" stroke="#080a12" stroke-width="26" stroke-linecap="round"/>'
             + '<path d="' + arc + '" fill="none" stroke="#232b42" stroke-width="18" stroke-linecap="round"/>'
             + '<path class="tach-fill" d="' + arc + '" fill="none" stroke="#ffc93c" stroke-width="18"'
@@ -990,8 +1044,8 @@ export class Hud {
             + '" stroke-dashoffset="' + TACH_LEN.toFixed(2) + '"/>'
             + ticks
             + '<g class="tach-needle" transform="' + NEEDLE_ROT[0] + '">'
-            + '<path d="M' + (TACH_CX - 6) + ' ' + TACH_CY + ' L' + TACH_CX + ' ' + (TACH_CY - TACH_R + 8)
-            + ' L' + (TACH_CX + 6) + ' ' + TACH_CY + ' Z" fill="#ff5a5f" stroke="#080a12" stroke-width="3"'
+            + '<path d="M' + (TACH_CX - 8) + ' ' + TACH_CY + ' L' + TACH_CX + ' ' + (TACH_CY - TACH_R + 4)
+            + ' L' + (TACH_CX + 8) + ' ' + TACH_CY + ' Z" fill="#ff5a5f" stroke="#080a12" stroke-width="3.5"'
             + ' stroke-linejoin="round"/>'
             + '</g>'
             + '<circle cx="' + TACH_CX + '" cy="' + TACH_CY + '" r="12" fill="#232b42" stroke="#080a12" stroke-width="3"/>'

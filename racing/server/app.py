@@ -79,9 +79,6 @@ class StaticHandler(tornado.web.StaticFileHandler):
         # кэша на сутки, иначе коллеги будут ловить вчерашний main.js.
         self.set_header('Cache-Control', 'no-cache')
 
-    def compute_etag(self):
-        return tornado.web.StaticFileHandler.compute_etag(self)
-
 
 _MISSING_INDEX_PAGE = (
     '<!doctype html><meta charset="utf-8">'

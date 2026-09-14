@@ -3,7 +3,8 @@
  *
  * Экспортирует buildTrackMeshes(track, theme, quality) из контракта (раздел 3).
  * Вход — данные формата 12.1 (плоские массивы x, y, z, tx, tz, nx, nz, hw, s),
- * либо объект Track клиента, хранящий те же поля, либо список samples из 7.2.
+ * либо экземпляр клиентского Track из js/track.js (те же массивы под именами
+ * cx, cy, cz, ctx, ctz, cnx, cnz, chw, cs), либо список samples из 7.2.
  *
  * Бюджет (раздел 1): вся трасса — шесть мешей и не более ~35 тысяч
  * треугольников на среднем пресете, то есть меньше половины кадрового лимита.
@@ -26,12 +27,14 @@ import {
     MeshBuilder,
     mergeGeometries,
     surfaceGrid,
+    ribbonStrip,
     extrudeProfile,
     shade,
     mixColor,
     toColor,
     disposeObject,
-    countTriangles
+    countTriangles,
+    countDrawCalls
 } from './geomutil.js';
 
 // ---------------------------------------------------------------------------
@@ -136,6 +139,30 @@ export function readTrack(track) {
             hw: track.hw,
             s: track.s,
             startGrid: track.start_grid || track.startGrid || null
+        };
+    }
+
+    if (track.cx && track.cz && track.chw) {
+        // экземпляр клиентского Track из js/track.js: те же данные, но поля
+        // названы иначе (контракт 12.1 фиксирует формат JSON, а не имена полей
+        // класса), поэтому принимаем и такой вид
+        const count = track.count || track.cx.length;
+        return {
+            count: count,
+            length: track.length || count * (track.step || 2.0),
+            step: track.step || 2.0,
+            theme: track.theme || 'city',
+            seed: track.decorSeed === undefined ? 12345 : track.decorSeed,
+            x: track.cx,
+            y: track.cy,
+            z: track.cz,
+            tx: track.ctx,
+            tz: track.ctz,
+            nx: track.cnx,
+            nz: track.cnz,
+            hw: track.chw,
+            s: track.cs,
+            startGrid: track.startGrid || null
         };
     }
 
@@ -260,7 +287,7 @@ export function buildTrackMeshes(track, theme, quality) {
         materials: { surface: surfaceMat, markings: markMat },
         bounds: { minY: minY, maxY: maxY, groundY: groundY },
         stats: {
-            drawCalls: 6,
+            drawCalls: countDrawCalls(group),
             triangles: countTriangles(group)
         },
         dispose: function () {
@@ -371,21 +398,23 @@ function buildMarkings(T, P, colors, material) {
 
     // кромочные линии по обеим сторонам, сплошные
     if (P.edgeLines) {
+        const inner = new Float32Array(T.count * 3);
+        const outer = new Float32Array(T.count * 3);
         for (let side = 0; side < 2; side++) {
             const sgn = side === 0 ? 1 : -1;
-            surfaceGrid(b, {
-                rows: T.count,
-                cols: 2,
+            for (let i = 0; i < T.count; i++) {
+                const ui = (T.hw[i] - 0.55) * sgn;
+                const uo = (T.hw[i] - 0.18) * sgn;
+                inner[i * 3] = T.x[i] + T.nx[i] * ui;
+                inner[i * 3 + 1] = T.y[i] + lift;
+                inner[i * 3 + 2] = T.z[i] + T.nz[i] * ui;
+                outer[i * 3] = T.x[i] + T.nx[i] * uo;
+                outer[i * 3 + 1] = T.y[i] + lift;
+                outer[i * 3 + 2] = T.z[i] + T.nz[i] * uo;
+            }
+            ribbonStrip(b, inner, outer, {
                 closed: true,
                 flip: sgn < 0,
-                point: function (i, j, out) {
-                    const inner = T.hw[i] - 0.55;
-                    const outer = T.hw[i] - 0.18;
-                    const u = (j === 0 ? inner : outer) * sgn;
-                    out[0] = T.x[i] + T.nx[i] * u;
-                    out[1] = T.y[i] + lift;
-                    out[2] = T.z[i] + T.nz[i] * u;
-                },
                 color: function (i, j, c) {
                     c.copy(colors.line);
                 }

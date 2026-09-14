@@ -72,7 +72,12 @@ def print_banner(args, host_url, addresses, notes):
     print('')
     print('      %s' % host_url)
     print('')
-    if addresses:
+    local_only = all(a.startswith('127.') or a == 'localhost' for a in addresses)
+    if addresses and local_only:
+        print('  Сервер слушает только этот компьютер (--bind %s):' % args.bind)
+        print('  соседи по сети подключиться не смогут.')
+        print('')
+    elif addresses:
         print('  ДИКТУЙТЕ СОСЕДЯМ ПО СЕТИ:')
         print('')
         for address in addresses:

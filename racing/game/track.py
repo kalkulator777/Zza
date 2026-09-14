@@ -8,9 +8,9 @@
 forward = (sin yaw, cos yaw), right = (cos yaw, -sin yaw). Отсюда для касательной
 (tx, tz) нормаль «вправо» равна (tz, -tx).
 
-Все массивы геометрии хранятся в двух видах:
+Все передаваемые массивы геометрии хранятся в двух видах:
   * ``_j*`` — значения, округлённые до 3 знаков, ровно они уходят в JSON клиенту;
-  * ``_c*`` — те же значения, приведённые к float32.
+  * ``_c*`` — те же значения, приведённые к float32, по ним идёт счёт.
 Клиент кладёт присланные числа в Float32Array, то есть получает ровно ``_c*``.
 Счёт на обеих сторонах идёт в float64 над одинаковыми входными числами, поэтому
 nearest_index / surface / clamp_to_track / advance_progress сходятся бит в бит.
@@ -49,6 +49,11 @@ GRID_LANE_FRACTION = 0.42  # доля половины ширины под см�
 GRID_LANE_MAX = 3.4        # м, дальше от оси не отходим даже на широкой трассе
 
 ITEM_ROW_SPREAD = 0.72     # доля половины ширины, по которой раскидан ряд боксов
+
+# Круг засчитывается по floor(progress / length) в момент пересечения линии.
+# progress в этот момент только что перешагнул кратное длине круга, и запас
+# в микрометр снимает вопрос о единице в последнем разряде.
+LAP_EPS = 1e-9
 
 SPLINE_MIN_SUBDIV = 8      # минимум подотрезков на сегмент при оцифровке сплайна
 SPLINE_MAX_SUBDIV = 256
@@ -197,13 +202,16 @@ class Track(object):
         # Продольный уклон в точке: считается по уже квантованным высотам,
         # чтобы клиент получил ровно те же числа. На физику не влияет (раздел 4),
         # нужен только для наклона кузова и камеры.
+        # Уклон НЕ квантуется: он не передаётся клиенту, тот считает его сам
+        # по тем же (уже квантованным) высотам и той же формулой. Так обе
+        # стороны получают одно и то же с точностью до реализации atan.
         pitch = [0.0] * count
         inv2 = 1.0 / (2.0 * self._step)
         for i in range(count):
             a = i - 1 if i > 0 else count - 1
             b = i + 1 if i + 1 < count else 0
             pitch[i] = math.atan((self._cy[b] - self._cy[a]) * inv2)
-        self._jpitch, self._cpitch = _quantize(pitch)
+        self._cpitch = pitch
 
         self.samples = [TrackSample(self._cx[i], self._cy[i], self._cz[i],
                                     self._ctx[i], self._ctz[i],
@@ -383,13 +391,13 @@ class Track(object):
         """Шаг 14 физики: выталкивание из стены, гашение скорости.
 
         Полотно шириной ``half_width`` — асфальт. Дальше идёт зона вылета
-        шириной WALL_MARGIN: там уже выставлен флаг ``off_track`` (его читает
-        шаг 11), но машина ещё едет. За ней — жёсткая стена.
-        Обновляет: x, z, vx, vz, sample_idx, off_track.
+        шириной WALL_MARGIN: там уже выставлен флаг ``offtrack`` (его читает
+        шаг 11 на следующем шаге), но машина ещё едет. За ней — жёсткая стена.
+        Обновляет: x, z, vx, vz, sample_idx, offtrack.
         """
         i, lateral, half_width, _y, _pitch = self.surface(state.x, state.z, hint)
         state.sample_idx = i
-        state.off_track = lateral > half_width or lateral < -half_width
+        state.offtrack = lateral > half_width or lateral < -half_width
         limit = half_width + WALL_MARGIN
         over = 0.0
         if lateral > limit:
@@ -410,12 +418,18 @@ class Track(object):
             state.vz -= nz * k
 
     def advance_progress(self, state, hint: int) -> None:
-        """Шаг 16 физики: накопление пути, отсечки, круги.
+        """Шаг 16 физики: накопление пути, отсечки, круги (раздел 7.4).
 
-        Обновляет: sample_idx, track_s, progress, next_cp, lap, lap_started.
+        Обновляет: sample_idx, progress, checkpoint, lap. Больше полей у
+        ``CarState`` нет — ``__slots__``, поэтому предыдущее положение по дуге
+        не хранится отдельно, а берётся из самого ``progress``: по построению
+        ``progress`` всегда равен ``s + круги * length``, значит остаток от
+        деления по модулю длины и есть прошлое ``s``.
+
         Скачок больше четверти круга не засчитывается (телепорт или шум), но
-        точка отсчёта пересинхронизируется, иначе машина осталась бы навсегда
-        заблокированной после респауна.
+        точка отсчёта пересинхронизируется — назад, никогда вперёд. Так машина
+        после респауна не остаётся навсегда с гигантским ds, а прыжок через
+        газон не приносит ни метра прогресса, только потерю круга.
         """
         n = self._n
         i = self.nearest_index(state.x, state.z, hint)
@@ -435,7 +449,10 @@ class Track(object):
         elif s_new < 0.0:
             s_new += length
 
-        last = state.track_s
+        progress = state.progress
+        laps_done = math.floor(progress / length)
+        last = progress - laps_done * length      # прошлое s, без оператора %
+
         ds = s_new - last
         if ds > self._half_length:
             ds -= length
@@ -443,16 +460,24 @@ class Track(object):
             ds += length
 
         if ds > self._quarter_length or ds < -self._quarter_length:
-            state.track_s = s_new
+            # Телепорт: путь не засчитываем. Точку отсчёта подтягиваем к новому
+            # положению, иначе машина навсегда осталась бы с гигантским ds,
+            # но НИКОГДА вперёд: прыжок через газон обязан быть невыгодным.
+            target = s_new + laps_done * length
+            if target > progress:
+                target -= length
+            state.progress = target
             return
 
-        state.progress += ds
+        progress += ds
+        state.progress = progress
         cp_s = self._cp_s
+        cp = state.checkpoint
 
         if ds > 0.0:
             remaining = ds
             for _ in range(CHECKPOINT_COUNT):
-                target = cp_s[state.next_cp]
+                target = cp_s[cp]
                 gap = target - last
                 if gap < 0.0:
                     gap += length
@@ -460,17 +485,17 @@ class Track(object):
                     break
                 last = target
                 remaining -= gap
-                if state.next_cp == 0:
-                    # линия старта пройдена в правильном порядке отсечек
-                    if state.lap_started:
-                        state.lap += 1
-                    else:
-                        state.lap_started = True
-                state.next_cp = state.next_cp + 1 if state.next_cp + 1 < CHECKPOINT_COUNT else 0
+                if cp == 0:
+                    # линия старта пересечена после всех одиннадцати отсечек:
+                    # круг можно засчитывать. Счётчик берём из самого пути,
+                    # он уже перешагнул через кратное длине круга.
+                    # LAP_EPS гасит единицу в последнем разряде на самой границе.
+                    state.lap = int(math.floor(progress / length + LAP_EPS))
+                cp = cp + 1 if cp + 1 < CHECKPOINT_COUNT else 0
         elif ds < 0.0:
             remaining = -ds
             for _ in range(CHECKPOINT_COUNT):
-                prev_cp = state.next_cp - 1 if state.next_cp > 0 else CHECKPOINT_COUNT - 1
+                prev_cp = cp - 1 if cp > 0 else CHECKPOINT_COUNT - 1
                 target = cp_s[prev_cp]
                 gap = last - target
                 if gap < 0.0:
@@ -479,23 +504,24 @@ class Track(object):
                     break
                 last = target
                 remaining -= gap
-                state.next_cp = prev_cp
-                if prev_cp == 0:
+                cp = prev_cp
+                if prev_cp == 0 and state.lap > 0:
                     # откат через линию старта задним ходом
-                    if state.lap > 0:
-                        state.lap -= 1
-                    else:
-                        state.lap_started = False
+                    state.lap -= 1
 
-        state.track_s = s_new
+        state.checkpoint = cp
 
     def init_state(self, state) -> None:
-        """Первичная привязка машины к трассе: решётка, респаун, телепорт.
+        """Первичная привязка машины к трассе: стартовая решётка, начало гонки.
 
-        Поля progress / track_s / next_cp / lap / lap_started / sample_idx /
-        off_track принадлежат этому модулю. Стартовая решётка стоит позади
-        линии, поэтому progress отрицателен: пересечение линии даёт ровно ноль,
-        а floor(progress / length) совпадает со счётчиком кругов по отсечкам.
+        Поля progress / checkpoint / lap / sample_idx / offtrack принадлежат
+        этому модулю. Решётка стоит позади линии, поэтому progress отрицателен:
+        пересечение линии даёт ровно ноль, а floor(progress / length) совпадает
+        со счётчиком кругов по отсечкам.
+
+        Для респауна по ходу гонки это звать НЕ надо: круги обнулятся.
+        Достаточно поправить x/z — advance_progress сам увидит скачок, не
+        засчитает его и пересинхронизируется.
         """
         i = self._global_index(state.x, state.z)
         dx = state.x - self._cx[i]
@@ -512,12 +538,10 @@ class Track(object):
         elif s_pos < 0.0:
             s_pos += self.length
         state.sample_idx = i
-        state.track_s = s_pos
         state.progress = s_pos - self.length if s_pos > self._half_length else s_pos
-        state.next_cp = 0
+        state.checkpoint = 0
         state.lap = 0
-        state.lap_started = False
-        state.off_track = False
+        state.offtrack = False
 
     # ------------------------------------------------------------ сериализация
 
@@ -565,20 +589,6 @@ class Track(object):
         inv = 1.0 / span
         return [[round((xs[k] - min_x) * inv, 4),
                  round((zs[k] - min_z) * inv, 4)] for k in range(points)]
-
-    def summary(self) -> dict:
-        """Сводка для инструментов и логов."""
-        return {
-            'id': self.id,
-            'name': self.name,
-            'length': self.length,
-            'count': self._n,
-            'step': self._step,
-            'min_half_width': min(self._chw),
-            'max_half_width': max(self._chw),
-            'min_y': min(self._cy),
-            'max_y': max(self._cy),
-        }
 
     def __repr__(self):
         return '<Track %s %.1f m, %d samples%s>' % (

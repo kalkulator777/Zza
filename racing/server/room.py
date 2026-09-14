@@ -90,6 +90,7 @@ class ContentLibrary(object):
         self.track_ids = ()
         self.cars = []               # элементы welcome.content.cars (§9)
         self.car_ids = ()
+        self.car_catalog = None      # game.cars.CarCatalog, если модуль доступен
         self.colors = list(config.COLORS)
         self.issues = []             # что не загрузилось — печатается при старте
         self._geometry = {}          # (track_id, mirror) -> Track
@@ -151,6 +152,28 @@ class ContentLibrary(object):
         if not os.path.isfile(self.cars_path):
             self.issues.append('нет файла машин %s' % self.cars_path)
             return
+        if self._load_cars_via_module():
+            return
+        self._load_cars_plain()
+
+    def _load_cars_via_module(self):
+        """Штатный путь: загрузка и валидация через game.cars ([track])."""
+        try:
+            from game.cars import CarCatalog
+        except ImportError:
+            return False
+        try:
+            catalog = CarCatalog.load(self.cars_path)
+        except Exception as exc:
+            self.issues.append('cars.json не прошёл проверку game.cars: %s' % exc)
+            return True                  # файл есть, но он битый: свой разбор не спасёт
+        self.car_catalog = catalog
+        self.cars = catalog.to_client()
+        self.car_ids = tuple(catalog.ids)
+        return True
+
+    def _load_cars_plain(self):
+        """Запасной разбор, пока модуля game.cars ещё нет в репозитории."""
         try:
             with open(self.cars_path, 'r', encoding='utf-8') as fp:
                 data = json.load(fp)
@@ -304,13 +327,6 @@ class Room(object):
         self.skipped_ticks = 0
 
     # --- общие сведения -----------------------------------------------------
-
-    @property
-    def population(self):
-        return len(self.players)
-
-    def is_empty(self):
-        return not self.players
 
     def summary(self):
         """Элемент rooms[] события rooms (§9)."""
@@ -742,10 +758,12 @@ class Room(object):
         if not self.tick_samples:
             return
         self._log('комната %s: гонка окончена (%s), тиков %d, '
-                  'тик avg %.3f мс, max %.3f мс, пропущено %d'
+                  'тик avg %.3f мс, max %.3f мс (бюджет %.1f мс%s), пропущено %d'
                   % (self.id, reason, self.tick_samples,
-                     self.tick_ms_sum / self.tick_samples,
-                     self.tick_ms_max, self.skipped_ticks))
+                     self.tick_ms_sum / self.tick_samples, self.tick_ms_max,
+                     config.TICK_BUDGET_MS,
+                     '' if self.tick_ms_max <= config.TICK_BUDGET_MS else ', ПРЕВЫШЕН',
+                     self.skipped_ticks))
         self.tick_samples = 0
         self.tick_ms_sum = 0.0
 

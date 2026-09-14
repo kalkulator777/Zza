@@ -231,6 +231,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Тумблер */
 .toggle {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 10px;
@@ -269,6 +270,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Галочка */
 .check {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 9px;
@@ -410,8 +412,8 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
     padding: 26px 26px 22px;
 }
 
-.menu-left { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
-.menu-right { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.menu-left { display: flex; flex-direction: column; gap: 16px; min-height: 0; min-width: 0; }
+.menu-right { display: flex; flex-direction: column; gap: 16px; min-height: 0; min-width: 0; }
 
 .brand { display: flex; align-items: center; gap: 14px; }
 
@@ -454,7 +456,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .server-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); flex: none; }
 
 .field { display: flex; flex-direction: column; gap: 7px; }
-.field + .field { margin-top: 14px; }
+.field + .field { margin-top: 13px; }
 
 .row { display: flex; align-items: center; gap: 10px; }
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -466,9 +468,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 .room-row {
     display: grid;
-    grid-template-columns: 1fr 172px 92px 106px 112px 106px;
+    grid-template-columns: minmax(0, 1fr) 166px 84px 92px 104px 100px;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     padding: 12px 14px;
     background: var(--panel-2);
     border: var(--bw) solid var(--ink);
@@ -565,17 +567,17 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
     min-height: 0;
 }
 
-.modal-body { padding: 16px; overflow-y: auto; min-height: 0; }
+.modal-body { padding: 12px 16px; overflow-y: auto; min-height: 0; }
 
 .modal-foot {
     display: flex;
     justify-content: flex-end;
     gap: 12px;
-    padding: 14px 16px;
+    padding: 11px 16px;
     border-top: var(--bw) solid var(--ink);
 }
 
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 .form-wide { grid-column: 1 / -1; }
 
 .track-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
@@ -583,7 +585,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .track-card {
     text-align: left;
     font-family: inherit;
-    padding: 12px;
+    padding: 10px 11px;
     background: var(--panel-2);
     border: var(--bw) solid var(--ink);
     border-radius: var(--r-md);
@@ -591,7 +593,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
     color: var(--text);
     display: flex;
     flex-direction: column;
-    gap: 7px;
+    gap: 5px;
 }
 
 .track-card:hover { background: var(--panel-3); }
@@ -603,7 +605,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 }
 
 .track-card .t-name { font-size: 15px; font-weight: 900; }
-.track-card .t-desc { font-size: 12px; font-weight: 600; color: var(--text-dim); min-height: 32px; }
+.track-card .t-desc { font-size: 12px; font-weight: 600; color: var(--text-dim); min-height: 28px; line-height: 1.22; }
 
 .diff { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 800; color: var(--text-mute); text-transform: uppercase; letter-spacing: .8px; }
 .diff-dots { display: flex; gap: 4px; }
@@ -615,7 +617,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .stepper { display: flex; align-items: center; gap: 10px; }
 
 .stepper .step {
-    width: 40px; height: 40px;
+    width: 36px; height: 36px;
     font-family: inherit;
     font-size: 22px;
     font-weight: 900;
@@ -632,9 +634,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .stepper .step:disabled { filter: grayscale(.8) brightness(.6); cursor: not-allowed; }
 
 .stepper .val {
-    min-width: 66px;
+    min-width: 58px;
     text-align: center;
-    font-size: 26px;
+    font-size: 24px;
     font-weight: 900;
     font-variant-numeric: tabular-nums;
 }
@@ -642,11 +644,12 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .items-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
 
 .item-check {
+    position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 6px;
-    padding: 10px 4px;
+    padding: 5px 4px;
     background: var(--panel-2);
     border: var(--bw) solid var(--ink);
     border-radius: var(--r-md);
@@ -656,7 +659,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 }
 
 .item-check input { position: absolute; opacity: 0; width: 0; height: 0; }
-.item-check .ic { width: 34px; height: 34px; opacity: .32; transition: opacity .1s linear, transform .1s ease-out; }
+.item-check .ic { width: 30px; height: 30px; opacity: .32; transition: opacity .1s linear, transform .1s ease-out; }
 .item-check .nm { color: var(--text-mute); }
 .item-check.is-on { border-color: var(--accent); }
 .item-check.is-on .ic { opacity: 1; transform: scale(1.06); }
@@ -683,24 +686,32 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
     position: absolute;
     inset: 0;
     display: grid;
-    grid-template-columns: 330px 1fr 330px;
-    grid-template-rows: auto 1fr;
-    gap: 16px;
-    padding: 22px;
+    grid-template-columns: 316px minmax(0, 1fr) 316px;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 14px;
+    padding: 18px;
 }
 
 .lobby-top {
     grid-column: 1 / -1;
     display: flex;
     align-items: center;
-    gap: 14px;
-    padding: 10px 16px;
+    gap: 12px;
+    padding: 8px 14px;
+    min-width: 0;
 }
 
-.lobby-title { font-size: 22px; font-weight: 900; letter-spacing: .6px; }
+.lobby-title {
+    font-size: 20px;
+    font-weight: 900;
+    letter-spacing: .5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .lobby-spacer { flex: 1; }
 
-.lobby-col { display: flex; flex-direction: column; gap: 14px; min-height: 0; }
+.lobby-col { display: flex; flex-direction: column; gap: 12px; min-height: 0; min-width: 0; }
 
 /* Список игроков */
 
@@ -757,20 +768,20 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Выбор машины */
 
-.cars-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; padding: 12px; }
+.cars-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; padding: 12px 12px 0; }
 
 .car-card {
     font-family: inherit;
-    text-align: left;
-    color: var(--text);
-    padding: 11px 10px;
+    color: var(--text-dim);
+    padding: 8px 4px 7px;
     background: var(--panel-2);
     border: var(--bw) solid var(--ink);
     border-radius: var(--r-md);
     cursor: pointer;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    align-items: center;
+    gap: 3px;
 }
 
 .car-card:hover { background: var(--panel-3); }
@@ -778,24 +789,46 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .car-card.is-active {
     background: var(--panel-3);
     border-color: var(--accent);
-    box-shadow: inset 0 0 0 2px var(--accent), 0 4px 0 var(--ink);
+    color: var(--text);
+    box-shadow: inset 0 0 0 2px var(--accent);
 }
 
-.car-card .c-art { height: 54px; display: grid; place-items: center; }
-.car-card .c-name { font-size: 15px; font-weight: 900; }
-.car-card .c-desc { font-size: 11px; font-weight: 600; color: var(--text-dim); min-height: 28px; line-height: 1.25; }
+.car-card .c-art { height: 36px; display: grid; place-items: center; }
+.car-card .c-name { font-size: 13px; font-weight: 900; text-align: center; }
 
-.bars { display: flex; flex-direction: column; gap: 4px; }
-.bar-row { display: grid; grid-template-columns: 46px 1fr; align-items: center; gap: 6px; }
-.bar-name { font-size: 10px; font-weight: 800; color: var(--text-mute); text-transform: uppercase; letter-spacing: .5px; }
-.bar-track { display: flex; gap: 3px; }
+/* Подробности по выбранной машине: крупный силуэт и полосы во всю ширину */
+.car-detail {
+    display: grid;
+    grid-template-columns: 176px minmax(0, 1fr);
+    align-items: center;
+    gap: 16px;
+    padding: 12px;
+}
+
+.car-detail .cd-art {
+    display: grid;
+    place-items: center;
+    padding: 12px 6px;
+    background: rgba(6, 8, 14, .38);
+    border: 2px solid var(--ink);
+    border-radius: var(--r-md);
+}
+
+.cd-info { min-width: 0; }
+.cd-name { font-size: 21px; font-weight: 900; letter-spacing: .3px; }
+.cd-desc { font-size: 13px; font-weight: 700; color: var(--text-dim); margin: 2px 0 10px; }
+
+.bars { display: flex; flex-direction: column; gap: 6px; }
+.bar-row { display: grid; grid-template-columns: 76px minmax(0, 1fr); align-items: center; gap: 10px; }
+.bar-name { font-size: 11px; font-weight: 800; color: var(--text-mute); text-transform: uppercase; letter-spacing: .6px; }
+.bar-track { display: flex; gap: 4px; }
 
 .bar-seg {
     flex: 1;
-    height: 8px;
-    border-radius: 3px;
+    height: 13px;
+    border-radius: 4px;
     background: #121727;
-    border: 1px solid var(--ink);
+    border: 2px solid var(--ink);
 }
 
 .bar-seg.on { background: var(--accent); }
@@ -806,7 +839,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Палитра цветов */
 
-.colors-row { display: flex; flex-wrap: wrap; gap: 9px; padding: 12px 14px; }
+.colors-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
 
 .color-btn {
     width: 40px; height: 40px;
@@ -835,7 +868,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Настройки комнаты (справа) */
 
-.settings-view { padding: 12px 14px; display: flex; flex-direction: column; gap: 11px; }
+.settings-view { padding: 10px 12px; display: flex; flex-direction: column; gap: 9px; }
 
 .set-row {
     display: flex;
@@ -918,27 +951,35 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
     inset: 0;
     display: grid;
     place-items: center;
-    background: radial-gradient(closest-side, rgba(8, 10, 18, .55), rgba(8, 10, 18, 0) 70%);
+    background: radial-gradient(closest-side,
+        rgba(8, 10, 18, .86), rgba(8, 10, 18, .62) 55%, rgba(8, 10, 18, .34));
 }
 
 .countdown-num {
-    font-size: 200px;
+    font-size: 224px;
     font-weight: 900;
     line-height: 1;
     color: var(--accent);
-    text-shadow: 0 8px 0 var(--ink), 0 0 60px rgba(255, 201, 60, .5);
+    -webkit-text-stroke: 12px var(--ink);
+    paint-order: stroke fill;
+    text-shadow: 0 10px 0 rgba(8, 10, 18, .6), 0 0 70px rgba(255, 201, 60, .45);
     transform: scale(1);
     will-change: transform, opacity;
 }
 
-.countdown-num.go { color: var(--green); font-size: 150px; letter-spacing: 6px; }
+.countdown-num.go {
+    color: var(--green);
+    font-size: 132px;
+    letter-spacing: 7px;
+    -webkit-text-stroke: 10px var(--ink);
+}
 .countdown-num.pop { animation: cd-pop .55s ease-out both; }
 
 @keyframes cd-pop {
-    0%   { transform: scale(1.9); opacity: 0; }
-    18%  { transform: scale(1);   opacity: 1; }
-    75%  { transform: scale(1);   opacity: 1; }
-    100% { transform: scale(.82); opacity: .25; }
+    0%   { transform: scale(2.1); opacity: 0; }
+    16%  { transform: scale(1);   opacity: 1; }
+    80%  { transform: scale(1);   opacity: 1; }
+    100% { transform: scale(.94); opacity: .85; }
 }
 
 /* ==========================================================================
@@ -1061,9 +1102,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 .hud-speedo {
     left: 18px;
-    bottom: 16px;
-    width: 232px;
-    height: 150px;
+    bottom: 14px;
+    width: 236px;
+    height: 188px;
     background: none;
     border: 0;
     box-shadow: none;
@@ -1071,26 +1112,27 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 .hud-speedo svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 
+/* Цифра и единица стоят ПОД раскрытием дуги, стрелку они не перекрывают. */
 .hud-speed-val {
     position: absolute;
     left: 0; right: 0;
-    bottom: 30px;
-    text-align: center;
-    font-size: 54px;
+    bottom: 6px;
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 7px;
+    font-size: 46px;
     font-weight: 900;
     line-height: 1;
     text-shadow: 0 3px 0 var(--ink);
 }
 
-.hud-speed-unit {
-    position: absolute;
-    left: 0; right: 0;
-    bottom: 10px;
-    text-align: center;
-    font-size: 12px;
+.hud-speed-val .unit {
+    font-size: 13px;
     font-weight: 900;
-    letter-spacing: 2.4px;
-    color: var(--text-mute);
+    letter-spacing: 1.8px;
+    color: var(--text-dim);
+    text-shadow: none;
 }
 
 /* -- Низ по центру: заряд дрифта ----------------------------------------- */
@@ -1139,18 +1181,19 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 .hud-minimap {
     right: 18px;
-    bottom: 16px;
-    width: 188px;
-    height: 188px;
+    bottom: 14px;
+    width: 190px;
+    height: 190px;
     padding: 8px;
     border-radius: 20px;
+    background: rgba(14, 18, 30, .84);
 }
 
 .hud-minimap canvas {
     position: absolute;
     left: 8px; top: 8px;
-    width: 166px;
-    height: 166px;
+    width: 168px;
+    height: 168px;
 }
 
 /* -- Лента событий ------------------------------------------------------- */
@@ -1255,7 +1298,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 .st-row {
     display: grid;
-    grid-template-columns: 34px 16px 1fr 74px 78px;
+    grid-template-columns: 34px 16px minmax(0, 1fr) 74px 88px;
     align-items: center;
     gap: 10px;
     padding: 7px 10px;
@@ -1270,7 +1313,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .st-row .st-color { width: 14px; height: 14px; border-radius: 5px; border: 2px solid var(--ink); }
 .st-row .st-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st-row .st-lap { color: var(--text-dim); font-size: 12px; text-align: right; }
-.st-row .st-gap { color: var(--text-dim); font-size: 13px; text-align: right; }
+.st-row .st-gap { color: var(--text-mute); font-size: 12px; text-align: right; font-weight: 800; }
+.st-row .st-gap.fin { color: var(--accent); }
+.st-row .st-gap.out { color: var(--red); }
 
 /* ==========================================================================
    ИТОГИ
@@ -1290,22 +1335,22 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .results-title {
     display: flex;
     align-items: center;
-    gap: 14px;
-    padding: 14px 20px;
+    gap: 13px;
+    padding: 11px 20px;
     border-bottom: var(--bw) solid var(--ink);
     background: linear-gradient(180deg, rgba(255, 255, 255, .08), rgba(255, 255, 255, 0));
 }
 
-.results-title h2 { font-size: 26px; letter-spacing: 3px; text-transform: uppercase; }
+.results-title h2 { font-size: 23px; letter-spacing: 2.4px; text-transform: uppercase; }
 
-.results-rows { padding: 12px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; min-height: 0; }
+.results-rows { padding: 10px 12px; display: flex; flex-direction: column; gap: 7px; overflow-y: auto; min-height: 0; }
 
 .res-row {
     display: grid;
-    grid-template-columns: 62px 26px 1fr 128px 118px 118px;
+    grid-template-columns: 52px 24px minmax(0, 1fr) 118px 112px 112px;
     align-items: center;
     gap: 12px;
-    padding: 11px 14px;
+    padding: 6px 14px;
     background: var(--panel-2);
     border: var(--bw) solid var(--ink);
     border-radius: var(--r-md);
@@ -1318,9 +1363,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .res-place {
     display: grid;
     place-items: center;
-    width: 46px; height: 46px;
-    border-radius: 14px;
-    font-size: 22px;
+    width: 42px; height: 36px;
+    border-radius: 12px;
+    font-size: 20px;
     font-weight: 900;
     color: var(--ink);
     background: var(--panel-3);
@@ -1332,9 +1377,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .res-place.m3 { background: #d08a4f; }
 
 .res-color { width: 22px; height: 22px; border-radius: 8px; border: 2px solid var(--ink); }
-.res-name { font-size: 17px; font-weight: 900; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-name { font-size: 16px; font-weight: 900; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .res-car { font-size: 13px; color: var(--text-dim); }
-.res-time { font-size: 19px; font-variant-numeric: tabular-nums; text-align: right; }
+.res-time { font-size: 18px; font-variant-numeric: tabular-nums; text-align: right; }
 .res-best { font-size: 15px; color: var(--purple); font-variant-numeric: tabular-nums; text-align: right; }
 .res-col-head { font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--text-mute); }
 
@@ -1343,7 +1388,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
     align-items: center;
     justify-content: space-between;
     gap: 14px;
-    padding: 13px 20px;
+    padding: 10px 20px;
     border-top: var(--bw) solid var(--ink);
 }
 
@@ -1352,7 +1397,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .res-countdown .n {
     display: grid;
     place-items: center;
-    min-width: 40px; height: 40px;
+    min-width: 38px; height: 38px;
     padding: 0 8px;
     border-radius: 12px;
     background: var(--accent);
@@ -1367,10 +1412,11 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
    ОВЕРЛЕЙ ПРОИЗВОДИТЕЛЬНОСТИ (F3)
    ========================================================================== */
 
+/* Правый край под панелью времён: не перекрывает ни круг/место, ни ленту. */
 .perf-root {
     position: absolute;
-    top: 14px;
-    left: 14px;
+    top: 118px;
+    right: 18px;
     width: 268px;
     padding: 10px 12px 8px;
     background: rgba(8, 11, 19, .9);
@@ -1410,11 +1456,12 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
    ========================================================================== */
 
 @media (max-height: 700px) {
-    .hud-speedo { width: 208px; height: 134px; }
-    .hud-speed-val { font-size: 46px; bottom: 26px; }
-    .hud-minimap { width: 168px; height: 168px; }
-    .hud-minimap canvas { width: 146px; height: 146px; }
+    .hud-speedo { width: 206px; height: 164px; }
+    .hud-speed-val { font-size: 40px; bottom: 12px; }
+    .hud-minimap { width: 166px; height: 166px; }
+    .hud-minimap canvas { width: 144px; height: 144px; }
     .hud-stat .v { font-size: 30px; }
+    .hud-feed { top: 104px; }
 }
 
 @media (max-width: 1150px) {

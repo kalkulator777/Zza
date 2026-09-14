@@ -29,6 +29,7 @@ import {
     primBox,
     primCyl,
     primPoly,
+    paintVertices,
     trs,
     toColor,
     disposeObject,
@@ -55,11 +56,11 @@ const THEME_ENV = {
         zenith: '#3f6fb5',
         horizon: '#bcc9da',
         fog: '#b9c6d7',
-        ambient: { color: '#b9c6da', intensity: 0.62 },
-        dir: { color: '#fff4e2', intensity: 0.95, dir: [0.45, 0.82, 0.35] },
+        ambient: { color: '#c3cfe0', intensity: 0.88 },
+        dir: { color: '#fff4e2', intensity: 1.05, dir: [0.45, 0.82, 0.35] },
         cloud: '#f4f7fb',
         palette: {
-            concrete: ['#9aa1a8', '#b3b6ae', '#8d949c', '#a7a094', '#7f8790'],
+            concrete: ['#b9bfc6', '#cbcabe', '#a8aeb6', '#c4bbab', '#9aa2ac'],
             accent: ['#d0552f', '#3f7ea8', '#cbb04a'],
             metal: '#9fa6ad',
             rail: '#c9ced3',
@@ -72,11 +73,11 @@ const THEME_ENV = {
         zenith: '#3877c4',
         horizon: '#d4e3ec',
         fog: '#cddfe9',
-        ambient: { color: '#c2d2e0', intensity: 0.58 },
-        dir: { color: '#fff0d2', intensity: 1.05, dir: [-0.4, 0.78, 0.48] },
+        ambient: { color: '#c9d8e6', intensity: 0.85 },
+        dir: { color: '#fff0d2', intensity: 1.1, dir: [-0.4, 0.78, 0.48] },
         cloud: '#ffffff',
         palette: {
-            needle: ['#2f5a34', '#39663a', '#274c2d', '#456f3d'],
+            needle: ['#3d7042', '#4a7d48', '#336038', '#578a48'],
             trunk: '#4a3a2c',
             rock: ['#75705f', '#867e6d', '#635e51'],
             wood: '#7a5c3c',
@@ -90,8 +91,8 @@ const THEME_ENV = {
         zenith: '#5d7fa0',
         horizon: '#d3cbb6',
         fog: '#cfc8b6',
-        ambient: { color: '#c8c4b4', intensity: 0.6 },
-        dir: { color: '#fff2d6', intensity: 0.9, dir: [0.35, 0.8, -0.45] },
+        ambient: { color: '#d0ccbe', intensity: 0.86 },
+        dir: { color: '#fff2d6', intensity: 1.0, dir: [0.35, 0.8, -0.45] },
         cloud: '#e8e4d8',
         palette: {
             hangar: ['#8d9298', '#7c8a90', '#98917f', '#6f7a80'],
@@ -200,6 +201,7 @@ export function buildScenery(track, theme, seed, quality) {
             skyGroup.position.z = camera.position.z;
         },
 
+        materials: ctx.materials,
         stats: {
             drawCalls: countInstanced(group),
             triangles: countTriangles(group)
@@ -318,7 +320,8 @@ function scatter(ctx, rng, opts, cb) {
         for (let si = 0; si < sides.length; si++) {
             if (rng.next() > chance) continue;
             const side = sides[si];
-            const off = rng.range(opts.offMin, opts.offMax);
+            const u = opts.offBias ? Math.pow(rng.next(), opts.offBias) : rng.next();
+            const off = opts.offMin + (opts.offMax - opts.offMin) * u;
             const lat = (T.hw[i] + off) * side;
             const x = T.x[i] + T.nx[i] * lat;
             const z = T.z[i] + T.nz[i] * lat;
@@ -399,6 +402,21 @@ function boxBands(bands, bandShade, topShade, vertical) {
         }
     }
     b.quad([-0.5, 1, -0.5], [-0.5, 1, 0.5], [0.5, 1, 0.5], [0.5, 1, -0.5], top);
+    return b.build();
+}
+
+/** Двускатная крыша: конёк вдоль оси Z, основание на высоте baseY. */
+function gableRoof(w, h, d, color, gable, baseY) {
+    const b = new MeshBuilder();
+    const hw = w * 0.5,
+        hd = d * 0.5;
+    const yt = baseY + h;
+    // скаты
+    b.quad([-hw, baseY, -hd], [-hw, baseY, hd], [0, yt, hd], [0, yt, -hd], color);
+    b.quad([0, yt, -hd], [0, yt, hd], [hw, baseY, hd], [hw, baseY, -hd], color);
+    // фронтоны
+    b.tri([-hw, baseY, hd], [hw, baseY, hd], [0, yt, hd], gable);
+    b.tri([hw, baseY, -hd], [-hw, baseY, -hd], [0, yt, -hd], gable);
     return b.build();
 }
 
@@ -489,7 +507,7 @@ function buildCityTheme(ctx, seed) {
     // здания
     const rngB = new Rng(seed ^ 0x00b1);
     const buildings = [];
-    scatter(ctx, rngB, { step: 26 / d, jitter: 6, offMin: 13, offMax: 38, radius: 9, margin: 3, chance: 0.8 }, function (p) {
+    scatter(ctx, rngB, { step: 26 / d, jitter: 6, offMin: 13, offMax: 38, offBias: 1.5, radius: 9, margin: 3, chance: 0.8 }, function (p) {
         const w = p.rng.range(8, 17);
         const h = p.rng.range(6, 30);
         const dep = p.rng.range(8, 16);
@@ -504,7 +522,7 @@ function buildCityTheme(ctx, seed) {
             color: p.rng.pick(pal.concrete)
         });
     });
-    addInstanced(ctx, 'buildings', boxBands(6, 0.42, 1.08, false), buildings);
+    addInstanced(ctx, 'buildings', boxBands(6, 0.62, 1.1, false), buildings);
 
     // фонари вдоль кромки
     const rngL = new Rng(seed ^ 0x00c2);
@@ -564,13 +582,13 @@ function buildMountainTheme(ctx, seed) {
 
     // три вида хвойных
     const kinds = [
-        { name: 'pineTall', geom: pineGeometry(pal, seg, 3, 1.5, pal.needle[0]), scale: [1.1, 1.9] },
-        { name: 'pineWide', geom: pineGeometry(pal, seg, 2, 2.1, pal.needle[1]), scale: [0.9, 1.4] },
-        { name: 'pineYoung', geom: pineGeometry(pal, Math.max(4, seg - 1), 2, 1.2, pal.needle[3]), scale: [0.6, 1.0] }
+        { name: 'pineTall', geom: pineGeometry(pal, seg, 3, 1.35, pal.needle[0]), scale: [1.5, 2.4] },
+        { name: 'pineWide', geom: pineGeometry(pal, seg, 2, 1.95, pal.needle[1]), scale: [1.1, 1.7] },
+        { name: 'pineYoung', geom: pineGeometry(pal, Math.max(4, seg - 1), 2, 1.15, pal.needle[3]), scale: [0.7, 1.1] }
     ];
     const lists = [[], [], []];
     const rngT = new Rng(seed ^ 0x0f01);
-    scatter(ctx, rngT, { step: 9 / d, jitter: 3.5, offMin: 6, offMax: 44, radius: 2.0, margin: 1.5, chance: 0.85 }, function (p) {
+    scatter(ctx, rngT, { step: 7 / d, jitter: 3.0, offMin: 6, offMax: 42, offBias: 1.8, radius: 2.2, margin: 1.5, chance: 0.9 }, function (p) {
         const k = p.off > 18 ? p.rng.int(0, 2) : p.rng.int(1, 2);
         const s = p.rng.range(kinds[k].scale[0], kinds[k].scale[1]);
         lists[k].push({
@@ -589,7 +607,7 @@ function buildMountainTheme(ctx, seed) {
     const rngR = new Rng(seed ^ 0x0f02);
     const rocks = [];
     const rockGeom = primPoly(1.0, 0, toColor(pal.rock[0]), 0, 0.45, 0);
-    scatter(ctx, rngR, { step: 13 / d, jitter: 5, offMin: 3.5, offMax: 40, radius: 1.4, margin: 1.0, chance: 0.7 }, function (p) {
+    scatter(ctx, rngR, { step: 13 / d, jitter: 5, offMin: 3.5, offMax: 36, offBias: 1.6, radius: 1.4, margin: 1.0, chance: 0.7 }, function (p) {
         const s = p.rng.range(0.6, 2.4);
         rocks.push({
             x: p.x,
@@ -672,8 +690,8 @@ function buildPeaks(ctx, seed) {
     const n = ctx.Q.peaks;
     for (let k = 0; k < n; k++) {
         const a = (k / n) * Math.PI * 2 + rng.spread(0.14);
-        const dist = r + rng.range(220, 620);
-        const h = rng.range(60, 165);
+        const dist = r + rng.range(90, 280);
+        const h = rng.range(45, 120);
         list.push({
             x: cx + Math.sin(a) * dist,
             y: ctx.sampler.groundY - 6,
@@ -699,8 +717,8 @@ function buildIndustrialTheme(ctx, seed) {
     // ангары: коробка со скатной крышей
     const hangar = mergeGeometries([
         primBox(1.0, 0.62, 1.0, WHITE, 0, 0.31, 0),
-        primBox(1.04, 0.06, 1.04, toColor('#6d757b'), 0, 0.64, 0),
-        primCyl(0.0, 0.72, 0.34, 4, toColor('#7d858b'), 0, 0.82, Math.PI * 0.25),
+        primBox(1.04, 0.05, 1.04, toColor('#6d757b'), 0, 0.65, 0),
+        gableRoof(1.04, 0.3, 1.04, toColor('#858d93'), toColor('#6d757b'), 0.66),
         primBox(0.34, 0.44, 0.05, toColor('#3a3f45'), 0, 0.22, 0.51)
     ]);
     const rngH = new Rng(seed ^ 0x1a01);
@@ -894,7 +912,7 @@ function buildGrandstands(ctx, seed) {
             const x = T.x[i] + T.nx[i] * lat;
             const z = T.z[i] + T.nz[i] * lat;
             if (ctx.clearance(x, z) < 6) continue;
-            ctx.occupancy(x, z, 9);
+            ctx.occupancy(x, z, 11);
             list.push({
                 x: x,
                 y: ctx.sampler(i, off, side < 0 ? 1 : 0) - 0.1,
@@ -937,8 +955,8 @@ function buildCrowd(ctx, seed) {
         }
     }
     // редкие зрители вдоль остальной трассы
-    scatter(ctx, rng, { step: 26 / ctx.density, jitter: 6, offMin: 4.5, offMax: 9, radius: 0.6, margin: 1.2, chance: 0.35 }, function (p) {
-        const n = p.rng.int(2, 5);
+    scatter(ctx, rng, { step: 34 / ctx.density, jitter: 8, offMin: 5, offMax: 11, radius: 0.6, margin: 1.2, chance: 0.22 }, function (p) {
+        const n = p.rng.int(1, 3);
         for (let k = 0; k < n; k++) {
             list.push({
                 x: p.x + p.rng.spread(1.6),
@@ -963,7 +981,9 @@ function buildCones(ctx, seed) {
         const j = (i + look) % T.count;
         const cross = T.tx[i] * T.tz[j] - T.tz[i] * T.tx[j];
         if (Math.abs(cross) < 0.22) continue;
-        const side = cross > 0 ? 1 : -1;
+        // знак векторного произведения касательных даёт сторону поворота;
+        // конусы ставим по внутренней кромке — там, где режут апекс
+        const side = cross > 0 ? -1 : 1;
         const off = rng.range(0.9, 1.7);
         const lat = (T.hw[i] + off) * side;
         const x = T.x[i] + T.nx[i] * lat;
@@ -996,20 +1016,13 @@ function buildSkyDome(env, Q) {
     for (const name of Object.keys(g.attributes)) {
         if (name !== 'position' && name !== 'normal') g.deleteAttribute(name);
     }
-    const pos = g.attributes.position;
-    const col = new Float32Array(pos.count * 3);
     const zen = toColor(env.zenith);
     const hor = toColor(env.horizon);
-    const tmp = new THREE.Color();
-    for (let i = 0; i < pos.count; i++) {
-        const t = Math.min(1, Math.max(0, pos.getY(i) / 900));
+    paintVertices(g, function (x, y, z, i, c) {
+        const t = Math.min(1, Math.max(0, y / 900));
         const k = Math.pow(t, 0.55);
-        tmp.setRGB(hor.r + (zen.r - hor.r) * k, hor.g + (zen.g - hor.g) * k, hor.b + (zen.b - hor.b) * k);
-        col[i * 3] = tmp.r;
-        col[i * 3 + 1] = tmp.g;
-        col[i * 3 + 2] = tmp.b;
-    }
-    g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+        c.setRGB(hor.r + (zen.r - hor.r) * k, hor.g + (zen.g - hor.g) * k, hor.b + (zen.b - hor.b) * k);
+    });
     const mat = new THREE.MeshBasicMaterial({
         vertexColors: true,
         side: THREE.BackSide,
