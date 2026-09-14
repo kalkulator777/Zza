@@ -133,6 +133,19 @@ const THEMES = {
 };
 
 const TERRAIN_WIDTH = 50.0; // ширина ленты рельефа с каждой стороны, м
+
+/**
+ * Опорная длина круга для ленты рельефа.
+ *
+ * Лента рельефа не отсекается по пирамиде видимости так же, как декор: в кадр
+ * попадает всё кольцо целиком, и его цена растёт прямо пропорционально длине
+ * трассы. На круге в два с лишним километра шаг выборки прореживается вдвое —
+ * на глаз это незаметно (полоса низкополигональных холмов шириной 50 м), зато
+ * кадровый счёт треугольников перестаёт зависеть от длины круга.
+ * Сэмплер высоты (createTerrainSampler) от шага НЕ зависит, поэтому декор
+ * по-прежнему стоит ровно на поверхности.
+ */
+const TERRAIN_REF_LENGTH = 1600.0;
 const KERB_WIDTH = 0.62; // ширина бордюра, м
 const MARK_LIFT = 0.015; // подъём разметки над полотном, м
 
@@ -630,7 +643,7 @@ function buildTerrain(T, P, colors, pal, groundY, material, ao) {
     const b = new MeshBuilder();
     const tp = terrainParams(T, P, pal, groundY);
     const rings = P.terrainRings;
-    const stride = P.terrainStride;
+    const stride = P.terrainStride * Math.max(1, Math.round(T.length / TERRAIN_REF_LENGTH));
     const rowsAll = Math.max(3, Math.floor(T.count / stride));
 
     const jitRng = new Rng((T.seed ^ 0x77aa3311) >>> 0);

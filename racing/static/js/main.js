@@ -268,7 +268,6 @@ function onWelcome(msg) {
     // есть только идентификатор машины, а рендеру нужна форма.
     setCatalog(msg);
     menu.applyWelcome(msg);
-    allowRoomCreation();
     lobby.applyWelcome(msg);
     results.applyWelcome(msg);
     // 12.8: в welcome слот почти всегда null, боевое значение придёт в room.you.
@@ -539,22 +538,6 @@ function onResultsReturn() {
     }
     teardownRace();
     setScreen(SCREEN_LOBBY);
-}
-
-/**
- * Доработка: комнату создаёт любой подключившийся, право больше не зависит
- * от токена хоста. Кнопку «Создать комнату» и объяснение «почему нельзя»
- * держит ui/menu.js по полю welcome.is_host; этот файл в правку не входит,
- * поэтому разрешение проставляется отсюда (см. отчёт: в menu.js остаётся
- * убрать сам признак и текст hostHint).
- */
-function allowRoomCreation() {
-    menu.isHost = true;
-    if (menu.createButton) {
-        menu.createButton.disabled = false;
-        menu.createButton.title = '';
-    }
-    if (menu.hostHint) menu.hostHint.hidden = true;
 }
 
 /** Esc (раздел 10.4): из гонки и лобби — в меню, из меню — никуда. */

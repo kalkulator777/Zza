@@ -60,6 +60,27 @@ const DECOR_DENSITY = { sparse: 0.45, normal: 1.15, dense: 1.9 };
 // плотности там сдержаннее: коэффициент на тему.
 const THEME_DENSITY = { city: 1.0, mountain: 0.82, industrial: 1.0 };
 
+/**
+ * Нормировка плотности по длине круга.
+ *
+ * Инстансы декора НЕ отсекаются по пирамиде видимости (см. шапку файла),
+ * поэтому в кадр попадает весь декор трассы разом: его цена растёт прямо
+ * пропорционально длине круга. Плотность в объектах на метр, одинаковая для
+ * километрового кольца и для трёхкилометрового, означала бы втрое больший
+ * кадровый счёт на длинной трассе — при том, что видно всё равно метров
+ * триста вперёд.
+ *
+ * Поэтому число объектов держится примерно постоянным: длиннее опорных
+ * DECOR_REF_LENGTH метров — реже на метр. Трёх исходных трасс это не
+ * касается (все короче), а длинные перестают стоить вдвое.
+ */
+const DECOR_REF_LENGTH = 1500;
+
+function lengthDensity(trackLength) {
+    if (!(trackLength > 0)) return 1;
+    return Math.min(1, DECOR_REF_LENGTH / trackLength);
+}
+
 // ---------------------------------------------------------------------------
 // Темы: небо, туман, свет, палитры объектов
 // ---------------------------------------------------------------------------
@@ -146,7 +167,8 @@ export function buildScenery(track, theme, seed, quality, opts) {
     const anim = o.anim !== false;
     const decorLevel = DECOR_DENSITY[o.decor] !== undefined ? o.decor : null;
     const density = (decorLevel ? DECOR_DENSITY[decorLevel] : Q.density)
-        * (THEME_DENSITY[themeName] || 1);
+        * (THEME_DENSITY[themeName] || 1)
+        * lengthDensity(T.length);
 
     const sampler = createTerrainSampler(track, themeName, qName);
     const clearance = makeClearance(T);
