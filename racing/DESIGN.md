@@ -1207,3 +1207,46 @@ leave_room   -> setLocalSlot(null): цвет освобождён
 Все три пути протестированы: комната останавливает цикл тиков, рассылает
 `results` всем, переходит в `RESULTS`, затем автоматически в `LOBBY`
 со снятой готовностью.
+
+### 12.9. Звук: интерфейс модуля
+
+Экспорты `static/js/audio.js`: класс `RaceAudio`, фабрика `createAudioState()`,
+готовый синглтон `audio`. Кадровый контракт устроен как у `Hud`: состояние —
+один заранее выделенный объект с типизированными массивами по слотам,
+`main.js` переписывает поля и зовёт `update`.
+
+```
+audio.attachUnlockHandlers(target)   // контекст создаётся только по жесту
+audio.unlock()                       // вернёт false, если WebAudio недоступен
+audio.setLocalSlot(slot)
+audio.startRace() / audio.stopRace()
+audio.update(state, dt)              // раз в кадр
+audio.raceEvent(msg)                 // готовое событие race_event из сети
+audio.countdown(value)               // countdown(0) означает старт гонки
+audio.collision(force, slot)
+audio.setVolume(volume, muted, persist)
+audio.stats()
+new RaceAudio({ createContext })     // внедрение контекста для офлайн-замеров
+```
+
+**Что обязан делать `main.js`.**
+
+- Заполнять `state.carSpeed[i]` — в снапшоте есть только `carVx`/`carVz`.
+- Ставить `state.engineOn`: в отсчёте — холостые, на экране итогов — тишина.
+- Звать `audio.collision(force, slot)` самостоятельно. **Столкновений нет
+  в схеме `race_event`**: их считает только сервер и наружу не отдаёт,
+  поэтому из потока событий звук удара запустить нечем.
+- Звать `audio.countdown(0)` при переходе комнаты в `RACING`: отдельного
+  события «старт» в протоколе нет.
+
+**Владелец ключей громкости** — `saveUiSettings` в `ui/menu.js`.
+`audio.setVolume` пишет туда же те же значения, дублирование безвредно.
+Отдельные шины (`engine`, `fx`, `ui`) регулируются через `setBusVolume`,
+но не персистятся: ключей под них в разделе 12.6 не заведено.
+
+**Ограничение проверки.** Firefox в среде разработки отсутствует, поэтому
+весь браузерный тест шёл в Chromium. Один участок кода написан специально
+под Firefox: у него нет `AudioParam.cancelAndHoldAtTime`, и запасной путь
+через `cancelScheduledValues` + `setValueAtTime` защищён проверкой наличия
+метода, но на живом Firefox не проверялся. Это первое, что надо посмотреть
+при первом запуске на целевых машинах.
