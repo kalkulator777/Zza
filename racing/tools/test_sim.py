@@ -48,7 +48,7 @@ from game import protocol
 from game.sim import Simulation
 from game.track import Track, WALL_MARGIN
 
-TRACK_IDS = ('office', 'serpentine', 'industrial')
+TRACK_IDS = ('office', 'serpentine', 'industrial', 'avenue', 'ridge')
 CAR_IDS = ('hatch', 'muscle', 'buggy', 'van', 'wedge', 'hatch', 'buggy', 'van')
 ALL_ITEMS = list(items_mod.ITEM_IDS)
 

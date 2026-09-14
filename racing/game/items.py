@@ -78,7 +78,61 @@ SHIELD_TIME = 8.0            # с щита (раздел 8)
 STORM_SLOW = 1.2             # с замедления всем впереди (раздел 8)
 
 ROCKET_SPIN = 1.5            # с раскрутки от попадания ракеты (раздел 8)
-ROCKET_SPEED = 46.0          # м/с; потолок машин 38..42, догнать обязана
+ROCKET_SPEED_MARGIN = 1.28   # во столько раз ракета быстрее самой быстрой
+                             # машины на ускорении. Абсолютное число здесь
+                             # уже протухало: потолки машин подняли, а ракета
+                             # осталась медленнее их и перестала догонять.
+ROCKET_SPEED_FALLBACK = 70.0  # м/с, если каталог машин почему-то недоступен
+_rocket_speed_cache = None
+
+
+def _terminal_speed(engine_force, ref_speed, drag, roll):
+    """Равновесная скорость: тяга engine_force*(1 - v/ref) равна сопротивлению.
+
+    Поле max_speed — это опорная скорость двигателя, а не фактический потолок
+    (раздел 12.5 контракта), поэтому потолок приходится досчитывать.
+    """
+    v = 0.0
+    for _ in range(3600):            # минута игрового времени с шагом 1/60
+        a = engine_force * (1.0 - v / ref_speed)
+        if a < 0.0:
+            a = 0.0
+        v += a / 60.0
+        v -= (drag * v * abs(v) + roll * v) / 60.0
+    return v
+
+
+def rocket_speed():
+    """Скорость ракеты, выведенная из самой быстрой машины каталога.
+
+    Считается один раз за процесс. Ракета обязана догонять кого угодно,
+    включая лидера на ускорении, иначе бонус бесполезен.
+    """
+    global _rocket_speed_cache
+    if _rocket_speed_cache is not None:
+        return _rocket_speed_cache
+    best = 0.0
+    # Импорт отложенный: sim сам импортирует items, на уровне модуля вышел бы цикл.
+    try:
+        from .sim import car_catalog
+        catalog = car_catalog()
+    except Exception:
+        catalog = None
+    if catalog is not None:
+        for car_id in catalog.ids:
+            stats = catalog.get(car_id).stats
+            d = stats if isinstance(stats, dict) else stats.__dict__
+            try:
+                ref = max(float(d['max_speed']), float(d.get('boost_speed', 0.0)))
+                v = _terminal_speed(float(d['engine_force']), ref,
+                                    float(d['drag']), float(d['roll']))
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            if v > best:
+                best = v
+    _rocket_speed_cache = (best * ROCKET_SPEED_MARGIN) if best > 0.0 \
+        else ROCKET_SPEED_FALLBACK
+    return _rocket_speed_cache
 ROCKET_TURN_RATE = 2.4       # рад/с — конечная скорость поворота: ракета
                              # с бесконечной наводкой неуклонима и бесит
 ROCKET_LIFE = 5.0            # с жизни, дальность выходит ~230 м
@@ -331,7 +385,7 @@ class Projectile(object):
         self.active = True
         self.target = -1
         if kind == ITEM_ROCKET:
-            self.speed = ROCKET_SPEED
+            self.speed = rocket_speed()
             self.life = ROCKET_LIFE
             self.arm = ROCKET_ARM
             self.radius = ROCKET_RADIUS
