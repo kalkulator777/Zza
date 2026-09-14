@@ -242,6 +242,11 @@ export function buildCarMesh(shape, bodyColor, quality, opts) {
 
     const _brakeOn = new THREE.Color('#ff2a18');
     const _brakeOff = new THREE.Color('#5a0d0d');
+    // Ночной множитель фар и стопов. Днём фары — декоративная деталь силуэта,
+    // ночью они главный источник картинки, поэтому эмиссив растёт.
+    let headBase = 0.85;
+    let headOn = true;
+    let nightK = 0;
 
     const api = {
         root: root,
@@ -295,7 +300,27 @@ export function buildCarMesh(shape, bodyColor, quality, opts) {
 
         /** Фары можно приглушить, например для машины-призрака. */
         setHeadlights: function (on) {
-            headMat.emissiveIntensity = on ? 0.85 : 0.12;
+            headOn = !!on;
+            headMat.emissiveIntensity = headOn ? headBase : headBase * 0.14;
+        },
+
+        /**
+         * Ночной режим: 0 — день, 0.5 — сумерки, 1 — ночь.
+         * Поднимает эмиссив фар и подогревает их цвет, а тлеющие стопы делает
+         * заметнее. Ни геометрия, ни цвет кузова при этом не трогаются —
+         * значит переключение стоит двух записей в материал.
+         */
+        setNight: function (k) {
+            nightK = k > 0 ? (k > 1.5 ? 1.5 : k) : 0;
+            headBase = 0.85 + nightK * 1.5;
+            headMat.emissive.setRGB(
+                1.0,
+                0.95 - nightK * 0.04,
+                0.80 - nightK * 0.10
+            );
+            headMat.emissiveIntensity = headOn ? headBase : headBase * 0.14;
+            _brakeOff.setRGB(0.35 + nightK * 0.22, 0.05, 0.05);
+            brakeMat.emissive.copy(_brakeOff);
         },
 
         /** Переписать матрицы инстансов колёс после поворота прокси-узлов. */
