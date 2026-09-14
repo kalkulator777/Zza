@@ -23,6 +23,16 @@
 // скорости), подкрученные константы и места, где контракт пришлось
 // дотолковать, подробно расписаны в докстринге game/physics.py.
 // Значения обоих файлов совпадают до последнего разряда.
+//
+// Награда за занос защищена тремя барьерами против абуза «зажал ручник и
+// виляю A/D» (полное обоснование — в докстринге game/physics.py):
+//   1) у заноса есть сторона driftDir, перекладка сжигает копилку;
+//   2) темп накопления растёт со скоростью как квадрат доли пути от
+//      HANDBRAKE_MIN_SPEED до HANDBRAKE_CHARGE_FULL_SPEED;
+//   3) вне трассы (а значит и у стены) заряд не копится вовсе.
+// driftDir в снапшот НЕ едет: клиент считает её сам тем же шагом. Кольцо
+// предсказания в net.js обязано сохранять и восстанавливать это поле
+// вместе с driftCharge, иначе после реконсиляции сторона отстанет.
 
 // ---------------------------------------------------------------------------
 // КОНСТАНТЫ (раздел 6.4)
@@ -65,6 +75,19 @@ export const HANDBRAKE_MIN_SPEED = 7.0;    // м/с, ниже занос не н
 export const HANDBRAKE_MAX_SLIP = 0.36;    // потолок |vLat| / |vFwd|, ~20° (было 0.5)
 export const HANDBRAKE_SLIDE_RECOVER = 0.7;// доля срезанного заноса обратно в vFwd
 export const HANDBRAKE_CHARGE_SLIP = 0.12; // ниже этого скольжения заряд не копится
+// --- три барьера против «зажал ручник и виляю A/D» -------------------------
+// Зона нечувствительности для СТОРОНЫ заноса. Сторона переключается (и сжигает
+// копилку) только когда скольжение вышло за эту долю; внутри неё знак не
+// трогается вообще, поэтому дрожание руля на границе честный занос не роняет.
+// Вдвое уже HANDBRAKE_CHARGE_SLIP: к моменту, когда заряд начинает копиться,
+// сторона уже определена, и перекладку видно раньше, чем она успеет накопить.
+export const HANDBRAKE_FLIP_SLIP = 0.06;   // доля |vLat| / vFwd, с которой есть сторона
+// Скорость, с которой заряд копится в полный темп. Ниже темп падает как
+// квадрат доли пути от HANDBRAKE_MIN_SPEED: 0.22 на 14 м/с (виляние и донат
+// на полном локе), 0.87 на 21 м/с (шпилька радиусом 13 м из 12.13), 1.0 на
+// 22 м/с и выше (длинная дуга). 22 выбрано замером: ниже — и виляние снова
+// окупается, выше — и шпильку перестаёт хватать на третий уровень.
+export const HANDBRAKE_CHARGE_FULL_SPEED = 22.0;  // м/с, полный темп накопления
 
 export const DRIFT_CHARGE_L1 = 0.7;        // с заряда -> уровень 1, синие искры
 export const DRIFT_CHARGE_L2 = 1.4;        // с заряда -> уровень 2, оранжевые
@@ -118,6 +141,8 @@ export const CAR_CONSTANTS = Object.freeze({
     HANDBRAKE_MAX_SLIP,
     HANDBRAKE_SLIDE_RECOVER,
     HANDBRAKE_CHARGE_SLIP,
+    HANDBRAKE_FLIP_SLIP,
+    HANDBRAKE_CHARGE_FULL_SPEED,
     DRIFT_CHARGE_L1,
     DRIFT_CHARGE_L2,
     DRIFT_CHARGE_L3,
@@ -153,6 +178,7 @@ export function createCarState(x, z, yaw) {
         steer: 0.0,               // текущий угол руля, -1..1
         driftCharge: 0.0,         // накопленный заряд заноса, с
         driftActive: false,       // идёт ли занос (ручник держит машину боком)
+        driftDir: 0,              // сторона заноса: +1 влево, -1 вправо, 0 нет
         boostTime: 0.0,           // остаток ускорения, с
         spinTime: 0.0,            // остаток раскрутки после урона, с
         shieldTime: 0.0,          // остаток щита, с
@@ -175,6 +201,7 @@ export function resetCarState(state, x, z, yaw) {
     state.steer = 0.0;
     state.driftCharge = 0.0;
     state.driftActive = false;
+    state.driftDir = 0;
     state.boostTime = 0.0;
     state.spinTime = 0.0;
     state.shieldTime = 0.0;
@@ -196,6 +223,7 @@ export function copyCarState(dst, src) {
     dst.steer = src.steer;
     dst.driftCharge = src.driftCharge;
     dst.driftActive = src.driftActive;
+    dst.driftDir = src.driftDir;
     dst.boostTime = src.boostTime;
     dst.spinTime = src.spinTime;
     dst.shieldTime = src.shieldTime;
@@ -247,7 +275,8 @@ export function step(state, carStats, buttons, dt, track, hint) {
     let slowTime = state.slowTime;
     let shieldTime = state.shieldTime;
     const sliding = state.driftActive;   // занос, поднятый ручником на прошлом шаге
-    const driftCharge = state.driftCharge;
+    let driftCharge = state.driftCharge;
+    let driftDir = state.driftDir;       // сторона заноса с прошлого шага
     let vx = state.vx;
     let vz = state.vz;
 
@@ -510,18 +539,56 @@ export function step(state, carStats, buttons, dt, track, hint) {
         if (driftCharge !== 0.0) {
             state.driftCharge = 0.0;
         }
+        if (driftDir !== 0) {
+            state.driftDir = 0;
+        }
     } else if (btnHandbrake && vFwd > HANDBRAKE_MIN_SPEED) {
         // требования «|steer| > 0.35» больше нет: ручник срабатывает от одного
         // пробела, руль нужен, чтобы заносом управлять, а не чтобы его начать
         if (!sliding) {
             state.driftActive = true;
         }
-        // ...но заряд копится только за НАСТОЯЩИЙ занос. Иначе зажатый на
-        // прямой пробел давал бы ускорение ни за что
-        const absLat = vLat < 0.0 ? -vLat : vLat;
-        if (absLat > HANDBRAKE_CHARGE_SLIP * vFwd) {
-            state.driftCharge = driftCharge + dt;
+        // 15а. У заноса есть СТОРОНА, и перекладка её сжигает. Виляние A→D→A
+        // меняет знак vLat, и копилка обнуляется на каждой перекладке —
+        // игрок обязан выбрать сторону и держать её. Внутри зоны
+        // нечувствительности HANDBRAKE_FLIP_SLIP знак не трогается вовсе,
+        // поэтому дрожание руля на границе честный занос не роняет.
+        const flipGate = HANDBRAKE_FLIP_SLIP * vFwd;
+        let side;
+        if (vLat > flipGate) {
+            side = 1;
+        } else if (vLat < -flipGate) {
+            side = -1;
+        } else {
+            side = 0;
         }
+        if (side !== 0 && side !== driftDir) {
+            if (driftDir !== 0) {
+                driftCharge = 0.0;      // перекладка: накопленное сгорает
+            }
+            driftDir = side;
+            state.driftDir = side;
+        }
+        // 15б. Заряд копится только за НАСТОЯЩИЙ занос (иначе зажатый на
+        // прямой пробел давал бы ускорение ни за что) и только НА ТРАССЕ:
+        // у стены боковое скольжение берётся из выталкивания шага 14, то есть
+        // даром, а жёсткая стена всегда лежит за кромкой асфальта (7.3),
+        // так что один флаг offtrack закрывает и стену, и газон.
+        const absLat = vLat < 0.0 ? -vLat : vLat;
+        if (absLat > HANDBRAKE_CHARGE_SLIP * vFwd && !state.offtrack) {
+            // 15в. Темп накопления зависит от скорости машины: квадрат доли
+            // пути от HANDBRAKE_MIN_SPEED до HANDBRAKE_CHARGE_FULL_SPEED.
+            // Ветка гарантирует vFwd > HANDBRAKE_MIN_SPEED, поэтому доля
+            // строго положительна и снизу её обрезать не нужно. Квадрат — это
+            // умножение, запрета на Math.pow из раздела 6 он не нарушает.
+            let chargeT = ((vFwd - HANDBRAKE_MIN_SPEED)
+                           / (HANDBRAKE_CHARGE_FULL_SPEED - HANDBRAKE_MIN_SPEED));
+            if (chargeT > 1.0) {
+                chargeT = 1.0;
+            }
+            driftCharge += chargeT * chargeT * dt;
+        }
+        state.driftCharge = driftCharge;
     } else if (sliding) {
         // ручник отпущен или скорость потеряна
         let reward;
@@ -543,6 +610,7 @@ export function step(state, carStats, buttons, dt, track, hint) {
         }
         state.driftActive = false;
         state.driftCharge = 0.0;
+        state.driftDir = 0;
     }
 
     // шаг 16: progress, круги и отсечки
