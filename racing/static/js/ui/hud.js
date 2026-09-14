@@ -260,6 +260,15 @@ export class Hud {
      * Здесь строится контур мини-карты и подписи таблицы позиций — всё,
      * что потом в кадре только читается.
      */
+    /**
+     * Собственный слот игрока. Раздел 12.6 требует этот метод от всех
+     * модулей, принимающих слот; у Hud его не было, и клиенту
+     * приходилось писать поле напрямую.
+     */
+    setLocalSlot(slot) {
+        this.localSlot = slot === undefined || slot === null ? -1 : slot | 0;
+    }
+
     setupRace(raceInit, localSlot) {
         this.localSlot = localSlot === undefined || localSlot === null ? -1 : localSlot | 0;
 

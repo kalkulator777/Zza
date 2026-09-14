@@ -154,7 +154,11 @@ export function showToast(text, kind) {
     const node = document.getElementById('toast');
     if (!node) return;
     node.textContent = text;
-    node.className = 'toast' + (kind === 'info' ? ' toast-info' : '');
+    // Допустимые kind: 'error' (по умолчанию, красный), 'info' (синий),
+    // 'ok' (зелёный). Раньше всё, кроме 'info', красилось в тревожный
+    // красный — хорошая новость выглядела как ошибка.
+    const TOAST_KIND = { info: ' toast-info', ok: ' toast-ok', error: '' };
+    node.className = 'toast' + (TOAST_KIND[kind] !== undefined ? TOAST_KIND[kind] : '');
     node.hidden = false;
     node.classList.remove('is-hiding');
     if (toastTimer) clearTimeout(toastTimer);
