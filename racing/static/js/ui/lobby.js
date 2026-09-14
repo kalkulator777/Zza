@@ -921,20 +921,17 @@ export class LobbyScreen {
     /**
      * Отправить изменение настроек владельцем. Схема раздела 9 требует
      * целиком объект settings, поэтому шлём текущий с наложенным изменением.
+     *
+     * Настройки копируются как есть, а не переписываются полем за полем:
+     * поле, которого этот экран ещё не знает (следующей приедет погода),
+     * уедет обратно нетронутым, а сервер всё равно проверяет каждое сам.
      */
     _pushSettings(patch) {
         if (!this.isOwner || !this.room || this.room.state !== 'LOBBY') return;
         const current = this.currentSettings || {};
-        const settings = {
-            track: patch.track !== undefined ? patch.track : current.track,
-            time_of_day: this._nextTimeOfDay(current, patch),
-            laps: patch.laps !== undefined ? patch.laps : current.laps,
-            max_players: patch.max_players !== undefined ? patch.max_players : current.max_players,
-            items_enabled: patch.items_enabled !== undefined ? patch.items_enabled : current.items_enabled,
-            items: patch.items !== undefined ? patch.items : (current.items || []).slice(),
-            collisions: patch.collisions !== undefined ? patch.collisions : current.collisions,
-            mirror: patch.mirror !== undefined ? patch.mirror : current.mirror,
-        };
+        const settings = Object.assign({}, current, patch);
+        settings.items = (settings.items || []).slice();
+        settings.time_of_day = this._nextTimeOfDay(current, patch);
         this._applySettings(settings);
         this._syncOwnerControls(this.room);
         if (this.handlers.onUpdateSettings) this.handlers.onUpdateSettings(settings);

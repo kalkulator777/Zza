@@ -100,9 +100,6 @@ ENV_FIELDS = (
     # ('weather', WEATHERS, 'bad_weather', 'погода'),
 )
 
-# Имена полей окружения отдельно: по ним ходит и настройки, и описание трассы.
-ENV_FIELD_NAMES = tuple(field[0] for field in ENV_FIELDS)
-
 # Силуэты машин (§12.2): поле style уходит в welcome.content.cars[] (§12.6).
 CAR_STYLES = ('hatch', 'muscle', 'buggy', 'van', 'wedge')
 

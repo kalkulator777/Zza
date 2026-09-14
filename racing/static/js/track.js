@@ -39,6 +39,9 @@ export class Track {
         this.name = data.name;
         this.theme = data.theme;
         this.decorSeed = data.decor_seed;
+        // Умолчание карты по времени суток. Настоящее значение выбирается
+        // в комнате и приезжает в settings; это запасной путь (12.16).
+        this.timeOfDay = data.time_of_day || 'day';
         this.length = data.length;
         this.step = data.sample_step;
         this.invStep = 1.0 / this.step;
