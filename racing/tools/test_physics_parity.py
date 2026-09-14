@@ -32,6 +32,15 @@
 6. Печатает замеры ощущений, которые иначе проверять глазами: ручник против
    сцепления (угол за 0,75 с, потеря скорости, время возврата) и контакт
    тяжёлой машины с лёгкой.
+7. Проверяет защиту награды за занос от абуза (``report_drift_guard``).
+   Заказчик на плейтесте нашёл дыру: «зажать ручник и просто нажимать A/D —
+   едем не быстро, но очки бонуса дрифта набираются и дают скорость».
+   Здесь это ловится навсегда: виляние рулём под зажатым ручником обязано
+   давать заряд НИЖЕ первого уровня, а честный занос на дуге — все три
+   уровня. Заодно перекрыты способы набрать заряд даром: занос задним ходом,
+   занос об стену и занос по газону. Если кто-нибудь вернёт прежнее
+   поведение (``drift_charge += dt`` без стороны, без скорости и без
+   проверки на трассу), этот блок падает первым.
 
 Сценарий обязан задеть все ветки шага: если какая-то (трава, стена, задний
 ход, дрифт, соприкосновение машин) не случилась, тест не молчит, а падает —
@@ -164,7 +173,7 @@ SCRIPT = (
     (600, GAS,                 "разгон по прямой до упора"),
     (120, GAS | LEFT,          "левый поворот"),
     (120, GAS | RIGHT,         "правый поворот"),
-    (240, GAS | LEFT | DRIFT,  "дрифт влево, 4 с заряда — уровень 3"),
+    (240, GAS | LEFT | DRIFT,  "дрифт влево, 4 с — уровень 3"),
     (120, GAS,                 "срыв заноса, награда и разгон на ней"),
     (120, GAS | RIGHT | DRIFT, "дрифт вправо, 2 с — уровень 2"),
     (120, GAS,                 "срыв"),
@@ -180,6 +189,8 @@ SCRIPT = (
     (200, 0,                   "накат, по пути удар о стену"),
 )
 
+SCRIPT_STEPS = sum(count for count, _mask, _why in SCRIPT)
+
 # Внешние воздействия: (шаг, поле состояния, значение). Через них подаётся
 # то, чего не выразить кнопками: попадания, бонусы и постановка машины
 # в нужную точку. Без постановки фазы вырождаются: машину уносит доворотами
@@ -190,7 +201,10 @@ def _restart(at, speed):
 
 
 INJECT = (
-    _restart(1200, 18.0)            # перед «дрифтом вправо»
+    # 24 м/с перед длинным дрифтом: на 49 м/с дуга полного лока не влезает
+    # в коридор шириной 80 м, машина уезжает на газон, а там заряд не копится
+    _restart(840, 24.0)             # перед «дрифтом влево»
+    + _restart(1200, 18.0)          # перед «дрифтом вправо»
     + _restart(1440, 18.0)          # перед коротким дрифтом
     + _restart(1710, 18.0)          # перед торможением в пол
     + _restart(2070, 0.0)           # перед разгоном с нуля
@@ -206,7 +220,18 @@ INJECT = (
        (2900, "yaw", 1.5707963267948966),
        (2900, "vx", 22.0),
        (2900, "vz", 0.0))
+    # перед блоком виляния ставим машину в центр коридора на 15 м/с: это
+    # ровно та скорость, на которой заказчик показал абуз
+    + _restart(SCRIPT_STEPS, 15.0)
 )
+
+# Блок абуза в общем плане: зажатый ручник плюс перекладка A/D каждые
+# WIGGLE_HALF шагов. Он тут не ради вердикта (вердикт выносит
+# report_drift_guard на чистой заглушке), а ради СВЕРКИ: ветка «сменилась
+# сторона заноса» обязана срабатывать в Python и в JS на одном и том же шаге,
+# иначе заряд разъедется и вместе с ним разъедется цвет искр.
+WIGGLE_STEPS = 600          # 10 с виляния
+WIGGLE_HALF = 30            # 0.5 с на сторону — период перекладки 1 с
 
 TOTAL_STEPS = 4200
 
@@ -263,6 +288,10 @@ def build_plan():
     for count, mask, _why in SCRIPT:
         for _ in range(count):
             buttons.append(mask)
+    # блок абуза: ручник зажат, руль перекладывается каждые WIGGLE_HALF шагов
+    for k in range(WIGGLE_STEPS):
+        buttons.append(GAS | DRIFT | (LEFT if (k // WIGGLE_HALF) % 2 == 0
+                                      else RIGHT))
     # хвост: детерминированный шумный ввод, ловит ветки, которые сценарий
     # мог не задеть (переброс руля, ручник на грани скорости, газ с тормозом)
     i = len(buttons)
@@ -941,6 +970,216 @@ def report_handbrake():
              straight.drift_charge))
 
 
+# ---------------------------------------------------------------------------
+# Защита награды за занос от абуза (раздел 6.3 плюс докстринг game/physics.py)
+# ---------------------------------------------------------------------------
+# Заказчик на плейтесте: «Мы можем зажать ручник и просто нажимать A/D, едем
+# не быстро но очки бонуса дрифта набираются и дают скорость, это абуз».
+# Прежний порог HANDBRAKE_CHARGE_SLIP закрывал только «зажать пробел на
+# прямой»: виляние рулём даёт боковое скольжение и на малом ходу. Теперь
+# заряд защищён тремя барьерами (сторона заноса, темп по скорости, «только
+# на трассе»), и всё, что ниже, — постоянная проверка этих трёх барьеров.
+# Проверки делятся пополам: половина ловит абуз (заряда быть не должно),
+# половина ловит перезакрученную гайку (честный занос обязан платить все три
+# уровня). Обе половины нужны: без второй барьер чинится тем, что награду
+# просто выключают.
+
+WIGGLE_SECONDS = 10.0           # столько виляем в замерах абуза
+GUARD_SPEED = 15.0              # м/с, скорость из жалобы заказчика
+
+
+def _drive_charge(pilot, seconds, start_x, start_z, start_yaw, speed, track):
+    """Прогнать пилота и вернуть (пик заряда, уровни бустов, состояние, след).
+
+    ``pilot(i, state, v_fwd, v_lat)`` возвращает маску кнопок. След — список
+    заряда по шагам: по нему видно и пик, и обнуления.
+    """
+    stats = CarStats(**HATCH_STATS)
+    state = CarState(start_x, start_z, start_yaw)
+    state.vx = speed * sin(start_yaw)
+    state.vz = speed * cos(start_yaw)
+    charges = []
+    boosts = []
+    for i in range(int(seconds / physics.DT + 0.5)):
+        fx = sin(state.yaw)
+        fz = cos(state.yaw)
+        v_fwd = state.vx * fx + state.vz * fz
+        v_lat = state.vx * fz - state.vz * fx
+        level = physics.step(state, stats, pilot(i, state, v_fwd, v_lat),
+                             physics.DT, track, state.sample_idx)
+        if level:
+            boosts.append(level)
+        charges.append(state.drift_charge)
+    return max(charges), boosts, state, charges
+
+
+def _pilot_wiggle(half, target):
+    """Зажатый ручник плюс перекладка A/D каждые ``half`` шагов."""
+    def pilot(i, state, v_fwd, v_lat):
+        mask = HANDBRAKE | (LEFT if (i // half) % 2 == 0 else RIGHT)
+        if v_fwd < target:
+            mask |= GAS
+        return mask
+    return pilot
+
+
+def _pilot_slalom(period, amp, target):
+    """Виляние вокруг ПРЯМОГО курса: цель курса ходит ±amp с периодом period.
+
+    Это честная модель абуза: игрок не крутится на месте, а едет вперёд и
+    виляет. Простая перекладка A/D на высокой частоте вырождается в занос
+    в одну сторону (руль не успевает перейти через ноль) и вперёд не едет.
+    """
+    def pilot(i, state, v_fwd, v_lat):
+        want = amp if (i % period) * 2 < period else -amp
+        err = want - state.yaw
+        mask = HANDBRAKE
+        if v_fwd < target:
+            mask |= GAS
+        if err > 0.01:
+            mask |= LEFT
+        elif err < -0.01:
+            mask |= RIGHT
+        return mask
+    return pilot
+
+
+def _pilot_arc(radius, sign=1):
+    """Честный занос: пилот держит дугу радиуса ``radius``, ручник зажат."""
+    box = [0.0]
+    def pilot(i, state, v_fwd, v_lat):
+        box[0] += sign * v_fwd / radius * physics.DT
+        err = box[0] - state.yaw
+        mask = GAS | HANDBRAKE
+        if err > 0.004:
+            mask |= LEFT
+        elif err < -0.004:
+            mask |= RIGHT
+        return mask
+    return pilot
+
+
+def _levels(charges):
+    """Через сколько секунд заряд впервые дошёл до каждого из трёх уровней."""
+    out = [None, None, None]
+    for i, c in enumerate(charges):
+        for k, threshold in enumerate((physics.DRIFT_CHARGE_L1,
+                                       physics.DRIFT_CHARGE_L2,
+                                       physics.DRIFT_CHARGE_L3)):
+            if out[k] is None and c >= threshold:
+                out[k] = (i + 1) / 60.0
+    return out
+
+
+def _fmt_levels(levels):
+    return " ".join("L%d %s" % (k + 1, ("%.2f с" % t) if t else "нет")
+                    for k, t in enumerate(levels))
+
+
+def report_drift_guard():
+    """Абуз награды за занос: ловится навсегда. Возвращает False при провале."""
+    print("  защита награды за занос (порог уровня 1 — %.2f с заряда):"
+          % physics.DRIFT_CHARGE_L1)
+    ok = True
+    null = NullTrack()
+
+    def check(mark, name, extra=""):
+        nonlocal ok
+        if not mark:
+            ok = False
+        print("    [%s] %-46s %s" % ("ок" if mark else "ПРОВАЛ", name, extra))
+
+    # --- половина первая: абуз заряда не даёт -----------------------------
+    # 1. Ровно то, что показал заказчик: ручник зажат, A/D с периодом 1 с.
+    for half, label in ((30, "1.00 с"), (15, "0.50 с"), (45, "1.50 с")):
+        peak, boosts, _st, _c = _drive_charge(
+            _pilot_wiggle(half, GUARD_SPEED), WIGGLE_SECONDS,
+            0.0, 0.0, 0.0, GUARD_SPEED, null)
+        check(peak < physics.DRIFT_CHARGE_L1 and not boosts,
+              "виляние A/D, период %s, 15 м/с, 10 с" % label,
+              "пик заряда %.3f с, ускорений %d" % (peak, len(boosts)))
+
+    # 2. То же, но игрок реально едет вперёд: виляние вокруг прямого курса.
+    for amp, period, speed in ((0.21, 60, 15.0), (0.21, 30, 15.0),
+                               (0.35, 60, 15.0), (0.21, 60, 25.0)):
+        peak, boosts, st, _c = _drive_charge(
+            _pilot_slalom(period, amp, speed), WIGGLE_SECONDS,
+            0.0, 0.0, 0.0, speed, null)
+        check(peak < physics.DRIFT_CHARGE_L1 and not boosts,
+              "слалом ±%.0f°, период %.2f с, %.0f м/с"
+              % (degrees(amp), period / 60.0, speed),
+              "пик %.3f с, ускорений %d, проехал %.0f м"
+              % (peak, len(boosts), hypot(st.x, st.z)))
+
+    # 3. Смена стороны обязана сжигать копилку. Держим занос влево, пока
+    #    заряд не перевалит за первый уровень, потом перекладываем вправо.
+    def flip_pilot(i, state, v_fwd, v_lat):
+        mask = GAS | HANDBRAKE
+        return mask | (LEFT if i < 90 else RIGHT)
+    _peak, _b, _st, charges = _drive_charge(flip_pilot, 3.0, 0.0, 0.0, 0.0,
+                                            26.0, null)
+    before = charges[89]
+    after = min(charges[90:])
+    check(before > physics.DRIFT_CHARGE_L1 and after == 0.0,
+          "перекладка влево -> вправо обнуляет копилку",
+          "было %.2f с, стало %.2f с" % (before, after))
+
+    # 4. Занос задним ходом: ветка требует v_fwd > HANDBRAKE_MIN_SPEED.
+    def reverse_pilot(i, state, v_fwd, v_lat):
+        return BRAKE | LEFT | (HANDBRAKE if i > 300 else 0)
+    peak, boosts, st, _c = _drive_charge(reverse_pilot, 15.0, 0.0, 0.0, 0.0,
+                                         0.0, null)
+    fx, fz = sin(st.yaw), cos(st.yaw)
+    check(peak == 0.0 and st.vx * fx + st.vz * fz < -5.0,
+          "занос задним ходом", "заряд %.3f с" % peak)
+
+    # 5. Занос об стену: выталкивание из шага 14 дарит боковую скорость даром.
+    #    Жёсткая стена всегда за кромкой асфальта, поэтому ловится по offtrack.
+    wall = StubTrack()
+    hits = [0]
+    def wall_pilot(i, state, v_fwd, v_lat):
+        if state.x >= StubTrack.WALL_LIMIT - 1e-9:
+            hits[0] += 1
+        return GAS | HANDBRAKE | RIGHT
+    peak, boosts, _st, _c = _drive_charge(
+        wall_pilot, WIGGLE_SECONDS, 58.0, 0.0, 0.21, 22.0, wall)
+    check(peak == 0.0 and hits[0] > 60, "занос об стену, 10 с",
+          "заряд %.3f с, шагов в стене %d" % (peak, hits[0]))
+
+    # --- половина вторая: честный занос по-прежнему платит ----------------
+    # Длинная дуга обязана давать все три уровня, шпилька — как минимум два
+    # и третий в разумное время. Если кто-нибудь закрутит барьеры сильнее,
+    # эти строки покажут цену.
+    for radius, entry, need3, name in (
+            (40.0, 35.0, 3.0, "длинная дуга R=40 м, вход 35 м/с"),
+            (30.0, 32.0, 3.0, "дуга R=30 м, вход 32 м/с"),
+            (20.0, 26.0, 3.2, "дуга R=20 м, вход 26 м/с"),
+            (13.0, 22.0, 4.5, "шпилька R=13 м, вход 22 м/с")):
+        _peak, _b, _st, charges = _drive_charge(
+            _pilot_arc(radius), 6.0, 0.0, 0.0, 0.0, entry, null)
+        levels = _levels(charges)
+        # честный занос не должен терять копилку на ровном месте: дрожания
+        # руля внутри зоны нечувствительности не считаются перекладкой
+        reset = any(charges[i] == 0.0 and charges[i - 1] > 0.0
+                    for i in range(1, len(charges)))
+        good = (levels[0] is not None and levels[1] is not None
+                and levels[2] is not None and levels[2] <= need3 and not reset)
+        check(good, name, "%s%s" % (_fmt_levels(levels),
+                                    ", копилка сгорала" if reset else ""))
+
+    # то же вправо: физика обязана быть симметричной
+    _peak, _b, _st, charges = _drive_charge(
+        _pilot_arc(13.0, -1), 6.0, 0.0, 0.0, 0.0, 22.0, null)
+    mirrored = _levels(charges)
+    check(mirrored[0] is not None and mirrored[1] is not None
+          and mirrored[2] is not None, "шпилька R=13 м вправо (симметрия)",
+          _fmt_levels(mirrored))
+
+    if not ok:
+        print("  ОШИБКА: защита награды за занос не держит — см. строки ПРОВАЛ")
+    return ok
+
+
 def main():
     print("Проверка совпадения физики Python и JS")
     print("  шагов в сценарии: %d (%.1f с игрового времени)"
@@ -983,6 +1222,10 @@ def main():
 
     print()
     report_handbrake()
+
+    print()
+    if not report_drift_guard():
+        ok = False
 
     print()
     pure = bench(plan, NullTrack())
