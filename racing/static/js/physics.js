@@ -75,7 +75,7 @@ export const DRIFT_BOOST_L3 = 1.8;         // с ускорения за уро�
 
 export const SPIN_RATE = 9.0;              // рад/с раскрутки после урона
 export const BOOST_ACCEL = 22.0;           // м/с², подтягивание к boostSpeed
-export const SLOW_FACTOR = 0.995;          // на шаг, пока slowTime > 0 (было 0.985)
+export const SLOW_FACTOR = 0.9969;         // на шаг, пока slowTime > 0 (было 0.985/0.995)
 export const OFFTRACK_FACTOR = 0.992;      // на шаг вне трассы (было 0.985)
 
 export const BRAKE_REVERSE_SPEED = 0.5;    // м/с, ниже тормоз — это задний ход

@@ -24,7 +24,10 @@
 //      EXTRAPOLATE_MAX, дальше заморозка.
 //   5. Считает то, чего в снапшоте нет (12.6): время текущего круга, лучший
 //      круг, отставание от лидера и бонус в руках — из race_event и progress.
-//   6. Меряет ping двумя способами. Свой: время от отправки ввода до
+//   6. Держит глобальную паузу гонки: событие `pause` (§9) останавливает
+//      предсказание и вычитает простой из местных часов, так что шкала
+//      чужих машин и время гонки замирают вместе с тиком сервера.
+//   7. Меряет ping двумя способами. Свой: время от отправки ввода до
 //      снапшота, который его подтвердил, минимум по скользящему окну —
 //      минимум отбрасывает то, что пакет простоял в очереди снапшота (20 Гц).
 //      И запоминает серверный: сервер сам гоняет ping/pong (§9) и кладёт
@@ -101,7 +104,25 @@ const TICK_CORRECTION_MAX = 3;          // шагов поправки за од
 // смещением: минимумом (приход − серверное время) по скользящему окну.
 // Минимум берётся потому, что задержка доставки бывает только больше нуля:
 // самый быстрый пакет окна и есть честная привязка.
+//
+// ЭПОХА СЕРВЕРНЫХ ЧАСОВ. Равенство tick * DT == race_time (12.4) верно только
+// пока симуляция тикает. В отсчёте (три секунды на решётке) и на паузе тик
+// стоит, а местные часы идут: замер «приход − tick * DT» в эти моменты
+// меньше настоящего смещения ровно на длину простоя, и минимум по окну
+// цепляется за него на все 64 замера. Измерено на живом сервере: один
+// снапшот решётки, отправленный до отсчёта, держал смещение заниженным на
+// 2,5 с в течение 3,2 с — момент показа улетал за самый свежий снапшот,
+// интерполяция подменялась экстраполяцией с упором в EXTRAPOLATE_MAX, и
+// чужая машина шла ступеньками по 20 Гц. Поэтому:
+//   1) в окно попадают только снапшоты идущей симуляции;
+//   2) простой паузы вычитается из местных часов (clockShift), так что обе
+//      шкалы замирают вместе;
+//   3) на всякий непредвиденный разъезд шкал есть страховка: если сырое
+//      смещение держится много выше оценки подряд CLOCK_RESYNC_HITS раз,
+//      окно сбрасывается и оценка строится заново.
 const CLOCK_WINDOW = 64;                // замеров смещения (3,2 с при 20 Гц)
+const CLOCK_RESYNC_GAP = 250;           // мс, выше этого разрыв считается сменой эпохи
+const CLOCK_RESYNC_HITS = 20;           // столько замеров подряд — и окно сбрасывается
 
 const TAU = Math.PI * 2;
 
@@ -181,7 +202,20 @@ export class NetClient {
         this.clockRing = new Float64Array(CLOCK_WINDOW);
         this.clockFill = 0;
         this.clockHead = 0;
+        this.clockMisses = 0;           // замеров подряд выше оценки (страховка)
         this.lastStamp = 0;
+
+        // --- пауза гонки -----------------------------------------------------
+        // Пока гонка стоит, серверный тик не идёт. Чтобы шкала времени чужих
+        // машин и время гонки не убежали вперёд, простой вычитается из
+        // местных часов: обе стороны замирают в одной точке и после снятия
+        // паузы продолжают с того же места.
+        this.pausePhase = 'running';    // running | paused | resuming
+        this.pauseBy = -1;              // слот того, кто поставил
+        this.pauseName = '';
+        this.pauseBudget = 0;           // с, сколько паузы ещё разрешено
+        this.clockShift = 0;            // мс местного времени, съеденные паузой
+        this.pauseMark = 0;             // местное время начала текущей паузы
 
         // --- предсказание своей машины ---------------------------------------
         this.track = null;
@@ -273,6 +307,7 @@ export class NetClient {
             ackSeq: 0,
             tickLead: 0,
             connected: false,
+            paused: false,
         };
 
         // Обработчики сокета создаются один раз.
@@ -381,6 +416,8 @@ export class NetClient {
         this.racing = false;
         this.localSlot = -1;
         this.roomState = '';
+        // Обрыв на паузе не должен оставить часы замороженными навсегда.
+        this._resetPause();
         if (this.h.onClose) this.h.onClose(ev, this.closedByUs);
         if (!this.closedByUs) this._scheduleReconnect(wasConnected);
     }
@@ -441,6 +478,8 @@ export class NetClient {
         } else if (t === 'results') {
             this.racing = false;
             if (this.h.onResults) this.h.onResults(msg);
+        } else if (t === 'pause') {
+            this._onPause(msg);
         } else if (t === 'ping') {
             // Замер задержки сервером: отвечаем сразу, без обработки (раздел 9).
             this.send({ t: 'pong', t0: msg.t0 });
@@ -456,6 +495,62 @@ export class NetClient {
         if (this.h.onWelcome) this.h.onWelcome(msg);
     }
 
+    /**
+     * Событие `pause`: гонка встала, снимается или уже поехала.
+     *
+     * Пока фаза не `running`, сервер не тикает. Местные часы идут дальше, и
+     * если их не притормозить, момент показа чужих машин (now - INTERP_DELAY)
+     * уедет за самый свежий снапшот, а time гонки убежит вперёд. Поэтому весь
+     * простой копится в clockShift и вычитается из местного времени: обе
+     * шкалы стоят вместе и продолжаются с той же точки.
+     */
+    _onPause(msg) {
+        const phase = msg.phase === 'paused' || msg.phase === 'resuming'
+            ? msg.phase : 'running';
+        const wasStopped = this.pausePhase !== 'running';
+        const stopped = phase !== 'running';
+        this.pausePhase = phase;
+        this.pauseBy = msg.by === undefined || msg.by === null ? -1 : msg.by | 0;
+        this.pauseName = msg.name || '';
+        this.pauseBudget = msg.budget || 0;
+
+        if (stopped && !wasStopped) {
+            this.pauseMark = now();
+        } else if (!stopped && wasStopped) {
+            this.clockShift += now() - this.pauseMark;
+            this.pauseMark = 0;
+            // Ввод, зажатый до паузы, на сервер не уходил: своё предсказание
+            // после снятия начинается с авторитетного состояния.
+            this.smoothX = 0; this.smoothZ = 0; this.smoothYaw = 0;
+            this.smoothLeft = 0;
+        }
+        if (this.h.onPause) this.h.onPause(msg);
+    }
+
+    /** Гонка стоит: тик сервера не идёт, ввод не принимается. */
+    isPaused() {
+        return this.pausePhase !== 'running';
+    }
+
+    /**
+     * Местное время с вычтенным простоем паузы. Все шкалы времени внутри
+     * модуля (история снапшотов, момент показа, время гонки) живут именно
+     * на этих часах, поэтому пауза для них — просто отсутствие времени.
+     */
+    _localMs(ms) {
+        if (this.pausePhase !== 'running') return this.pauseMark - this.clockShift;
+        return ms - this.clockShift;
+    }
+
+    _resetPause() {
+        this.pausePhase = 'running';
+        this.pauseBy = -1;
+        this.pauseName = '';
+        this.pauseBudget = 0;
+        this.clockShift = 0;
+        this.pauseMark = 0;
+    }
+
     _onRoom(msg) {
         // 12.8: слот приходит в каждом событии room, ловить «первое» не нужно.
         this.localSlot = (msg.you === undefined || msg.you === null) ? -1 : msg.you | 0;
@@ -466,6 +561,17 @@ export class NetClient {
         if (this.racing && !wasRacing) {
             // Старт: отсчёт seq начинается заново вместе с гонкой.
             this._resetPrediction();
+        } else if (!this.racing && wasRacing) {
+            // Гонка кончилась — застрявшая пауза не должна пережить её.
+            // Сдвиг часов при этом сохраняется: он уже вшит в метки истории.
+            if (this.pausePhase !== 'running') {
+                this.clockShift += now() - this.pauseMark;
+                this.pauseMark = 0;
+            }
+            this.pausePhase = 'running';
+            this.pauseBy = -1;
+            this.pauseName = '';
+            this.pauseBudget = 0;
         }
         if (msg.settings && msg.settings.laps) this.lapsTotal = msg.settings.laps | 0;
 
@@ -519,6 +625,7 @@ export class NetClient {
         this.prevZ = state.z;
         this.prevYaw = state.yaw;
 
+        this._resetPause();
         this._resetPrediction();
         this._resetSnapshots();
 
@@ -559,7 +666,9 @@ export class NetClient {
         const snap = this.snap;
         if (!decodeSnapshot(buffer, snap)) return;
 
-        const t = now();
+        const raw = now();
+        // Шкала времени внутри модуля — местные часы без простоя паузы.
+        const t = this._localMs(raw);
         if (this.snapRecvMs > 0) {
             const gap = t - this.snapRecvMs;
             // Сглаженный интервал: для оверлея F3, ожидается 50 мс.
@@ -589,7 +698,8 @@ export class NetClient {
         }
 
         this._pushHistory(this._stampOf(snap.tick, t), snap);
-        this._measurePing(snap.ackSeq, t);
+        // ping считается по сырым часам: он про доставку, а не про шкалу гонки.
+        this._measurePing(snap.ackSeq, raw);
         this._reconcile(snap);
         this._updateProgress(snap);
 
@@ -604,7 +714,34 @@ export class NetClient {
      */
     _stampOf(tick, arrivedMs) {
         const serverMs = tick * (DT * 1000);
-        this.clockRing[this.clockHead] = arrivedMs - serverMs;
+        const raw = arrivedMs - serverMs;
+
+        // Снапшот стоящей симуляции (решётка в отсчёте, кадр на паузе) в окно
+        // не идёт: там tick заморожен, и такой замер занижен ровно на длину
+        // простоя. Метка ему ставится прямо по приходу — шкала истории от
+        // этого остаётся непрерывной, а оценка смещения не отравляется.
+        if (!this.racing || this.pausePhase !== 'running') {
+            let pre = arrivedMs;
+            if (pre <= this.lastStamp) pre = this.lastStamp + 0.001;
+            this.lastStamp = pre;
+            return pre;
+        }
+
+        // Страховка от смены эпохи, которую мы не предвидели (сервер надолго
+        // пропустил тики): минимум по окну устарел, если сырой замер держится
+        // заметно выше него подряд много раз. Тогда окно строится заново.
+        if (this.clockFill > 0 && raw - this.clockOffset > CLOCK_RESYNC_GAP) {
+            this.clockMisses++;
+            if (this.clockMisses >= CLOCK_RESYNC_HITS) {
+                this.clockFill = 0;
+                this.clockHead = 0;
+                this.clockMisses = 0;
+            }
+        } else {
+            this.clockMisses = 0;
+        }
+
+        this.clockRing[this.clockHead] = raw;
         this.clockHead = this.clockHead + 1 >= CLOCK_WINDOW ? 0 : this.clockHead + 1;
         if (this.clockFill < CLOCK_WINDOW) this.clockFill++;
 
@@ -922,6 +1059,7 @@ export class NetClient {
         this.localInSnapshot = false;
         this.clockFill = 0;
         this.clockHead = 0;
+        this.clockMisses = 0;
         this.clockOffset = 0;
         this.lastStamp = 0;
         this.snapRecvMs = 0;
@@ -958,6 +1096,8 @@ export class NetClient {
      */
     stepLocal(buttons) {
         if (!this.racing || !this.track || !this.localStats) return;
+        // На паузе сервер ввод не принимает и не тикает: предсказывать нечего.
+        if (this.pausePhase !== 'running') return;
         // Финишировавший доживает призраком и через 3 с пропадает из снапшотов
         // (раздел 9). Предсказывать и слать ввод за исчезнувшую машину незачем:
         // сервер такой ввод всё равно отбрасывает, а предсказание без
@@ -1039,7 +1179,7 @@ export class NetClient {
             return;
         }
 
-        const renderTime = nowMs - INTERP_DELAY;
+        const renderTime = this._localMs(nowMs) - INTERP_DELAY;
         const head = this.snapHead;
         const times = this.snapTime;
 
@@ -1241,8 +1381,8 @@ export class NetClient {
         if (this.snapRecvMs <= 0) return 0;
         // Вне RACING сервер не тикает: в отсчёте часы стоят на нуле, а на
         // экране итогов замирают на времени последнего снапшота.
-        if (!this.racing) return this.snapRaceTime;
-        const t = this.snapRaceTime + (nowMs - this.snapRecvMs) * 0.001;
+        if (!this.racing || this.pausePhase !== 'running') return this.snapRaceTime;
+        const t = this.snapRaceTime + (this._localMs(nowMs) - this.snapRecvMs) * 0.001;
         return t > 0 ? t : 0;
     }
 
@@ -1267,6 +1407,7 @@ export class NetClient {
         s.ackSeq = this.ackSeq;
         s.tickLead = this.tickLead;
         s.connected = this.connected;
+        s.paused = this.pausePhase !== 'running';
         return s;
     }
 }

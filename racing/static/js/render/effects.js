@@ -524,7 +524,9 @@ export class Effects {
         this.mineMat = new THREE.MeshLambertMaterial({
             vertexColors: true,
             flatShading: true,
-            emissive: new THREE.Color('#4a1400'),
+            // эмиссив слабый и общий на все мины: разницу «взведена или нет»
+            // несёт инстансный цвет, а он на эмиссив не влияет
+            emissive: new THREE.Color('#2a0a00'),
             emissiveIntensity: 1.0,
             // предупреждающий круг лежит в двух сантиметрах над полотном:
             // без смещения полигонов он замерцает на дистанции
@@ -611,6 +613,11 @@ export class Effects {
         this.shieldMesh.visible = false;
         this.group.add(this.shieldMesh);
 
+        // Слот, машина которого в этом кадре не рисуется (вид из кокпита —
+        // своя машина спрятана, 12.11). Её ореолы обязаны исчезнуть вместе
+        // с ней, иначе фары светят прямо в объектив.
+        this.hiddenSlot = -1;
+
         // --- состояние по слотам (аккумуляторы частоты эмиссии) -------------
         this.accSmoke = new Float32Array(MAX_CARS);
         this.accSpark = new Float32Array(MAX_CARS);
@@ -666,6 +673,14 @@ export class Effects {
 
         // счётчик активных частиц для оверлея F3
         this.activeParticles = 0;
+    }
+
+    /**
+     * Слот, чья машина в этом кадре скрыта (вид из кокпита). Её накладное
+     * свечение не выкладывается.
+     */
+    setHiddenSlot(slot) {
+        this.hiddenSlot = slot === undefined || slot === null ? -1 : slot;
     }
 
     /**
@@ -777,7 +792,8 @@ export class Effects {
         const rearZ = view.rearZ;
 
         // --- накладное свечение ламп ----------------------------------------
-        if (this.glowOn) {
+        const lampsOn = this.glowOn && slot !== this.hiddenSlot;
+        if (lampsOn) {
             // фары горят постоянно (10.3), кроме машины-призрака — её уже
             // отсекли по FLAG_GHOST выше
             this.lampRow(view, view.lampHead, 1, LAMP_HEAD_R, LAMP_HEAD_G, LAMP_HEAD_B,
@@ -836,7 +852,7 @@ export class Effects {
             else if (charge >= DRIFT_L1) level = 1;
             if (level > 0) {
                 const col = level === 3 ? SPARK_L3 : level === 2 ? SPARK_L2 : SPARK_L1;
-                if (this.glowOn) {
+                if (lampsOn) {
                     // ореол у задних колёс: уровень заряда виден и по цвету,
                     // и по размеру, даже если частицы выключены
                     const puls = 0.7 + Math.sin(this.time * (14 + level * 6) + slot) * 0.3;
@@ -985,7 +1001,7 @@ export class Effects {
                 c[idx * 3] = k * 0.85;
                 c[idx * 3 + 1] = k;
                 c[idx * 3 + 2] = k;
-                if (this.glowOn) {
+                if (lampsOn) {
                     // купол читается и днём: мягкий холодный ореол по контуру
                     const gl = 0.32 + Math.sin(this.time * 3.2 + slot) * 0.08 + flash * 0.8;
                     this.lamp(view.x, view.y + view.halfLength * 0.5, view.z, r * 2.6,
@@ -1255,10 +1271,11 @@ export class Effects {
                 const mc = this.mineMesh.instanceColor.array;
                 const mo = mineN * 3;
                 if (arming) {
-                    // невзведённая: холодная и приглушённая
-                    mc[mo] = 0.5;
-                    mc[mo + 1] = 0.62;
-                    mc[mo + 2] = 0.78;
+                    // невзведённая: холодная, тусклая, без маяка — она ещё
+                    // разворачивается и пока не опасна
+                    mc[mo] = 0.3;
+                    mc[mo + 1] = 0.42;
+                    mc[mo + 2] = 0.6;
                 } else {
                     const beat = 0.88 + Math.sin(this.time * 7.5 + i * 1.7) * 0.32;
                     mc[mo] = beat;
@@ -1318,7 +1335,7 @@ export class Effects {
             this.mineMesh.instanceColor.needsUpdate = true;
         }
         this.rocketMat.emissiveIntensity = 0.8 + Math.sin(this.time * 14) * 0.2;
-        this.mineMat.emissiveIntensity = 0.55 + Math.sin(this.time * 7.5) * 0.45;
+        this.mineMat.emissiveIntensity = 0.45 + Math.sin(this.time * 7.5) * 0.4;
 
         // --- щиты -----------------------------------------------------------
         this.shieldMesh.count = this.shieldCount;

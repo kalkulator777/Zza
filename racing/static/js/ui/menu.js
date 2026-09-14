@@ -32,6 +32,15 @@
 
 // --- локальные настройки клиента -------------------------------------------
 
+import {
+    loadGfxSettings,
+    saveGfxSettings,
+    applyGfxPreset,
+    DECOR_LEVELS,
+    PARTICLE_LEVELS,
+    RENDER_SCALES
+} from '../render/renderer.js';
+
 const LS_NAME = 'racing.name';
 const LS_QUALITY = 'racing.quality';
 const LS_VOLUME = 'racing.volume';
@@ -39,6 +48,12 @@ const LS_MUTED = 'racing.muted';
 
 export const QUALITY_PRESETS = ['low', 'medium', 'high'];
 const QUALITY_LABELS = { low: 'Низкое', medium: 'Среднее', high: 'Высокое' };
+
+// Подписи отдельных настроек графики. Пресет выше — быстрая заготовка,
+// которая выставляет их скопом; дальше каждую можно крутить руками.
+const DECOR_LABELS = { sparse: 'Реже', normal: 'Обычно', dense: 'Гуще' };
+const PARTICLE_LABELS = { off: 'Выкл', few: 'Мало', normal: 'Норма', many: 'Много' };
+const SCALE_LABELS = { 0.5: '50 %', 0.75: '75 %', 1: '100 %' };
 
 /** Безопасное чтение localStorage: в приватном окне доступ может бросать. */
 function lsGet(key) {
@@ -56,11 +71,15 @@ function lsSet(key, value) {
 export function loadUiSettings() {
     const quality = lsGet(LS_QUALITY);
     const volumeRaw = parseFloat(lsGet(LS_VOLUME));
+    const preset = QUALITY_PRESETS.indexOf(quality) >= 0 ? quality : 'medium';
     return {
         name: lsGet(LS_NAME) || '',
-        quality: QUALITY_PRESETS.indexOf(quality) >= 0 ? quality : 'medium',
+        quality: preset,
         volume: Number.isFinite(volumeRaw) ? Math.min(1, Math.max(0, volumeRaw)) : 0.7,
         muted: lsGet(LS_MUTED) === '1',
+        // Отдельные галочки графики. Их владелец — render/renderer.js: он же
+        // их применяет. Меню только показывает и записывает.
+        gfx: loadGfxSettings(preset),
     };
 }
 
@@ -351,6 +370,12 @@ export class MenuScreen {
         qField.appendChild(seg);
         setBody.appendChild(qField);
 
+        // --- отдельные переключатели графики -----------------------------
+        // Требование заказчика: всё новое обязано выключаться по отдельности,
+        // а не только тремя пресетами скопом. Блок свёрнут, чтобы меню не
+        // разрослось: кому надо — раскроет.
+        setBody.appendChild(this._buildGfx());
+
         const vField = el('div', 'field');
         const vHead = el('div', 'row-between');
         vHead.appendChild(el('div', 'label', 'Громкость'));
@@ -394,6 +419,73 @@ export class MenuScreen {
         left.appendChild(keys);
 
         return left;
+    }
+
+    /**
+     * Блок отдельных настроек графики. Каждая строка пишет свой ключ
+     * localStorage (`racing.gfx.*`) и тут же зовёт onSettingsChange —
+     * рендер применяет изменение без перезагрузки страницы.
+     */
+    _buildGfx() {
+        const box = el('details', 'gfx');
+        const head = el('summary', 'gfx-summary', 'Отдельные настройки графики');
+        box.appendChild(head);
+        const body = el('div', 'gfx-body');
+
+        this.gfxToggles = {};
+        const self = this;
+
+        function addToggle(key, caption, hint) {
+            const field = el('div', 'field');
+            const label = el('label', 'toggle');
+            const input = el('input');
+            input.type = 'checkbox';
+            input.addEventListener('change', function () {
+                const patch = {};
+                patch[key] = input.checked;
+                self._setGfx(patch);
+            });
+            label.appendChild(input);
+            label.appendChild(el('span', 'toggle-track'));
+            label.appendChild(el('span', null, caption));
+            field.appendChild(label);
+            if (hint) field.appendChild(el('div', 'gfx-hint', hint));
+            body.appendChild(field);
+            self.gfxToggles[key] = input;
+        }
+
+        function addSegmented(key, caption, values, labels) {
+            const field = el('div', 'field');
+            field.appendChild(el('div', 'label', caption));
+            const row = el('div', 'segmented segmented-tight');
+            const buttons = [];
+            for (let i = 0; i < values.length; i++) {
+                const v = values[i];
+                const btn = el('button', 'seg', labels[v]);
+                btn.type = 'button';
+                btn.addEventListener('click', function () {
+                    const patch = {};
+                    patch[key] = v;
+                    self._setGfx(patch);
+                });
+                row.appendChild(btn);
+                buttons.push(btn);
+            }
+            field.appendChild(row);
+            body.appendChild(field);
+            self.gfxSegments[key] = { values: values, buttons: buttons };
+        }
+
+        this.gfxSegments = {};
+        addToggle('ao', 'Запечённое затенение', 'Тени в стыках и у оснований. В кадре бесплатно.');
+        addToggle('glow', 'Свечение огней', 'Фары, стоп-сигналы, турбо, маяки мин.');
+        addToggle('decorAnim', 'Анимация декора', 'Качание деревьев и флагов, движение толпы.');
+        addSegmented('decor', 'Плотность декора', DECOR_LEVELS, DECOR_LABELS);
+        addSegmented('particles', 'Частицы', PARTICLE_LEVELS, PARTICLE_LABELS);
+        addSegmented('renderScale', 'Чёткость картинки', RENDER_SCALES, SCALE_LABELS);
+
+        box.appendChild(body);
+        return box;
     }
 
     _buildRight() {
@@ -832,7 +924,34 @@ export class MenuScreen {
         this.volumeInput.value = String(Math.round(s.volume * 100));
         this.volumeValue.textContent = String(Math.round(s.volume * 100));
         this.muteInput.checked = !s.muted;
+        this._applyGfxState();
         this._updateCreateAvailability();
+    }
+
+    /** Разложить текущие галочки графики по элементам управления. */
+    _applyGfxState() {
+        const g = this.settings.gfx;
+        if (!g || !this.gfxToggles) return;
+        for (const key in this.gfxToggles) {
+            this.gfxToggles[key].checked = !!g[key];
+        }
+        for (const key in this.gfxSegments) {
+            const seg = this.gfxSegments[key];
+            for (let i = 0; i < seg.buttons.length; i++) {
+                seg.buttons[i].classList.toggle('is-active', seg.values[i] === g[key]);
+            }
+        }
+    }
+
+    /**
+     * Изменить одну настройку графики. Значение уходит в localStorage, а
+     * onSettingsChange заставляет рендер перечитать его и применить —
+     * при необходимости с пересборкой сцены, но без перезагрузки страницы.
+     */
+    _setGfx(patch) {
+        this.settings.gfx = saveGfxSettings(patch, this.settings.quality);
+        this._applyGfxState();
+        this._emitSettings();
     }
 
     _emitSettings() {
@@ -841,6 +960,8 @@ export class MenuScreen {
 
     _setQuality(preset) {
         this.settings = saveUiSettings({ quality: preset });
+        // Пресет — быстрая заготовка: он выставляет ВСЕ отдельные галочки.
+        this.settings.gfx = applyGfxPreset(preset);
         this._applyLocalSettings();
         this._emitSettings();
     }

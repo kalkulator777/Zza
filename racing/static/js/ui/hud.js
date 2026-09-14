@@ -1,7 +1,7 @@
 /*
  * HUD гонки: скорость, тахометр, круг, позиция, времена, слот бонуса,
- * заряд дрифта, мини-карта, лента событий, таблица позиций по Tab
- * и предупреждение о движении не в ту сторону.
+ * заряд дрифта, мини-карта, лента событий, таблица позиций по Tab,
+ * предупреждение о движении не в ту сторону и глобальная пауза.
  *
  * ЭТО САМЫЙ ГОРЯЧИЙ КОД ИНТЕРФЕЙСА: update() зовётся каждый кадр рядом с
  * рендером, бюджет — десятые доли миллисекунды. Отсюда правила, которым
@@ -38,6 +38,14 @@
  *
  *   // на событие race_event:
  *   hud.pushRaceEvent(msg);
+ *
+ *   // на событие pause: 'running' | 'paused' | 'resuming'
+ *   hud.setPause(msg.phase, msg.name);
+ *
+ * ПАУЗА. Клавиша P и кнопка в HUD — оба пути зовут один обработчик
+ * onTogglePause(wantPause) из options. Сам HUD состояние паузы не хранит:
+ * плашку он рисует по событию сервера, а не по нажатию, иначе у игроков
+ * разъедется картинка. Плашка и кнопка живут вне кадрового цикла.
  */
 
 import { ITEM_DEFS, ITEM_BY_ID, ITEM_BY_KIND, itemIconSvg } from './menu.js';
@@ -207,7 +215,8 @@ class TimeField {
 export class Hud {
     /**
      * @param {HTMLElement} root корень слоя HUD (#screen-hud)
-     * @param {object} [options] {bindKeys: true} — самому слушать Tab
+     * @param {object} [options] {bindKeys: true} — самому слушать Tab и P;
+     *        {onTogglePause(want)} — нажали P или кнопку паузы
      */
     constructor(root, options) {
         this.root = root;
@@ -238,6 +247,9 @@ export class Hud {
         this.standingsVisible = false;
         this.standingsNextUpdate = 0;
 
+        this.onTogglePause = opts.onTogglePause || null;
+        this.pausePhase = 'running';
+
         this.feedHead = 0;
         this.feedNextExpiry = Infinity;
 
@@ -253,6 +265,34 @@ export class Hud {
         this.root.hidden = true;
         this.visible = false;
         this.setStandingsVisible(false);
+        this.setPause('running', '');
+    }
+
+    /**
+     * Событие `pause` (§9). Фазы: `paused` — стоим, плашка на весь экран;
+     * `resuming` — идёт обратный отсчёт, его рисует оверлей отсчёта, плашка
+     * уходит; `running` — едем.
+     */
+    setPause(phase, name) {
+        const want = phase === 'paused' || phase === 'resuming' ? phase : 'running';
+        if (want === this.pausePhase) return;
+        this.pausePhase = want;
+        this.pauseNode.hidden = want !== 'paused';
+        if (want === 'paused') {
+            this.pauseWho.textContent = name ? 'поставил ' + name : 'поставлена';
+        }
+        this.pauseButton.textContent = want === 'paused' ? 'Продолжить · P' : 'Пауза · P';
+        this.pauseButton.className = want === 'paused' ? 'hud-pause-btn on' : 'hud-pause-btn';
+    }
+
+    /**
+     * Нажали P или кнопку: просим сервер поставить или снять паузу.
+     * Во время отсчёта снятия (`resuming`) нажатие означает «стоп, обратно на
+     * паузу»: передумать до того, как машины поедут, — обычное дело.
+     */
+    togglePause() {
+        if (!this.visible || !this.onTogglePause) return;
+        this.onTogglePause(this.pausePhase !== 'paused');
     }
 
     /**
@@ -323,6 +363,7 @@ export class Hud {
         this.wrongWayNode.className = 'hud-wrongway';
         this._showItem(0, false);
         this._clearFeed();
+        this.setPause('running', '');
     }
 
     _resetCache() {
@@ -626,6 +667,18 @@ export class Hud {
     _bindKeys() {
         // Tab по коду клавиши, не по символу: раскладка значения не имеет (10.4).
         this._onKeyDown = (e) => {
+            if (e.code === 'KeyP') {
+                // P — глобальная пауза (доработка «офисная игра»). В поле
+                // ввода P остаётся буквой.
+                const node = e.target;
+                const tag = node && node.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+                if (node && node.isContentEditable) return;
+                if (!this.visible || e.repeat) return;
+                e.preventDefault();
+                this.togglePause();
+                return;
+            }
             if (e.code !== 'Tab' || !this.visible) return;
             e.preventDefault();
             if (!this.standingsVisible) this.setStandingsVisible(true);
@@ -979,6 +1032,42 @@ export class Hud {
             + 'stroke="#080a12" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">'
             + '<path d="M12 3v18M12 3 6 9M12 3l6 6"/></svg><span>Не туда!</span>';
         wrap.appendChild(this.wrongWayNode);
+
+        // Пауза: плашка на весь экран и кнопка рядом с блоком времён.
+        // Стили инлайновые: правка css/style.css в эту задачу не входит.
+        this.pauseNode = el('div', 'hud-pause');
+        this.pauseNode.style.cssText = 'position:absolute;inset:0;display:grid;'
+            + 'place-items:center;pointer-events:none;'
+            + 'background:radial-gradient(closest-side,rgba(8,10,18,.88),'
+            + 'rgba(8,10,18,.66) 55%,rgba(8,10,18,.4))';
+        const pauseCard = el('div');
+        pauseCard.style.cssText = 'text-align:center';
+        const pauseTitle = el('div', null, 'ПАУЗА');
+        pauseTitle.style.cssText = 'font-size:132px;font-weight:900;line-height:1;'
+            + 'letter-spacing:10px;color:#ffc93c;-webkit-text-stroke:11px #080a12;'
+            + 'paint-order:stroke fill;text-shadow:0 10px 0 rgba(8,10,18,.6)';
+        pauseCard.appendChild(pauseTitle);
+        this.pauseWho = el('div', null, 'поставлена');
+        this.pauseWho.style.cssText = 'margin-top:18px;font-size:26px;font-weight:900;'
+            + 'color:#eef2ff;-webkit-text-stroke:6px #080a12;paint-order:stroke fill';
+        pauseCard.appendChild(this.pauseWho);
+        const pauseHint = el('div', null, 'P или кнопка в углу — продолжить');
+        pauseHint.style.cssText = 'margin-top:10px;font-size:15px;font-weight:700;'
+            + 'color:#94a1c6;-webkit-text-stroke:5px #080a12;paint-order:stroke fill';
+        pauseCard.appendChild(pauseHint);
+        this.pauseNode.appendChild(pauseCard);
+        this.pauseNode.hidden = true;
+        wrap.appendChild(this.pauseNode);
+
+        this.pauseButton = el('button', 'hud-pause-btn', 'Пауза · P');
+        this.pauseButton.type = 'button';
+        this.pauseButton.style.cssText = 'position:absolute;top:18px;right:254px;'
+            + 'pointer-events:auto;font:inherit;font-size:13px;font-weight:900;'
+            + 'padding:9px 14px;border-radius:14px;cursor:pointer;color:#eef2ff;'
+            + 'background:rgba(16,20,33,.8);border:3px solid #080a12;'
+            + 'box-shadow:0 4px 0 rgba(8,10,18,.8)';
+        this.pauseButton.addEventListener('click', () => this.togglePause());
+        wrap.appendChild(this.pauseButton);
 
         // Таблица позиций
         this.standingsNode = el('div', 'hud-standings');

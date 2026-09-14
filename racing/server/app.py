@@ -35,12 +35,15 @@ for _ext, _mime in config.STATIC_MIME.items():
 class ServerContext(object):
     """Всё, что нужно хендлерам: комнаты, контент, токен хоста, соседи."""
 
-    def __init__(self, manager, content, host_token, guest_rooms,
+    def __init__(self, manager, content, host_token,
                  server_name, port, static_dir, discovery=None, log=None):
         self.manager = manager
         self.content = content
+        # Токен хоста отмечает того, кто запустил run.py: он уходит в
+        # welcome.is_host (§9) и подписывает ссылку хозяина в баннере.
+        # Прав на создание комнат он больше не даёт — комнату создаёт любой
+        # подключившийся, ключ --guest-rooms за ненадобностью убран.
         self.host_token = host_token
-        self.guest_rooms = bool(guest_rooms)
         self.server_name = server_name
         self.port = port
         self.static_dir = static_dir
@@ -295,10 +298,9 @@ class GameSocket(tornado.websocket.WebSocketHandler):
         self.player.send_event(self.ctx.manager.rooms_event())
 
     def _ev_create_room(self, data):
+        # Комнату создаёт любой подключившийся: ограничение «только хозяин»
+        # держалось на недоразумении и снято вместе с ключом --guest-rooms.
         player = self.player
-        if not self.ctx.guest_rooms and not player.is_host:
-            player.send_error('not_host', 'комнаты создаёт хозяин сервера')
-            return
         self.ctx.manager.create_room(player, data.get('name'), data.get('settings'))
 
     def _ev_join_room(self, data):
@@ -335,6 +337,17 @@ class GameSocket(tornado.websocket.WebSocketHandler):
             return
         player.room.start_race(player)
 
+    def _ev_set_pause(self, data):
+        player = self.player
+        if player.room is None:
+            player.send_error('no_room', 'вы не в комнате')
+            return
+        paused = data.get('paused')
+        if not isinstance(paused, bool):
+            player.send_error('bad_flag', 'paused должен быть true или false')
+            return
+        player.room.set_pause(player, paused)
+
     def _ev_chat(self, data):
         player = self.player
         if player.room is None:
@@ -360,6 +373,7 @@ HANDLERS = {
     'set_ready': GameSocket._ev_set_ready,
     'update_settings': GameSocket._ev_update_settings,
     'start_race': GameSocket._ev_start_race,
+    'set_pause': GameSocket._ev_set_pause,
     'chat': GameSocket._ev_chat,
     'pong': GameSocket._ev_pong,
 }

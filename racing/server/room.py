@@ -5,6 +5,10 @@
 
     LOBBY -> COUNTDOWN -> RACING -> RESULTS -> LOBBY
 
+Поверх RACING живёт глобальная пауза: её ставит и снимает любой участник
+гонки (игра офисная), состояние комнаты при этом не меняется, а игровой цикл
+останавливается целиком — см. раздел «глобальная пауза» ниже.
+
 Комната ничего не знает про физику, трассу и бонусы: вся игровая логика живёт
 за интерфейсом ``Simulation`` из §12.4. Комната отвечает за темп (фиксированный
 шаг 1/60 с с накопителем), за рассылку снапшотов каждый третий тик, за
@@ -345,6 +349,17 @@ class Room(object):
         self._reserved = set()       # слоты, занятые гонкой (в т.ч. отвалившимися)
         self._timer = None           # отсчёт / итоги
         self._loop = None            # PeriodicCallback игрового цикла
+        self._grid_loop = None       # снапшоты решётки в отсчёте (прогрев клиента)
+        # Глобальная пауза: фаза, кто поставил, бюджет простоя.
+        self._pause_phase = 'running'    # running | paused | resuming
+        self._pause_by = -1
+        self._pause_name = ''
+        self._pause_reason = 'player'    # player | timeout
+        self._pause_started = 0.0        # монотонное время начала простоя
+        self._paused_total = 0.0         # сколько простоя уже съедено за гонку
+        self._pause_last = {}            # слот -> когда игрок ставил паузу
+        self._pause_timer = None         # предел простоя / шаг отсчёта снятия
+        self._resume_value = 0
         self._accum = 0.0            # накопитель фиксированного шага
         self._last_frame = 0.0
         self._ticks = 0              # тиков с начала гонки
@@ -636,8 +651,20 @@ class Room(object):
         })
         self.broadcast_state()
         self.manager.rooms_changed()
-        # Один снапшот до отсчёта: клиент сразу видит машины на решётке.
+        # Снапшоты решётки идут все три секунды отсчёта с той же частотой
+        # 20 Гц, что и в гонке. Это не «чтобы видно было машины» — один кадр
+        # для этого хватало и раньше, — а прогрев клиента: к моменту старта
+        # у него уже набрана история интерполяции на INTERP_DELAY вперёд и
+        # непрерывная шкала времени. Без прогрева первые секунды гонки чужие
+        # машины шли ступеньками (см. §10.2 и комментарий в net.js).
         self.broadcast_snapshot()
+        self._grid_loop = PeriodicCallback(self.broadcast_snapshot, config.SNAPSHOT_MS)
+        self._grid_loop.start()
+        self._pause_last = {}
+        self._paused_total = 0.0
+        self._pause_phase = 'running'
+        self._pause_by = -1
+        self._pause_name = ''
         self._countdown_value = config.COUNTDOWN_SECONDS
         self._countdown_step()
 
@@ -653,6 +680,9 @@ class Room(object):
 
     def _begin_racing(self):
         """Ввод разблокирован, запускается игровой цикл."""
+        if self._grid_loop is not None:
+            self._grid_loop.stop()
+            self._grid_loop = None
         self.state = config.STATE_RACING
         self.broadcast_state()
         self._accum = 0.0
@@ -772,10 +802,141 @@ class Room(object):
         """Бинарный ввод от игрока: только участнику идущей гонки."""
         if self.state != config.STATE_RACING or self._sim is None:
             return
+        if self._pause_phase != 'running':
+            return                       # гонка стоит: ввод игнорируется
         slot = player.slot
         if slot not in self._race_slots:
             return
         self._sim.set_input(slot, seq, buttons)
+
+    # --- глобальная пауза ---------------------------------------------------
+    #
+    # Игра офисная: подошёл начальник — остановить надо мгновенно и всем.
+    # Поэтому паузу ставит и снимает ЛЮБОЙ участник гонки, а не владелец
+    # комнаты. Пока пауза держится, игровой цикл остановлен целиком: тик
+    # не идёт, значит стоят и время гонки, и времена кругов, и снаряды,
+    # и таймеры бонусов — замораживать их поштучно не нужно.
+    #
+    # Фазы: running (едем) -> paused (стоим) -> resuming (обратный отсчёт,
+    # тик ещё стоит) -> running. Клиент узнаёт фазу из события `pause`,
+    # обратный отсчёт снятия идёт обычными событиями `countdown`.
+
+    def set_pause(self, player, want):
+        """Событие set_pause от игрока: поставить или снять паузу."""
+        if self.state != config.STATE_RACING or self._sim is None:
+            player.send_error('busy', 'пауза работает только в идущей гонке')
+            return
+        if player.slot not in self._race_slots:
+            player.send_error('busy', 'паузу ставит участник гонки')
+            return
+        if want:
+            if self._pause_phase == 'paused':
+                return                   # уже стоим — повтор молча
+            now = time.monotonic()
+            last = self._pause_last.get(player.slot)
+            if last is not None and now - last < config.PAUSE_MIN_INTERVAL:
+                player.send_error(
+                    'pause_rate', 'паузу можно ставить раз в %d с'
+                    % int(config.PAUSE_MIN_INTERVAL))
+                return
+            if self._pause_left() <= 0.0:
+                player.send_error('pause_rate', 'лимит паузы на эту гонку исчерпан')
+                return
+            self._pause_last[player.slot] = now
+            self._enter_pause(player.slot, player.name)
+        else:
+            if self._pause_phase != 'paused':
+                return                   # уже снимается или и не стояла
+            self._begin_resume(player.slot, player.name, 'player')
+
+    def _pause_left(self):
+        """Сколько простоя ещё разрешено этой гонке, с."""
+        spent = self._paused_total
+        if self._pause_phase != 'running' and self._pause_started:
+            spent += time.monotonic() - self._pause_started
+        left = config.PAUSE_MAX_TOTAL - spent
+        return left if left > 0.0 else 0.0
+
+    def _enter_pause(self, slot, name):
+        """Остановить симуляцию. Из running и из resuming — одинаково."""
+        frozen = self._pause_phase != 'running'
+        self._pause_phase = 'paused'
+        self._pause_by = slot
+        self._pause_name = name or ''
+        self._pause_reason = 'player'
+        if not frozen:
+            self._pause_started = time.monotonic()
+            if self._loop is not None:
+                self._loop.stop()
+                self._loop = None
+        self._cancel_pause_timer()
+        # Общий предел: пауза снимется сама, когда бюджет кончится.
+        self._pause_timer = IOLoop.current().call_later(self._pause_left(),
+                                                        self._pause_expired)
+        self._broadcast_pause()
+
+    def _pause_expired(self):
+        """Бюджет простоя исчерпан — снимаем паузу сами."""
+        self._pause_timer = None
+        if self._pause_phase != 'paused':
+            return
+        self._begin_resume(-1, '', 'timeout')
+
+    def _begin_resume(self, slot, name, reason):
+        """Снятие паузы: короткий отсчёт, чтобы руки вернулись на клавиатуру."""
+        self._pause_phase = 'resuming'
+        self._pause_by = slot
+        self._pause_name = name or ''
+        self._pause_reason = reason
+        self._cancel_pause_timer()
+        self._resume_value = config.PAUSE_RESUME_SECONDS
+        self._broadcast_pause(resume_in=config.PAUSE_RESUME_SECONDS)
+        self._resume_step()
+
+    def _resume_step(self):
+        """Шаги отсчёта снятия: обычные события countdown (§9)."""
+        self._pause_timer = None
+        if self.state != config.STATE_RACING or self._sim is None:
+            return
+        if self._resume_value <= 0:
+            self._finish_resume()
+            self.broadcast({'t': 'countdown', 'value': 0})
+            return
+        self.broadcast({'t': 'countdown', 'value': self._resume_value})
+        self._resume_value -= 1
+        self._pause_timer = IOLoop.current().call_later(1.0, self._resume_step)
+
+    def _finish_resume(self):
+        """Тик пошёл снова. Накопитель обнуляется: простой нагонять не нужно."""
+        if self._pause_started:
+            self._paused_total += time.monotonic() - self._pause_started
+        self._pause_started = 0.0
+        self._pause_phase = 'running'
+        self._broadcast_pause()
+        self._accum = 0.0
+        self._last_frame = time.monotonic()
+        if self._loop is None:
+            self._loop = PeriodicCallback(self._frame, config.TICK_MS)
+            self._loop.start()
+
+    def _cancel_pause_timer(self):
+        if self._pause_timer is not None:
+            IOLoop.current().remove_timeout(self._pause_timer)
+            self._pause_timer = None
+
+    def _broadcast_pause(self, resume_in=0):
+        """Событие pause (§9): фаза, кто её вызвал и остаток бюджета."""
+        event = {
+            't': 'pause',
+            'phase': self._pause_phase,
+            'by': self._pause_by,
+            'name': self._pause_name,
+            'reason': self._pause_reason,
+            'budget': round(self._pause_left(), 1),
+        }
+        if resume_in:
+            event['resume_in'] = resume_in
+        self.broadcast(event)
 
     # --- финиш и итоги ------------------------------------------------------
 
@@ -783,7 +944,12 @@ class Room(object):
         """Завершение гонки: итоги на RESULTS_SECONDS и назад в лобби."""
         if self.state not in (config.STATE_COUNTDOWN, config.STATE_RACING):
             return
+        was_paused = self._pause_phase != 'running'
         self._stop_loop()
+        if was_paused:
+            # Гонка кончилась прямо на паузе: плашку у всех надо снять.
+            self._pause_reason = 'race_over'
+            self._broadcast_pause()
         sim = self._sim
         rows = []
         if sim is not None:
@@ -820,6 +986,8 @@ class Room(object):
         self._sim = None
         self._race_slots = ()
         self._reserved = set()
+        self._paused_total = 0.0
+        self._pause_last = {}
         self.state = config.STATE_LOBBY
         for player in self.order:
             player.reset_for_lobby()
@@ -830,9 +998,17 @@ class Room(object):
         if self._loop is not None:
             self._loop.stop()
             self._loop = None
+        if self._grid_loop is not None:
+            self._grid_loop.stop()
+            self._grid_loop = None
         if self._timer is not None:
             IOLoop.current().remove_timeout(self._timer)
             self._timer = None
+        self._cancel_pause_timer()
+        self._pause_phase = 'running'
+        self._pause_by = -1
+        self._pause_name = ''
+        self._pause_started = 0.0
 
     def close(self):
         """Погасить все таймеры комнаты (выход последнего игрока, остановка сервера)."""

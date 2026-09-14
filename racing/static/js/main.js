@@ -20,9 +20,14 @@
 // audioState, perfStats) созданы один раз при старте, дальше только
 // переписываются по полям. Ни литералов, ни замыканий, ни .map внутри кадра.
 //
-// ЧУЖИЕ КЛАВИШИ. Tab и F3 слушают ui/hud.js и ui/perf.js, C и Shift —
+// ЧУЖИЕ КЛАВИШИ. Tab, F3 и P слушают ui/hud.js и ui/perf.js, C и Shift —
 // render/renderer.js (12.6, 12.11). main.js их не трогает и только читает
 // rr.lookBack, чтобы положить бит «взгляд назад» в пакет ввода.
+//
+// ПАУЗА. Бита в маске кнопок под неё нет и не нужно (событие редкое): P и
+// кнопка в HUD шлют JSON-событие set_pause, решение принимает сервер, а
+// обратно приезжает событие pause. Пока оно не сказало `running`, кадровый
+// цикл не делает ни одного фиксированного шага.
 
 import { MenuScreen, showToast, loadUiSettings, saveUiSettings } from './ui/menu.js';
 import { LobbyScreen } from './ui/lobby.js';
@@ -97,6 +102,7 @@ const app = {
     roomState: '',
     raceBuilt: false,
     racing: false,
+    paused: false,          // глобальная пауза гонки (§9, событие pause)
     startSoundDone: false,
     raceCarCount: 0,
     lapsTotal: 3,
@@ -128,7 +134,7 @@ const settings = loadUiSettings();
 const renderer = new RaceRenderer(canvas, { quality: settings.quality });
 renderer.resize(window.innerWidth, window.innerHeight);
 
-const hud = new Hud(rootHud);
+const hud = new Hud(rootHud, { onTogglePause: onTogglePause });
 const hudState = createHudState();
 const audioState = createAudioState();
 const perf = new PerfOverlay(rootPerf);
@@ -159,6 +165,7 @@ const net = new NetClient({
     onCountdown: onCountdown,
     onRaceEvent: onRaceEvent,
     onResults: onResults,
+    onPause: onPause,
     onError: onServerError,
     onSnapshot: onSnapshot,
 });
@@ -180,7 +187,7 @@ const lobby = new LobbyScreen(rootLobby, rootCountdown, {
     onLeave: onLeaveRoom,
 });
 
-const results = new ResultsScreen(rootResults, { onReturn: onLeaveRoom });
+const results = new ResultsScreen(rootResults, { onReturn: onResultsReturn });
 
 // ---------------------------------------------------------------------------
 // Экраны
@@ -220,6 +227,7 @@ function teardownRace() {
     if (!app.raceBuilt) return;
     app.raceBuilt = false;
     app.racing = false;
+    app.paused = false;
     app.startSoundDone = false;
     renderer.dispose();
     audio.stopRace();
@@ -260,6 +268,7 @@ function onWelcome(msg) {
     // есть только идентификатор машины, а рендеру нужна форма.
     setCatalog(msg);
     menu.applyWelcome(msg);
+    allowRoomCreation();
     lobby.applyWelcome(msg);
     results.applyWelcome(msg);
     // 12.8: в welcome слот почти всегда null, боевое значение придёт в room.you.
@@ -281,6 +290,11 @@ function onRoom(msg) {
     const state = msg.state || 'LOBBY';
     const was = app.roomState;
     app.roomState = state;
+    if (state !== 'RACING' && app.paused) {
+        // Гонка кончилась прямо на паузе — плашка не должна пережить её.
+        app.paused = false;
+        hud.setPause('running', '');
+    }
     if (msg.settings && msg.settings.laps) app.lapsTotal = msg.settings.laps | 0;
 
     if (state === 'LOBBY') {
@@ -375,6 +389,37 @@ function onResults(msg) {
     app.racing = false;
     audioState.engineOn = false;
     setScreen(SCREEN_RESULTS);
+}
+
+/**
+ * Событие `pause` (§9). Пока фаза не `running`, комната не тикает: шаги
+ * предсказания не делаются, ввод никуда не уходит, время гонки и времена
+ * кругов стоят (этим занимается net.js своими часами). HUD показывает
+ * плашку, обратный отсчёт снятия приезжает обычными событиями countdown.
+ */
+function onPause(msg) {
+    const phase = msg.phase === 'paused' || msg.phase === 'resuming' ? msg.phase : 'running';
+    const was = app.paused;
+    app.paused = phase !== 'running';
+    hud.setPause(phase, msg.name || '');
+    if (app.paused) {
+        audioState.engineOn = false;
+    } else if (was) {
+        audioState.engineOn = true;
+    }
+    // Тост нужен только там, где плашки и отсчёта не хватает: паузу поставил
+    // не ты (кто именно — видно и на плашке) или её сняло само время.
+    if (phase === 'paused' && msg.by !== app.localSlot) {
+        showToast((msg.name || 'Игрок') + ' поставил паузу', 'info');
+    } else if (phase === 'running' && was && msg.reason === 'timeout') {
+        showToast('Пауза снята: исчерпан предел длительности', 'info');
+    }
+}
+
+/** Нажали P или кнопку паузы в HUD. Решение принимает сервер. */
+function onTogglePause(want) {
+    if (!app.racing) return;
+    net.send({ t: 'set_pause', paused: !!want });
 }
 
 function onServerError(msg) {
@@ -478,6 +523,40 @@ function onLeaveRoom() {
     net.send({ t: 'list_rooms' });
 }
 
+/**
+ * Кнопка «В лобби» на экране итогов.
+ *
+ * Комната сама возвращается из RESULTS в LOBBY через пятнадцать секунд
+ * (раздел 9), игроки при этом остаются в ней. Кнопка только пропускает
+ * таблицу вперёд и НЕ выходит из комнаты: раньше она была повешена на
+ * onLeaveRoom, поэтому вместо лобби игрок оказывался в меню, а если он был
+ * владельцем комнаты — вместе с ним уезжало и владение.
+ */
+function onResultsReturn() {
+    if (!app.inRoom) {
+        setScreen(SCREEN_MENU);
+        return;
+    }
+    teardownRace();
+    setScreen(SCREEN_LOBBY);
+}
+
+/**
+ * Доработка: комнату создаёт любой подключившийся, право больше не зависит
+ * от токена хоста. Кнопку «Создать комнату» и объяснение «почему нельзя»
+ * держит ui/menu.js по полю welcome.is_host; этот файл в правку не входит,
+ * поэтому разрешение проставляется отсюда (см. отчёт: в menu.js остаётся
+ * убрать сам признак и текст hostHint).
+ */
+function allowRoomCreation() {
+    menu.isHost = true;
+    if (menu.createButton) {
+        menu.createButton.disabled = false;
+        menu.createButton.title = '';
+    }
+    if (menu.hostHint) menu.hostHint.hidden = true;
+}
+
 /** Esc (раздел 10.4): из гонки и лобби — в меню, из меню — никуда. */
 function onEscape() {
     if (app.screen === SCREEN_RACE || app.screen === SCREEN_LOBBY
@@ -511,7 +590,11 @@ function frame(timestamp) {
 
     // --- фиксированный шаг -------------------------------------------------
     let steps = 0;
-    if (app.racing && app.raceBuilt) {
+    if (app.paused && app.raceBuilt) {
+        // Гонка стоит: ни одного шага, ввод никуда не идёт. Накопитель при
+        // этом НЕ трогаем — alpha остаётся тем же, и своя машина замирает
+        // ровно в той точке, где её застала пауза, без полушага назад.
+    } else if (app.racing && app.raceBuilt) {
         // Поправка темпа от net.js: держит число шагов клиента вровень
         // с числом тиков сервера, иначе счётчики расходятся и реконсиляция
         // правит не физику, а разницу в количестве шагов.

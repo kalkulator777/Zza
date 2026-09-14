@@ -5,12 +5,14 @@
     python3 run.py                 # сервер + Firefox на localhost
     python3 run.py --no-browser    # только сервер
     python3 run.py --port 8000
-    python3 run.py --guest-rooms   # комнаты может создавать любой клиент
     python3 run.py --name "Комп Васи"
 
 Запустивший получает ссылку с токеном хоста; остальные заходят на
 http://<ip-этой-машины>:<порт>. Адреса, которые надо диктовать соседям,
 печатаются при старте крупно и по одному на строку.
+
+Комнату создаёт любой подключившийся: прежнее ограничение «только хозяин»
+держалось на недоразумении и снято вместе с ключом --guest-rooms.
 """
 
 import argparse
@@ -46,8 +48,6 @@ def parse_args(argv=None):
                         help='адрес для прослушивания (по умолчанию все интерфейсы)')
     parser.add_argument('--no-browser', action='store_true',
                         help='не открывать браузер')
-    parser.add_argument('--guest-rooms', action='store_true',
-                        help='разрешить создание комнат любому клиенту')
     parser.add_argument('--name', default=None,
                         help='имя сервера, видное соседям по сети')
     parser.add_argument('--content', default=os.path.join(BASE_DIR, 'content'),
@@ -68,7 +68,7 @@ def print_banner(args, host_url, addresses, notes):
     print('  ГОНКИ ЗАПУЩЕНЫ:  %s' % args.name)
     print(line)
     print('')
-    print('  ВЫ (хозяин сервера, только вам можно создавать комнаты):')
+    print('  ВЫ (хозяин сервера):')
     print('')
     print('      %s' % host_url)
     print('')
@@ -88,8 +88,7 @@ def print_banner(args, host_url, addresses, notes):
         print('  похоже, машина сейчас без сети. Соседи подключиться не смогут.')
         print('')
     print('  Обнаружение других серверов: UDP %d' % config.DISCOVERY_PORT)
-    if args.guest_rooms:
-        print('  Комнаты разрешено создавать всем (--guest-rooms)')
+    print('  Комнату может создать любой, кто зашёл на этот сервер')
     for note in notes:
         print('  ! %s' % note)
     print('')
@@ -138,7 +137,6 @@ async def serve(args):
         manager=manager,
         content=content,
         host_token=host_token,
-        guest_rooms=args.guest_rooms,
         server_name=args.name,
         port=args.port,
         static_dir=os.path.join(BASE_DIR, 'static'),

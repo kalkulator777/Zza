@@ -54,7 +54,7 @@ const QUALITY = {
  * (требование заказчика: каждую добавку можно выключить или убавить своей
  * галочкой). Пресет лишь выставляет значение по умолчанию.
  */
-const DECOR_DENSITY = { sparse: 0.5, normal: 1.1, dense: 1.7 };
+const DECOR_DENSITY = { sparse: 0.45, normal: 1.15, dense: 1.9 };
 
 // Горы — самая тяжёлая тема по треугольникам (хвоя), поэтому прибавка
 // плотности там сдержаннее: коэффициент на тему.
@@ -623,6 +623,21 @@ function broadleafGeometry(seg, trunkColor, leafColor) {
     ]);
 }
 
+/**
+ * Мягкая вариация яркости для инстансов, у которых цвет УЖЕ запечён в
+ * геометрию. Инстансный цвет домножает все вершины подряд, поэтому красить
+ * дерево целиком в зелёный нельзя — вместе с кроной позеленел бы и ствол.
+ * Здесь вместо покраски идёт разброс яркости с лёгким сдвигом оттенка.
+ */
+function tintVariation(rng) {
+    const k = rng.range(0.82, 1.12);
+    return new THREE.Color(
+        k * rng.range(0.88, 1.02),
+        k * rng.range(0.94, 1.1),
+        k * rng.range(0.82, 1.0)
+    );
+}
+
 /** Куст: приплюснутый многогранник у самой земли. */
 function bushGeometry(color) {
     const g = primPoly(0.8, 0, toColor(color), 0, 0.42, 0);
@@ -722,7 +737,7 @@ function buildCityTheme(ctx, seed) {
     addInstanced(ctx, 'buildings', boxBands(6, 0.62, 1.1, false), buildings, {
         // здание — единичный куб, растянутый до 30 м: высота затенения тоже
         // задаётся в долях куба, иначе тень у основания уползёт на пол-этажа
-        ao: { base: 0, height: 0.13, floor: 0.44, power: 0.75, sky: 0.26 }
+        ao: { base: 0, height: 0.15, floor: 0.36, power: 0.75, sky: 0.26 }
     });
 
     // фонари вдоль кромки
@@ -774,10 +789,10 @@ function buildCityTheme(ctx, seed) {
             sx: sc * p.rng.range(0.9, 1.1),
             sy: sc * p.rng.range(0.95, 1.3),
             sz: sc * p.rng.range(0.9, 1.1),
-            color: p.rng.pick(['#4e8a4a', '#5f9a52', '#417a45', '#6aa25a'])
+            color: tintVariation(p.rng)
         });
     });
-    addInstanced(ctx, 'cityTrees', broadleafGeometry(seg, '#5a4632', '#ffffff'), trees, {
+    addInstanced(ctx, 'cityTrees', broadleafGeometry(seg, '#5a4632', '#4f8a48'), trees, {
         material: swayMaterial(ctx, 'tree'),
         ao: { base: 0, height: 1.7, floor: 0.42, power: 0.6, sky: 0.34, down: 0.7 }
     });
@@ -908,7 +923,7 @@ function buildMountainTheme(ctx, seed) {
         });
     });
     addInstanced(ctx, 'huts', hutGeom, huts, {
-        ao: { base: 0, height: 1.7, floor: 0.45, power: 0.7, sky: 0.28 }
+        ao: { base: 0, height: 1.8, floor: 0.38, power: 0.7, sky: 0.28 }
     });
 
     buildFlags(ctx, seed ^ 0x0f06, ['#c23b3b', '#e8eaec', '#3d7042', '#c9d3d8']);
@@ -993,7 +1008,7 @@ function buildIndustrialTheme(ctx, seed) {
         });
     });
     addInstanced(ctx, 'hangars', hangar, hangars, {
-        ao: { base: 0, height: 0.2, floor: 0.44, power: 0.75, sky: 0.26 }
+        ao: { base: 0, height: 0.22, floor: 0.36, power: 0.75, sky: 0.26 }
     });
 
     // цистерны
@@ -1066,7 +1081,7 @@ function buildIndustrialTheme(ctx, seed) {
         }
     });
     addInstanced(ctx, 'containers', container, containers, {
-        ao: { base: 0, height: 0.3, floor: 0.46, power: 0.75, sky: 0.28 }
+        ao: { base: 0, height: 0.32, floor: 0.4, power: 0.75, sky: 0.28 }
     });
 
     // бочки: мелочь у оснований, за которую цепляется глаз
@@ -1097,10 +1112,10 @@ function buildIndustrialTheme(ctx, seed) {
             x: p.x, y: p.y - 0.1, z: p.z,
             yaw: p.rng.range(0, Math.PI * 2),
             sx: sc, sy: sc * p.rng.range(0.9, 1.2), sz: sc,
-            color: p.rng.pick(['#5d7a45', '#6b8450', '#4f6b3e'])
+            color: tintVariation(p.rng)
         });
     });
-    addInstanced(ctx, 'cityTrees', broadleafGeometry(seg, '#57493a', '#ffffff'), trees, {
+    addInstanced(ctx, 'cityTrees', broadleafGeometry(seg, '#57493a', '#5d7a45'), trees, {
         material: swayMaterial(ctx, 'tree'),
         ao: { base: 0, height: 1.7, floor: 0.42, power: 0.6, sky: 0.34, down: 0.7 }
     });
@@ -1222,7 +1237,7 @@ function buildFlags(ctx, seed, colors) {
             color: p.rng.pick(colors)
         });
     });
-    addInstanced(ctx, 'flags', flagGeometry(ctx.Q.seg, '#b9c0c8', '#ffffff'), list, {
+    addInstanced(ctx, 'flags', flagGeometry(ctx.Q.seg, '#2c3036', '#ffffff'), list, {
         material: swayMaterial(ctx, 'flag'),
         ao: { base: 0, height: 1.6, floor: 0.5, power: 0.6, sky: 0.22 }
     });
@@ -1253,7 +1268,7 @@ function buildGrandstands(ctx, seed) {
     }
     addInstanced(ctx, 'stands', standGeometry(ctx.pal), list, {
         // ниши под ступенями и задняя стенка тонут в тени, верхние ряды светлее
-        ao: { base: 0, height: 2.6, floor: 0.38, power: 0.75, sky: 0.34, down: 0.58 }
+        ao: { base: 0, height: 2.8, floor: 0.32, power: 0.8, sky: 0.34, down: 0.5 }
     });
     ctx._standSeats = list;
     ctx._standRng = rng;

@@ -835,6 +835,9 @@ export class RaceRenderer {
         let shadowN = 0;
 
         this.effects.beginFrame();
+        // В виде из кокпита своя машина скрыта (12.11) — вместе с ней
+        // обязано исчезнуть и её накладное свечение.
+        this.effects.setHiddenSlot(this.cameraMode === CAMERA_COCKPIT ? this.localSlot : -1);
 
         for (let i = 0; i < MAX_CARS; i++) {
             const v = this.views[i];

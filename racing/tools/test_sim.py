@@ -33,6 +33,7 @@
 
 import argparse
 import collections
+import gc
 import math
 import os
 import random
@@ -44,7 +45,10 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from game import items as items_mod
+from game import physics
 from game import protocol
+from game import sim as sim_mod
+from game.cars import solve_top_speed
 from game.sim import Simulation
 from game.track import Track, WALL_MARGIN
 
@@ -55,6 +59,35 @@ ALL_ITEMS = list(items_mod.ITEM_IDS)
 TWO_PI = math.pi * 2.0
 MAX_RACE_TICKS = 60 * 60 * 8          # восемь минут — дальше гонка признаётся зависшей
 DRIFT_COMMIT = 52                     # тиков, на которые бот фиксирует занос
+LOOKAHEAD_ARC = 24.0                  # м дуги, по которой бот считает
+                                      # крутизну рядом (условие заноса)
+SCAN_STEP = 8.0                       # м между точками просмотра вперёд
+BOT_GRIP_SAFETY = 0.72                # доля предела сцепления, на которую
+                                      # бот согласен ехать: он идёт не по
+                                      # идеальной траектории
+BOT_BRAKE_SAFETY = 0.70               # с каким запасом бот считает свои
+                                      # тормоза, планируя точку торможения
+
+
+def _curvature_radii(track):
+    """Радиус кривизны осевой линии в каждой точке, м.
+
+    Считается один раз на трассу: боту он нужен на каждом тике, чтобы знать,
+    насколько крутая дуга его ждёт через тормозную дистанцию.
+    """
+    samples = track.samples
+    n = len(samples)
+    out = [0.0] * n
+    for i in range(n):
+        a = samples[(i - 2) % n]
+        b = samples[i]
+        c = samples[(i + 2) % n]
+        ab = math.hypot(b.x - a.x, b.z - a.z)
+        bc = math.hypot(c.x - b.x, c.z - b.z)
+        ca = math.hypot(a.x - c.x, a.z - c.z)
+        area2 = abs((b.x - a.x) * (c.z - a.z) - (c.x - a.x) * (b.z - a.z))
+        out[i] = 1.0e6 if area2 < 1e-9 else ab * bc * ca / (2.0 * area2)
+    return out
 
 BTN_THROTTLE = protocol.BTN_THROTTLE
 BTN_BRAKE = protocol.BTN_BRAKE
@@ -70,12 +103,27 @@ class Autopilot(object):
     """Простой автопилот: осевая линия, газ в пол, руль к центру полотна."""
 
     def __init__(self, track, sim, skill=1.0, seed=0, lane=0.0,
-                 allow_drift=False):
+                 allow_drift=False, stats=None):
         self.track = track
         self.sim = sim
         self.count = len(track.samples)
         self.step = track.length / self.count
         self.skill = skill
+        # характеристики своей машины: предел поперечного ускорения и потолок.
+        # BOT_GRIP_SAFETY — запас на то, что бот едет по осевой со сдвигом
+        # в свою полосу, а не по идеальной траектории
+        if stats is None:
+            self.lat_accel = 0.17 * physics.GRIP_LAT_ACCEL * BOT_GRIP_SAFETY
+            self.top_speed = 40.0
+            self.boost_speed = 55.0
+            self.brake_accel = 24.0
+        else:
+            self.lat_accel = stats.grip_step * physics.GRIP_LAT_ACCEL * BOT_GRIP_SAFETY
+            self.top_speed = solve_top_speed(stats.engine_force, stats.max_speed,
+                                             stats.drag, stats.roll)
+            self.boost_speed = stats.boost_speed
+            self.brake_accel = stats.brake_force * BOT_BRAKE_SAFETY
+        self.radius = _curvature_radii(track)
         self.lane = lane                     # своя полоса, доля полуширины
         self.rng = random.Random(seed)
         self.hold = 0                        # задержка перед применением бонуса
@@ -127,22 +175,38 @@ class Autopilot(object):
         while error < -math.pi:
             error += TWO_PI
 
-        # --- скорость по кривизне впереди
-        near = samples[(index + int(10.0 / self.step)) % count]
-        far = samples[(index + int(34.0 / self.step)) % count]
-        dot = near.tangent_x * far.tangent_x + near.tangent_z * far.tangent_z
-        if dot > 1.0:
-            dot = 1.0
-        elif dot < -1.0:
-            dot = -1.0
-        turn = math.acos(dot)
-        limit = 33.0 * self.skill
-        if turn > 0.15:
-            corner = (7.0 + 5.5 / turn) * self.skill
-            if corner < limit:
-                limit = corner
+        # --- скорость по кривизне впереди.
+        # Предел в дуге — по СЦЕПЛЕНИЮ СВОЕЙ машины: шаг 9 физики ограничивает
+        # поперечное ускорение, поэтому v = sqrt(a_lat * R). Прежняя формула
+        # (7.0 + 5.5 / turn) — это v = R * turn_rate, модель старой физики, где
+        # предела по сцеплению не было вовсе: с ней бот вёл все пять машин по
+        # одинаковым скоростям и разницы в сцеплении не видел в принципе.
+        #
+        # Смотреть вперёд надо на всю тормозную дистанцию, а не на фиксированные
+        # 24 м: на 33 м/с это было 0,7 с запаса, на 55 м/с стало 0,4 с, и бот
+        # физически не успевал оттормозиться — лишние метры он гасил травой
+        # и отбойником, отчего гонку выигрывала самая тяговитая машина, а не
+        # самая подходящая трассе.
+        limit = self.top_speed
+        radii = self.radius
+        brake_a = self.brake_accel
+        reach = speed * speed / (2.0 * brake_a) + 3.0 * SCAN_STEP
+        dist = SCAN_STEP
+        turn = 0.0
+        while dist <= reach:
+            j = (index + int(dist / self.step)) % count
+            sample = samples[j]
+            corner = math.sqrt(self.lat_accel * (radii[j] + sample.half_width))
+            allow = math.sqrt(corner * corner + 2.0 * brake_a * dist) * self.skill
+            if allow < limit:
+                limit = allow
+            if dist <= LOOKAHEAD_ARC * 1.5:
+                bend = LOOKAHEAD_ARC / radii[j] if radii[j] > 0.0 else 0.0
+                if bend > turn:
+                    turn = bend         # крутизна рядом — для условия заноса
+            dist += SCAN_STEP
         if state.boost_time > 0.0:
-            limit = 70.0            # ускорение не тормозим, оно для того и взято
+            limit = self.boost_speed   # ускорение не тормозим, оно для того и взято
 
         # --- выбираемся, если упёрлись: чуть назад и в другую сторону.
         #     Живой игрок делает ровно это, а без отката бот залипает
@@ -226,15 +290,18 @@ def make_settings(laps, items=True, collisions=True):
     }
 
 
-def make_players(count=8):
+def make_players(count=8, car_id=None):
+    """Расстановка игроков. ``car_id`` делает всех одинаковыми — это нужно
+    сценариям, где разница характеристик машин мешает проверять снаряд."""
     return [{'slot': i, 'name': 'Бот %d' % i,
-             'car_id': CAR_IDS[i % len(CAR_IDS)], 'color': '#ffffff'}
+             'car_id': car_id or CAR_IDS[i % len(CAR_IDS)], 'color': '#ffffff'}
             for i in range(count)]
 
 
-def new_sim(track, laps, items=True, collisions=True, count=8, seed=0):
+def new_sim(track, laps, items=True, collisions=True, count=8, seed=0,
+            car_id=None):
     sim = Simulation(track, make_settings(laps, items, collisions),
-                     make_players(count))
+                     make_players(count, car_id))
     sim.items.rng = random.Random(seed * 977 + 13)
     return sim
 
@@ -244,13 +311,14 @@ def make_bots(track, sim, seed, count=8, spread=0.03, allow_drift=False):
     lanes = [-0.5 + k / float(count - 1) for k in range(count)] if count > 1 else [0.0]
     rng.shuffle(lanes)
     return [Autopilot(track, sim, 1.0 + rng.uniform(-spread, spread),
-                      seed * 31 + i, lanes[i], allow_drift)
+                      seed * 31 + i, lanes[i], allow_drift,
+                      stats=sim.cars[i].stats)
             for i in range(count)]
 
 
 # --- полная гонка -----------------------------------------------------------
 
-def run_full_race(track, laps, seed, report, items=True, measure=False):
+def run_full_race(track, laps, seed, report, items=True):
     """Полная гонка восьми ботов с проверками на каждом тике."""
     sim = new_sim(track, laps, items=items, seed=seed)
     bots = make_bots(track, sim, seed)
@@ -261,7 +329,6 @@ def run_full_race(track, laps, seed, report, items=True, measure=False):
     place_breaks = 0
     stuck_slots = set()
     box_cycle = {'off': set(), 'respawned': 0}
-    tick_times = []
     leader_seq = []
 
     for tick in range(MAX_RACE_TICKS):
@@ -270,10 +337,7 @@ def run_full_race(track, laps, seed, report, items=True, measure=False):
                 continue
             sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
 
-        started = time.perf_counter()
         events = sim.tick()
-        if measure:
-            tick_times.append((time.perf_counter() - started) * 1000.0)
 
         for event in events:
             kind = event['kind']
@@ -321,8 +385,7 @@ def run_full_race(track, laps, seed, report, items=True, measure=False):
         'sim': sim, 'counts': counts, 'lap_events': lap_events,
         'wall_breaks': wall_breaks, 'place_breaks': place_breaks,
         'stuck_slots': stuck_slots, 'respawned': box_cycle['respawned'],
-        'ticks': finished_ticks, 'tick_times': tick_times,
-        'leader_seq': leader_seq,
+        'ticks': finished_ticks, 'leader_seq': leader_seq,
     }
 
 
@@ -359,14 +422,12 @@ def _places_consistent(sim):
 def check_races(report, laps, seed=0):
     """Полная гонка на каждой из трёх трасс."""
     totals = collections.Counter()
-    measured = None
     for track_id in TRACK_IDS:
         track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
                                         '%s.json' % track_id))
         report.section('Полная гонка: %s (%s), %d круга, 8 ботов'
                        % (track.name, track_id, laps))
-        result = run_full_race(track, laps, seed, report, items=True,
-                               measure=(track_id == 'office'))
+        result = run_full_race(track, laps, seed, report, items=True)
         sim = result['sim']
         rows = sim.results()
 
@@ -403,8 +464,6 @@ def check_races(report, laps, seed=0):
         best = rows[0]
         report.note('победитель: слот %d (%s), %.1f с, лучший круг %s'
                     % (best['slot'], best['car'], best['time'], best['best_lap']))
-        if result['tick_times']:
-            measured = result['tick_times']
 
     report.section('Итог по бонусам за три гонки')
     for name in ALL_ITEMS:
@@ -423,7 +482,6 @@ def check_races(report, laps, seed=0):
                + totals[('hit', 'storm', True)])
     report.check(blocked > 0, 'щит гасит попадания в живой гонке',
                  'погашено %d' % blocked)
-    return measured
 
 
 # --- точечные сценарии ------------------------------------------------------
@@ -460,43 +518,131 @@ def check_shield(report):
                  'событие hit по схеме раздела 9', repr(first))
 
 
+def _rocket_scene(track, car_id, want_gap, seed=0):
+    """Две одинаковые машины на трассе, лидер оторвался на ``want_gap`` метров.
+
+    Машины ведут автопилоты, а не голая кнопка газа: на 180..197 км/ч машина
+    с зажатым газом и без руля улетает в стену на первом же повороте, и вся
+    проверка вырождается в «стоим у отбойника». Отрыв задаётся В МЕТРАХ и
+    набирается замедлением догоняющего — метры не зависят от того, какой
+    сейчас потолок скорости, а фиксированное число кадров зависит.
+
+    Возвращает (sim, лидер, догоняющий, боты, ведущая функция, отрыв).
+    """
+    sim = new_sim(track, 9, count=2, collisions=False, seed=seed, car_id=car_id)
+    leader, chaser = sim.cars[0], sim.cars[1]
+    bots = make_bots(track, sim, seed, count=2)
+
+    def drive(ticks, chaser_lift=False):
+        """Тик за тиком. Кнопка бонуса у ботов отобрана: в этой проверке
+        на трассе должен быть ровно один снаряд — наш."""
+        for _ in range(ticks):
+            sim.set_input(leader.slot, sim.tick_no + 1,
+                          bots[0].drive(leader, sim.tick_no) & ~BTN_ITEM)
+            mask = bots[1].drive(chaser, sim.tick_no) & ~BTN_ITEM
+            if chaser_lift:
+                mask &= ~BTN_THROTTLE
+            sim.set_input(chaser.slot, sim.tick_no + 1, mask)
+            sim.tick()
+
+    drive(420)                       # обе вышли на рабочую скорость
+    guard = 0
+    while (leader.state.progress - chaser.state.progress) < want_gap \
+            and guard < 60 * 60:
+        drive(1, chaser_lift=True)
+        guard += 1
+    drive(150)                       # догоняющий снова разогнался
+    gap = leader.state.progress - chaser.state.progress
+    return sim, leader, chaser, drive, gap
+
+
 def check_rocket(report):
-    """Ракета догоняет цель впереди на разных дистанциях."""
+    """Ракета самонаводится в ближайшего впереди и догоняет его."""
     report.section('Ракета самонаводится и попадает')
     track = _solo_track()
+
+    # Прямая проверка на протухание константы: ракета обязана быть быстрее
+    # самой быстрой машины каталога, иначе догонять ей нечем. Именно это
+    # сломалось, когда потолки подняли со 138..152 до 181..197 км/ч.
+    speed = items_mod.rocket_speed()
+    fastest = 0.0
+    fastest_id = ''
+    for car in sim_mod.car_catalog():
+        top = max(car.top_speed, car.boost_top)
+        if top > fastest:
+            fastest = top
+            fastest_id = car.id
+    report.check(speed > fastest * 1.15,
+                 'ракета быстрее самой быстрой машины с запасом',
+                 'ракета %.1f м/с, %s на ускорении %.1f м/с' % (speed, fastest_id, fastest))
+
     hits = []
-    for head_start in (0, 30, 120, 240):
-        sim = new_sim(track, 5, count=2, collisions=False)
-        leader, chaser = sim.cars[0], sim.cars[1]
-        for _ in range(head_start):
-            sim.set_input(leader.slot, sim.tick_no + 1, BTN_THROTTLE)
-            sim.tick()
-        for _ in range(240):
-            sim.set_input(leader.slot, sim.tick_no + 1, BTN_THROTTLE)
-            sim.set_input(chaser.slot, sim.tick_no + 1, BTN_THROTTLE)
-            sim.tick()
-        gap = leader.state.progress - chaser.state.progress
+    for want_gap in (20.0, 50.0, 110.0, 200.0):
+        # «Клин» — самая быстрая машина каталога, то есть худший случай
+        sim, leader, chaser, drive, gap = _rocket_scene(track, 'wedge', want_gap)
         chaser.item = items_mod.ITEM_ROCKET
         sim.items.use(sim, chaser)
-        proj = sim.items.projectiles[sim.items._live[0]]
+        proj = sim.items.projectiles[sim.items._live[sim.items.live_count - 1]]
         target_ok = proj.target == leader.slot
         hit_at = None
         for step in range(400):
-            sim.set_input(leader.slot, sim.tick_no + 1, BTN_THROTTLE)
-            sim.set_input(chaser.slot, sim.tick_no + 1, BTN_THROTTLE)
-            for event in sim.tick():
+            drive(1)
+            for event in sim.events:
                 if event['kind'] == 'hit' and event['item'] == 'rocket':
                     hit_at = step / 60.0
             if hit_at is not None:
                 break
         hits.append((round(gap, 1), hit_at, target_ok))
+    report.check(all(item[0] > 10.0 for item in hits),
+                 'отрыв действительно набран, сценарий не вырожден',
+                 'отрывы: %s' % [g for g, _t, _o in hits])
     report.check(all(item[2] for item in hits),
                  'цель — ближайший впереди по progress')
     report.check(all(item[1] is not None for item in hits),
                  'ракета догоняет цель на всех дистанциях',
                  'отрыв/время: %s' % [(g, t) for g, t, _ in hits])
+    report.check(all(item[1] <= items_mod.ROCKET_LIFE for item in hits
+                     if item[1] is not None),
+                 'ракета укладывается в свой срок жизни',
+                 'срок %.1f с' % items_mod.ROCKET_LIFE)
     report.check(all(item[1] > 0.0 for item in hits if item[1] is not None),
                  'ракета не взрывается о собственный бампер')
+
+
+def check_rocket_target(report):
+    """Цель ракеты — ближайший ВПЕРЕДИ, а не лидер и не сосед по слоту."""
+    report.section('Ракета выбирает ближайшего впереди')
+    track = _solo_track()
+    sim = new_sim(track, 9, count=5, collisions=False, car_id='hatch')
+    step = track.length / len(track.samples)
+    # расставляем по дуге вручную: 0 впереди всех, 4 последний
+    for k, car in enumerate(sim.cars):
+        index = int((200.0 - k * 40.0) / step) % len(track.samples)
+        sample = track.samples[index]
+        car.state.x = sample.x
+        car.state.z = sample.z
+        car.state.yaw = math.atan2(sample.tangent_x, sample.tangent_z)
+        car.state.vx = sample.tangent_x * 20.0
+        car.state.vz = sample.tangent_z * 20.0
+        track.init_state(car.state)
+    sim.tick()
+    picks = []
+    for k, car in enumerate(sim.cars):
+        target = sim.items._target_ahead(sim, car)
+        picks.append(-1 if target is None else target.slot)
+    report.check(picks[0] == -1, 'у лидера цели нет — впереди никого',
+                 'цель лидера: %d' % picks[0])
+    report.check(picks[1:] == [0, 1, 2, 3],
+                 'каждый целится в ближайшего впереди, а не в лидера',
+                 'цели: %s' % picks)
+
+    # выбывший сосед не должен становиться целью
+    sim.drop_player(2)
+    sim.cars[2].removed = True
+    target = sim.items._target_ahead(sim, sim.cars[3])
+    report.check(target is not None and target.slot == 1,
+                 'выбывший пропускается, целью становится следующий впереди',
+                 'цель: %s' % (target.slot if target else None))
 
 
 def check_mine(report):
@@ -829,9 +975,55 @@ def check_snapshot(report):
 
 # --- замеры -----------------------------------------------------------------
 
-def measure_tick(report, samples):
+def collect_tick_times(track_id='office', laps=3, seed=0, warmup=180):
+    """Время тика, замеренное отдельным прогоном и ничем не засорённое.
+
+    Раньше замер снимался прямо в полной гонке, между проверками мест, стен
+    и боксов. Вся эта обвязка аллоцирует множества и счётчики на каждом тике,
+    сборщик мусора CPython срабатывает ВНУТРИ следующего ``sim.tick()`` —
+    и в хвост распределения попадали не тики, а паузы GC от самого теста:
+    медиана держалась на 0,090 мс, а p99.9 прыгал от 0,20 до 6,0 мс от
+    запуска к запуску. Здесь в цикле нет ничего, кроме ботов и тика.
+
+    Циклический сборщик на время замера выключен по той же причине: он
+    обходит ВЕСЬ накопленный за тест кучевой мусор, а не то, что создал тик.
+    Чтобы это не превратилось в поблажку, функция заодно возвращает, сколько
+    циклического мусора симуляция породила за прогон — вызывающий это
+    проверяет отдельно, чего раньше не проверял никто.
+
+    Возвращает (список времён в мс, число недостижимых циклических объектов).
+    """
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                    '%s.json' % track_id))
+    sim = new_sim(track, laps, seed=seed)
+    bots = make_bots(track, sim, seed)
+    samples = []
+    gc.collect()
+    gc.disable()
+    try:
+        for tick in range(MAX_RACE_TICKS):
+            for index, car in enumerate(sim.cars):
+                if car.removed:
+                    continue
+                sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+            started = time.perf_counter()
+            sim.tick()
+            elapsed = (time.perf_counter() - started) * 1000.0
+            if tick >= warmup:      # первые тики — прогрев интерпретатора
+                samples.append(elapsed)
+            if sim.is_over():
+                break
+    finally:
+        gc.enable()
+    # всё, что породил прогон и что не убралось счётчиком ссылок
+    garbage = gc.collect()
+    return samples, garbage
+
+
+def measure_tick(report, measured):
     """Время тика при восьми машинах — условие приёмки раздела 1."""
     report.section('Время тика (восемь машин, бонусы включены)')
+    samples, garbage = measured
     if not samples:
         report.check(False, 'замер не состоялся')
         return
@@ -853,8 +1045,14 @@ def measure_tick(report, samples):
     # процесса планировщиком, а не работа симуляции: при p99.9 меньше
     # десятой доли бюджета одиночный пик в миллисекунду ни о чём не говорит.
     if worst >= 2.0:
-        report.note('ВНИМАНИЕ: одиночный выброс %.3f мс (GC или планировщик ОС) — '
+        report.note('ВНИМАНИЕ: одиночный выброс %.3f мс (планировщик ОС) — '
                     'при p99.9 = %.3f мс это не стоимость тика' % (worst, p999))
+    # Замер шёл с выключенным циклическим сборщиком, поэтому отдельно
+    # проверяем, что выключать его было честно: тик не должен плодить циклы,
+    # иначе на живом сервере он же и платил бы за их уборку.
+    report.check(garbage <= count // 100,
+                 'тик не плодит циклический мусор',
+                 '%d недостижимых объектов на %d тиков' % (garbage, count))
 
 
 def balance_series(laps=3, runs=6, hold_ticks=180):
@@ -955,9 +1153,10 @@ def main(argv=None):
 
     report = Report()
     started = time.time()
-    samples = check_races(report, args.laps, args.seed)
+    check_races(report, args.laps, args.seed)
     check_shield(report)
     check_rocket(report)
+    check_rocket_target(report)
     check_mine(report)
     check_boxes(report)
     check_projectile_cap(report)
@@ -966,7 +1165,7 @@ def main(argv=None):
     check_shortcut(report)
     check_ghosts(report)
     check_snapshot(report)
-    measure_tick(report, samples)
+    measure_tick(report, collect_tick_times(laps=args.laps, seed=args.seed))
 
     if args.balance:
         balance_series(args.laps, args.runs)

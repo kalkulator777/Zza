@@ -102,6 +102,21 @@ def _terminal_speed(engine_force, ref_speed, drag, roll):
     return v
 
 
+def _car_top_speed(d):
+    """Самое быстрое, на что способна машина: потолок мотора или ускорение.
+
+    Под «Турбо» шаг 7 физики тянет продольную скорость ПРЯМО к boost_speed
+    со скоростью BOOST_ACCEL, а не через формулу тяги, поэтому равновесие
+    двигателя тут не показатель: машина выходит ровно на boost_speed.
+    Считать только равновесие — это и есть способ снова получить ракету,
+    которая не догоняет лидера на ускорении.
+    """
+    plain = _terminal_speed(float(d['engine_force']), float(d['max_speed']),
+                            float(d['drag']), float(d['roll']))
+    boost = float(d.get('boost_speed', 0.0))
+    return plain if plain > boost else boost
+
+
 def rocket_speed():
     """Скорость ракеты, выведенная из самой быстрой машины каталога.
 
@@ -123,9 +138,7 @@ def rocket_speed():
             stats = catalog.get(car_id).stats
             d = stats if isinstance(stats, dict) else stats.__dict__
             try:
-                ref = max(float(d['max_speed']), float(d.get('boost_speed', 0.0)))
-                v = _terminal_speed(float(d['engine_force']), ref,
-                                    float(d['drag']), float(d['roll']))
+                v = _car_top_speed(d)
             except (KeyError, TypeError, ValueError, ZeroDivisionError):
                 continue
             if v > best:
@@ -135,7 +148,7 @@ def rocket_speed():
     return _rocket_speed_cache
 ROCKET_TURN_RATE = 2.4       # рад/с — конечная скорость поворота: ракета
                              # с бесконечной наводкой неуклонима и бесит
-ROCKET_LIFE = 5.0            # с жизни, дальность выходит ~230 м
+ROCKET_LIFE = 5.0            # с жизни; при нынешней скорости это ~415 м
 ROCKET_RADIUS = 2.8          # м, радиус поражения
 ROCKET_ARM = 0.0             # ракете взведение не нужно: от собственного
                              # бампера её защищает проверка по слоту владельца,
@@ -779,8 +792,8 @@ class ItemSystem(object):
     def _advance_along(self, proj):
         """Довести индекс осевой точки снаряда локальным шагом.
 
-        За тик ракета пролетает меньше метра при шаге точек в два, поэтому
-        цикл делает ноль или один шаг. Полный поиск по трассе не нужен.
+        За тик ракета пролетает около полутора метров при шаге точек в два,
+        поэтому цикл делает ноль или один шаг. Полный поиск по трассе не нужен.
         """
         index = proj.sample_idx
         step = self._step
