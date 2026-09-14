@@ -8,6 +8,7 @@
     python3 tools/smoke_test.py --verbose          # плюс подробности
     python3 tools/smoke_test.py --port 8123        # фиксированный порт
     python3 tools/smoke_test.py --keep-screenshots /tmp/shots
+    python3 tools/smoke_test.py --no-browser       # только серверная часть
 
 Код возврата:
 
@@ -30,17 +31,27 @@
 * ноль ошибок в консоли браузера и ноль необработанных исключений страницы;
 * машина едет: путь по трассе растёт, скорость выходит на разумные значения;
 * круг засчитывается, время круга и лучший круг заполняются;
-* каждый клиент видит машину другого, и позиции сходятся;
+* каждый клиент видит машину другого, и позиции сходятся: предсказание
+  против авторитета сервера и картинка чужой машины против него же;
 * снапшоты идут 20 Гц (раздел 5.1);
 * чужая машина едет гладко — ловится класс сетевых регрессий из 12.12;
 * пауза морозит время гонки и времена кругов (12.12);
 * сервер не выдал ни одного исключения;
 * итоговая таблица приходит и непустая, возврат в лобби работает.
 
-ЧЕГО ЭТОТ СКРИПТ НЕ ПРОВЕРЯЕТ: качество картинки, fps и бюджет рендера,
-звук, бонусы и снаряды (в приёмочной гонке они выключены), больше двух
-игроков, переподключение, обнаружение серверов по UDP, чат и правку настроек
-комнаты владельцем, поведение при плохой сети.
+Прогон занимает около минуты: один круг на самой короткой трассе
+(«Офисный круг», 1374 м) вдвоём, с проверкой паузы посередине.
+
+ЧЕГО ЭТОТ СКРИПТ НЕ ПРОВЕРЯЕТ. Качество картинки и бюджет рендера — прогон
+идёт на низких настройках графики и в маленьком окне, иначе программный
+рендер headless-браузера не успевает (см. LOW_GFX). Число кадров в секунду
+здесь печатается, но ничего не значит: это скорость стенда, а не игры. Также
+не проверяются звук, бонусы и снаряды (в приёмочной гонке они выключены —
+ради предсказуемого времени прогона), больше двух игроков, переподключение
+и потеря связи, обнаружение серверов по UDP, чат, правка настроек комнаты
+владельцем, зеркальные трассы, режим наблюдателя, поведение при плохой сети
+и мобильные браузеры. Физику и симуляцию проверяет tools/test_sim.py —
+здесь они не дублируются.
 
 ЛОББИ И КОМНАТА ИДУТ ЧЕРЕЗ ``net.send``. Нажатия по кнопкам меню и лобби
 здесь намеренно не эмулируются: разметку этих экранов строит JS, она живёт
@@ -62,6 +73,7 @@ websocket-клиентами Tornado.
 """
 
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -73,6 +85,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 
@@ -121,26 +134,40 @@ PAUSE_GAP_MS = 1000.0          # простой длиннее — это пау
 #      и он же не даёт ей разъехаться.
 #
 # Сумма двух и есть «где гость себя предсказал против того, где его видит
-# хозяин» — те самые «порядка полуметра». Пороги взяты примерно втрое от
-# измеренного на этом стенде (медиана 0,05 м, p95 0,3 м у второй половины;
-# 0,01 и 0,2 м у первой), чтобы прогон не краснел от дрожания стенда.
+# хозяин» — те самые «порядка полуметра»; она печатается справочной строкой.
+#
+# Откуда пороги. Первая половина на этом стенде даёт медиану 0,002 м и p95
+# около 0,5 м: хвост — это пропущенные шаги главного цикла, поэтому порог
+# на нём стоит грубый, он тут только страховкой, а работает медиана.
+# Вторая половина даёт медиану 0,003 м и p95 0,010 м — больше и не может:
+# 0,008 м это стрелка прогиба хорды за 50 мс между снапшотами при предельном
+# поперечном ускорении. Пороги ниже — примерно вдесятеро от измеренного.
+# Проверено на подсаженной регрессии 12.12 (историю чужих машин разметили
+# временем прихода пакета вместо тика): p95 второй половины уезжает
+# на 0,28 м, то есть за порог.
 PREDICT_MEDIAN_MAX = 0.20
-PREDICT_P95_MAX = 1.00
-DIVERGE_MEDIAN_MAX = 0.40
-DIVERGE_P95_MAX = 1.00
+PREDICT_P95_MAX = 3.00         # хвост на медленном стенде шумит: 0,3..1,3 м
+                               # от кадра к кадру, поэтому он тут страховка
+                               # от грубой поломки, а работает медиана
+PREDICT_OVER_EPS_MAX = 0.40    # доля снапшотов, где потребовалась коррекция
+DIVERGE_MEDIAN_MAX = 0.05
+DIVERGE_P95_MAX = 0.10
 
-# Плавность чужой машины: доля кадров, где видимая скорость (пройденное
-# за кадр расстояние, делённое на длину кадра) отличается от заявленной
-# в снапшоте больше чем на половину. Метрика взята из 10.2, где ею мерили
-# ровно ту регрессию с дёрганьем: «разметка по времени прихода давала 51 %
-# таких кадров, разметка по tick — 1,3 %». Порог 5 % лежит между этими
-# числами ближе к хорошему краю.
+# Плавность чужой машины: насколько видимая скорость (пройденное за кадр
+# расстояние, делённое на длину кадра) расходится с заявленной в снапшоте.
+# Метрика взята из 10.2, где ею мерили ровно ту регрессию с дёрганьем:
+# «разметка по времени прихода давала 51 % кадров с отклонением скорости
+# больше половины, разметка по tick — 1,3 %». Порог по доле таких кадров —
+# 5 %, между этими числами ближе к хорошему краю. Второй порог, по p95
+# самого отклонения, чувствительнее: целая игра даёт 1..2 %, подсаженная
+# регрессия 12.12 — 19..24 %.
 #
 # Почему не отклонение от гладкой траектории в метрах, как в таблице 12.12:
 # оно растёт как куб длины кадра, а headless-браузер выдаёт 15 кадров
 # в секунду вместо 60 — те же 0,0017 м превращаются в 0,13 м, и порог
 # пришлось бы привязывать к скорости стенда. Это число печатается справочно.
 SMOOTH_JUMPY_MAX = 0.05        # доля кадров с отклонением скорости > 50 %
+SMOOTH_P95_MAX = 0.10          # p95 самого отклонения, доля единицы
 SMOOTH_MAX_FRAME_MS = 120.0    # окна с кадром длиннее в метрику не идут
 
 # Пауза морозит серверный тик целиком (12.12), значит время гонки и время
@@ -173,7 +200,11 @@ CHROMIUM_CANDIDATES = (
 
 
 class TestBroken(Exception):
-    """Сломался тест или окружение, а не игра: порт, сервер, браузер."""
+    """Сломалось окружение, а не игра: занятый порт, браузер, playwright."""
+
+
+class GameBroken(Exception):
+    """Сломалась игра, и продолжать прогон бессмысленно."""
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +252,8 @@ class Report(object):
     def stage(self, text):
         print('\n--- %s' % text, flush=True)
 
-    def summary(self):
+    def summary(self, broken=None):
+        """Сводка и код возврата: 0 — цело, 1 — игра, 2 — сам прогон."""
         seconds = time.monotonic() - self.started
         print('')
         print('=' * 68)
@@ -230,12 +262,20 @@ class Report(object):
                   (len(self.failures), self.checks, seconds))
             for text in self.failures:
                 print('    - %s' % text)
+            if broken:
+                print('  Прогон остановлен на этом месте: %s' % broken)
+        elif broken:
+            print('  ТЕСТ НЕ ОТРАБОТАЛ: %s' % broken)
+            print('  Это поломка прогона или окружения, а не игры.')
+            print('  Успело пройти проверок: %d, %.0f с' % (self.checks, seconds))
         else:
             print('  ЦЕЛО: %d проверок пройдено, %.0f с' % (self.checks, seconds))
         for text in self.skips:
             print('  пропущено: %s' % text)
         print('=' * 68, flush=True)
-        return 1 if self.failures else 0
+        if self.failures:
+            return 1
+        return 2 if broken else 0
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +335,13 @@ class Server(object):
         deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                raise TestBroken('сервер умер на старте, код %d:\n%s'
-                                 % (self.proc.returncode, self.tail(20)))
+                # Питон упал с трассировкой — это поломка игры, а не стенда.
+                text = '\n'.join(self.lines)
+                if 'Traceback' in text or 'Error' in text:
+                    raise GameBroken('сервер не запустился: %s'
+                                     % self.last_error())
+                raise TestBroken('сервер умер на старте, код %d: %s'
+                                 % (self.proc.returncode, self.tail(3)))
             try:
                 with urllib.request.urlopen(url, timeout=1.0) as resp:
                     if resp.status == 200:
@@ -315,7 +360,16 @@ class Server(object):
             pass
 
     def tail(self, count=30):
-        return '\n'.join(self.lines[-count:])
+        return ' | '.join(line.strip() for line in self.lines[-count:]
+                          if line.strip())
+
+    def last_error(self):
+        """Последняя осмысленная строка лога — обычно сам текст исключения."""
+        for line in reversed(self.lines):
+            text = line.strip()
+            if text and not text.startswith(('File "', '^', '~', 'Traceback')):
+                return text
+        return self.tail(3)
 
     def errors(self):
         """Строки лога, похожие на исключение сервера."""
@@ -992,14 +1046,18 @@ def lobby_stage(report, host, guest):
             raise TestBroken('клиент не подключился, дальше идти некуда')
         client.install_agent()
 
+    # Имя уезжает на сервер только в hello, поэтому menu.js после правки
+    # имени тихо переподключается (main.js, onNameChange) — ждём, пока связь
+    # вернётся уже с новым именем. Что его принял сервер, видно ниже,
+    # в списке игроков комнаты.
     named = [enter_name(host), enter_name(guest)]
-    for client in (host, guest):
-        client.wait('n => window.__racing.net.connected '
-                    '&& window.__racing.net.playerName === n', 10.0, client.name)
-    report.ok('имя введено в меню: «%s» и «%s»%s'
-              % (host.name, guest.name,
-                 '' if all(named) else ' (поля ввода в меню не нашлось, имя '
-                                       'подставлено из localStorage)'))
+    propagated = [c.wait('n => window.__racing.net.connected '
+                         '&& window.__racing.net.playerName === n', 10.0, c.name)
+                  for c in (host, guest)]
+    report.check(all(propagated), 'имя введено в меню: «%s» и «%s»%s'
+                 % (host.name, guest.name,
+                    '' if all(named) else ' (поля ввода в меню не нашлось, имя '
+                                          'подставлено из localStorage)'))
     host.shot('01-menu')
 
     # Палитра: из welcome, пойманного после переподключения по смене имени.
@@ -1062,7 +1120,8 @@ def lobby_stage(report, host, guest):
     report.check(screens, 'у обоих открыт экран лобби')
 
     host.send({'t': 'set_car', 'car_id': HOST_CAR, 'color': colors[0]})
-    guest.send({'t': 'set_car', 'car_id': GUEST_CAR, 'color': colors[1 % len(colors)]})
+    guest.send({'t': 'set_car', 'car_id': GUEST_CAR,
+                'color': colors[1] if len(colors) > 1 else colors[0]})
 
     def car_of(client, slot):
         room = client.smoke('room') or {}
@@ -1118,7 +1177,7 @@ def countdown_stage(report, host, guest):
     return racing
 
 
-def pause_stage(report, host, guest):
+def pause_stage(report, host, guest, guest_slot):
     """Пауза: ставит гость, снимает хозяин. Время гонки обязано замереть."""
     report.stage('пауза')
     read = ('() => { const n = window.__racing.net; const t = performance.now(); '
@@ -1133,7 +1192,14 @@ def pause_stage(report, host, guest):
     if not stopped:
         report.fail('пауза не встала у обоих за %.1f с (клавиша P)' % delay)
         return False
-    report.ok('пауза встала у обоих за %.2f с (поставил %s)' % (delay, guest.name))
+    # Событие pause у хозяина должно назвать инициатором гостя (схема §9).
+    marks = host.smoke('pauses', [])
+    last = marks[-1] if marks else {}
+    report.check(last.get('by') == guest_slot and last.get('reason') == 'player',
+                 'пауза встала у обоих за %.2f с, событие pause называет '
+                 'инициатором слот %s, причина «%s», бюджет %.0f с'
+                 % (delay, last.get('by'), last.get('reason'),
+                    last.get('budget') or 0.0))
     host.shot('05-pause')
 
     # Отсчёт замеров — уже с паузы: между нажатием клавиши и остановкой
@@ -1173,7 +1239,7 @@ def pause_stage(report, host, guest):
 
 
 def race_stage(report, host, guest, host_slot, guest_slot):
-    """Едем до финиша: круг, итоги, возврат в лобби."""
+    """Едем до финиша, посередине — проверка паузы."""
     report.stage('гонка')
     for client, other in ((host, guest_slot), (guest, host_slot)):
         client.js('s => { window.__smoke.other = s; }', other)
@@ -1188,7 +1254,7 @@ def race_stage(report, host, guest, host_slot, guest_slot):
             host.shot('04-race')
             shot_done = True
         if not paused_done and time.monotonic() - started > DRIVE_BEFORE_PAUSE:
-            pause_stage(report, host, guest)
+            pause_stage(report, host, guest, guest_slot)
             paused_done = True
             report.stage('гонка (продолжение)')
         if all(c.js('() => !!window.__smoke.results') for c in (host, guest)):
@@ -1197,11 +1263,10 @@ def race_stage(report, host, guest, host_slot, guest_slot):
 
     finished = all(c.js('() => !!window.__smoke.results') for c in (host, guest))
     lasted = time.monotonic() - started
-    if not finished:
-        report.fail('гонка не закончилась за %.0f с: итогов нет' % lasted)
-    else:
-        report.ok('гонка доехала до итогов за %.0f с' % lasted)
-    return finished, lasted
+    report.check(finished, 'гонка доехала до итогов за %.0f с' % lasted
+                 if finished else 'гонка не закончилась за %.0f с: итогов нет'
+                 % lasted)
+    return finished
 
 
 def results_stage(report, host, guest):
@@ -1281,7 +1346,7 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
                 if e.get('kind') == 'lap' and e.get('slot') == slot]
         best = data[key]['best']
         good = bool(laps) and laps[0].get('time', 0) > 0 and best > 0
-        report.check(good, '%s: круг засчитан (%d событий lap), время круга %.2f с, '
+        report.check(good, '%s: круг засчитан — событий lap %d, время круга %.2f с, '
                      'лучший круг %.2f с'
                      % (client.name, len(laps),
                         laps[0].get('time', 0.0) if laps else 0.0, best))
@@ -1309,6 +1374,8 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
     # Сравнение выровнено по времени: у хозяина чужая машина показана
     # на момент now - INTERP_DELAY, и этот момент записан вместе с позицией.
     # Половина первая: гость против сервера — верно ли он предсказывает себя.
+    # Доля снапшотов сверх RECONCILE_EPS — вторая цифра из 10.2: сверка
+    # по tick давала там 15 %, сверка по ack_seq (та самая ошибка) — 53 %.
     for client, key in ((host, 'host'), (guest, 'guest')):
         rec = data[key]['rec']
         if len(rec) < 50:
@@ -1317,12 +1384,15 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
             continue
         median = percentile(rec, 0.5)
         p95 = percentile(rec, 0.95)
-        report.check(median <= PREDICT_MEDIAN_MAX and p95 <= PREDICT_P95_MAX,
+        over = sum(1 for v in rec if v > 0.05) / len(rec)
+        report.check(median <= PREDICT_MEDIAN_MAX and p95 <= PREDICT_P95_MAX
+                     and over <= PREDICT_OVER_EPS_MAX,
                      '%s предсказывает себя верно: расхождение с авторитетом '
-                     'медиана %.3f м, p95 %.3f м по %d снапшотам '
-                     '(пороги %.2f и %.2f м)'
-                     % (client.name, median, p95, len(rec),
-                        PREDICT_MEDIAN_MAX, PREDICT_P95_MAX))
+                     'медиана %.3f м, p95 %.3f м, сверх 0,05 м — %.0f %% из %d '
+                     'снапшотов (пороги %.2f м, %.2f м, %.0f %%)'
+                     % (client.name, median, p95, over * 100.0, len(rec),
+                        PREDICT_MEDIAN_MAX, PREDICT_P95_MAX,
+                        PREDICT_OVER_EPS_MAX * 100.0))
 
     # Половина вторая: хозяин против сервера — там ли он рисует гостя.
     guest_data = data['guest']
@@ -1347,6 +1417,24 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
                      % (median, p95, len(deltas), DIVERGE_MEDIAN_MAX,
                         DIVERGE_P95_MAX))
 
+    # То же самое, но в лоб: показанная гостю собственная машина против
+    # показанной хозяину чужой. Без порога — на медленном стенде сюда попадают
+    # пропущенные шаги главного цикла, — но число полезное: это ровно то
+    # расхождение, которое увидели бы два игрока, глядя на свои экраны.
+    direct = []
+    for i in range(len(seen['vt'])):
+        point = interp_track(guest_data['lt'], guest_data['lx'], guest_data['lz'],
+                             seen['vt'][i])
+        if point is not None:
+            direct.append(math.hypot(seen['vx'][i] - point[0],
+                                     seen['vz'][i] - point[1]))
+    if direct:
+        report.info('то же в лоб — предсказание гостя против картинки хозяина: '
+                    'медиана %.3f м, p95 %.3f м (порога нет: сюда попадают '
+                    'просадки стенда, %d пропущенных шагов за гонку)'
+                    % (percentile(direct, 0.5), percentile(direct, 0.95),
+                       guest_data['dropped']))
+
     # --- плавность чужой машины --------------------------------------------
     for client, key in ((host, 'host'), (guest, 'guest')):
         d = data[key]
@@ -1357,12 +1445,13 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
                         % (client.name, len(devs)))
             continue
         jumpy = sum(1 for v in devs if v > 0.5) / len(devs)
-        report.check(jumpy <= SMOOTH_JUMPY_MAX,
-                     '%s: чужая машина едет гладко — %.1f %% кадров с отклонением '
-                     'скорости больше половины по %d кадрам (порог %.0f %%), '
-                     'p95 отклонения %.0f %%'
-                     % (client.name, jumpy * 100.0, len(devs),
-                        SMOOTH_JUMPY_MAX * 100.0, percentile(devs, 0.95) * 100.0))
+        p95 = percentile(devs, 0.95)
+        report.check(jumpy <= SMOOTH_JUMPY_MAX and p95 <= SMOOTH_P95_MAX,
+                     '%s: чужая машина едет гладко — отклонение видимой скорости '
+                     'от заявленной p95 %.0f %% (порог %.0f %%), кадров хуже '
+                     'половины %.1f %% (порог %.0f %%), всего %d кадров'
+                     % (client.name, p95 * 100.0, SMOOTH_P95_MAX * 100.0,
+                        jumpy * 100.0, SMOOTH_JUMPY_MAX * 100.0, len(devs)))
         shift = smoothness(d['vt'], d['vx'], d['vz'], d['vms'])
         if shift:
             report.info('%s: отклонение от гладкой траектории p95 %.4f м, пик '
@@ -1501,7 +1590,6 @@ class WsClient(object):
     async def connect(self):
         import tornado.websocket
         self.conn = await tornado.websocket.websocket_connect(self.url)
-        import asyncio
         self.reader = asyncio.ensure_future(self._read_loop())
 
     async def _read_loop(self):
@@ -1561,7 +1649,6 @@ class WsClient(object):
 
 
 async def ws_wait(check, timeout=STAGE_TIMEOUT):
-    import asyncio
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if check():
@@ -1660,8 +1747,6 @@ class WsBot(object):
 
 async def ws_scenario(report, port):
     """Лобби, старт, езда и пауза — без браузера."""
-    import asyncio
-
     host = WsClient('Хозяин', port)
     guest = WsClient('Гость', port)
     try:
@@ -1844,32 +1929,38 @@ def main(argv=None):
             report.skip('браузер отключён ключом --no-browser')
         if not with_browser:
             report.stage('сервер без браузера')
-            import asyncio
             asyncio.run(ws_scenario(report, port))
-
-        report.stage('сервер: итог')
-        errors = server.errors()
-        report.check(not errors, 'исключений в логе сервера: %d%s'
-                     % (len(errors), ('; ' + errors[0][:160]) if errors else ''))
-        if errors and args.verbose:
-            for line in errors[:10]:
-                report.info(line[:200])
-        if shots_dir:
-            report.info('скриншоты: %s' % shots_dir)
+    except GameBroken as exc:
+        report.fail(str(exc))
+        if args.verbose:
+            report.info(server.tail(25))
     except TestBroken as exc:
         broken = str(exc)
     except KeyboardInterrupt:
         broken = 'прервано с клавиатуры'
+    except Exception as exc:
+        # Сюда попадает всё неожиданное — например, playwright, у которого
+        # не дождалась страница. Трассировку показываем только с --verbose:
+        # глазами читают вывод, а не стек.
+        broken = '%s: %s' % (type(exc).__name__, exc)
+        if args.verbose:
+            traceback.print_exc()
     finally:
+        # Лог сервера смотрим всегда, даже если прогон оборвался на середине:
+        # исключение на той стороне — самая важная новость из всех.
+        if server.lines:
+            report.stage('сервер: итог')
+            errors = server.errors()
+            report.check(not errors, 'исключений в логе сервера: %d%s'
+                         % (len(errors), ('; ' + errors[0][:160]) if errors else ''))
+            if errors and args.verbose:
+                for line in errors[:10]:
+                    report.info(line[:200])
+        if shots_dir:
+            report.info('скриншоты: %s' % shots_dir)
         server.stop()
 
-    code = report.summary()
-    if broken is not None:
-        print('')
-        print('  ТЕСТ НЕ ОТРАБОТАЛ: %s' % broken)
-        print('  Это поломка прогона или окружения, а не игры.', flush=True)
-        return 2
-    return code
+    return report.summary(broken)
 
 
 if __name__ == '__main__':
