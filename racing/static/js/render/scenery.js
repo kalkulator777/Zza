@@ -443,6 +443,9 @@ export function buildScenery(track, theme, seed, quality, opts) {
         stars: stars,
         skyGroup: skyGroup,
         instances: ctx.instances,
+        // наборы инстансов с раскладкой по корзинам: нужны отсечению,
+        // а заодно автотесту, который проверяет его на корректность
+        sets: sets,
         theme: themeName,
         quality: qName,
         timeOfDay: todName,
