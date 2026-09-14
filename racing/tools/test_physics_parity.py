@@ -75,6 +75,10 @@ from game.physics import (CarState, CarStats, WALL_BOUNCE,  # noqa: E402
 # метры — это уже разъехавшийся порядок операций, то есть баг.
 POS_TOL = 0.02      # м, выше этого — провал
 YAW_TOL = 0.005     # рад, выше этого — провал
+# Заряд заноса — чистая сумма приращений по шагу, никаких sin/cos в ней нет,
+# поэтому Python и JS обязаны совпадать почти до бита. Допуск здесь жёстче
+# позиционного на порядки: разойтись он может только веткой, а не округлением.
+CHARGE_TOL = 1e-9   # с
 # Порог подозрения. Реально наблюдаемый шум от разницы sin/cos в Python и V8 —
 # около 2e-13 м на 4200 шагов. Всё, что заметно больше, но ещё в допуске, —
 # почти наверняка не шум, а разошедшаяся константа или переставленная операция;
@@ -634,6 +638,11 @@ def compare(py, js):
     max_yaw = 0.0
     max_yaw_at = 0
     max_vel = 0.0
+    # заряд заноса сверяется отдельно: он не двигает машину, пока не выдан
+    # буст, поэтому разъехавшаяся ветка шага 15 может долго не проявляться
+    # в позиции. А искры, HUD и звук читают именно его.
+    max_charge = 0.0
+    max_charge_at = 0
     for i in range(n):
         dx = py["x"][i] - js["x"][i]
         dz = py["z"][i] - js["z"][i]
@@ -650,16 +659,26 @@ def compare(py, js):
         dv = (dvx * dvx + dvz * dvz) ** 0.5
         if dv > max_vel:
             max_vel = dv
+        dc = abs(py["charge"][i] - js["charge"][i])
+        if dc > max_charge:
+            max_charge = dc
+            max_charge_at = i
 
     print("  расхождение позиции: %.3e м (максимум на шаге %d)"
           % (max_pos, max_pos_at))
     print("  расхождение курса:   %.3e рад (максимум на шаге %d)"
           % (max_yaw, max_yaw_at))
     print("  расхождение скорости: %.3e м/с" % max_vel)
+    print("  расхождение заряда заноса: %.3e с (максимум на шаге %d)"
+          % (max_charge, max_charge_at))
     print("  progress: python %.6f м, js %.6f м, разница %.6f м"
           % (py["progress"], js["progress"], abs(py["progress"] - js["progress"])))
 
     ok = True
+    if max_charge > CHARGE_TOL:
+        print("  РАСХОЖДЕНИЕ: заряд заноса разъехался сверх допуска %.1e с"
+              % CHARGE_TOL)
+        ok = False
     if POS_SUSPECT < max_pos <= POS_TOL:
         print("  ВНИМАНИЕ: расхождение сильно выше шума sin/cos (~2e-13 м).")
         print("  В допуск укладывается, но так выглядит разошедшаяся константа")
@@ -986,6 +1005,10 @@ def report_handbrake():
 
 WIGGLE_SECONDS = 10.0           # столько виляем в замерах абуза
 GUARD_SPEED = 15.0              # м/с, скорость из жалобы заказчика
+# Сколько метров за десять секунд отделяет «едет и виляет» от «крутится на
+# месте». Прямая на газу даёт больше четырёхсот метров, честный занос по
+# дуге — сотню с лишним, волчок — единицы.
+WIGGLE_SPIN_DIST = 40.0         # м
 
 
 def _drive_charge(pilot, seconds, start_x, start_z, start_yaw, speed, track):
@@ -1090,14 +1113,23 @@ def report_drift_guard():
         print("    [%s] %-46s %s" % ("ок" if mark else "ПРОВАЛ", name, extra))
 
     # --- половина первая: абуз заряда не даёт -----------------------------
-    # 1. Ровно то, что показал заказчик: ручник зажат, A/D с периодом 1 с.
+    # 1. Ровно то, что показал заказчик: ручник зажат, A/D с периодом около
+    #    секунды. Второе условие обязательно: на частоте выше примерно 2 Гц
+    #    руль физически не успевает перейти через ноль (STEER_RATE = 4.5/с),
+    #    машина уходит в занос в одну сторону и крутится на месте. Это уже
+    #    не «едем и набираем», а стоячий волчок: за десять секунд он проходит
+    #    единицы метров вместо четырёх сотен, и заряд там ничего не стоит.
+    #    Поэтому проверяем не только заряд, но и пройденный путь.
     for half, label in ((30, "1.00 с"), (15, "0.50 с"), (45, "1.50 с")):
-        peak, boosts, _st, _c = _drive_charge(
+        peak, boosts, st, _c = _drive_charge(
             _pilot_wiggle(half, GUARD_SPEED), WIGGLE_SECONDS,
             0.0, 0.0, 0.0, GUARD_SPEED, null)
-        check(peak < physics.DRIFT_CHARGE_L1 and not boosts,
+        dist = hypot(st.x, st.z)
+        check((peak < physics.DRIFT_CHARGE_L1 and not boosts)
+              or dist < WIGGLE_SPIN_DIST,
               "виляние A/D, период %s, 15 м/с, 10 с" % label,
-              "пик заряда %.3f с, ускорений %d" % (peak, len(boosts)))
+              "пик заряда %.3f с, ускорений %d, проехал %.0f м"
+              % (peak, len(boosts), dist))
 
     # 2. То же, но игрок реально едет вперёд: виляние вокруг прямого курса.
     for amp, period, speed in ((0.21, 60, 15.0), (0.21, 30, 15.0),
@@ -1124,14 +1156,18 @@ def report_drift_guard():
           "перекладка влево -> вправо обнуляет копилку",
           "было %.2f с, стало %.2f с" % (before, after))
 
-    # 4. Занос задним ходом: ветка требует v_fwd > HANDBRAKE_MIN_SPEED.
+    # 4. Занос задним ходом: ветка требует v_fwd > HANDBRAKE_MIN_SPEED,
+    #    то есть строго вперёд. Разгоняемся назад, потом добавляем ручник.
+    fastest_back = [0.0]
     def reverse_pilot(i, state, v_fwd, v_lat):
+        if v_fwd < fastest_back[0]:
+            fastest_back[0] = v_fwd
         return BRAKE | LEFT | (HANDBRAKE if i > 300 else 0)
-    peak, boosts, st, _c = _drive_charge(reverse_pilot, 15.0, 0.0, 0.0, 0.0,
-                                         0.0, null)
-    fx, fz = sin(st.yaw), cos(st.yaw)
-    check(peak == 0.0 and st.vx * fx + st.vz * fz < -5.0,
-          "занос задним ходом", "заряд %.3f с" % peak)
+    peak, boosts, _st, _c = _drive_charge(reverse_pilot, 15.0, 0.0, 0.0, 0.0,
+                                          0.0, null)
+    check(peak == 0.0 and fastest_back[0] < -5.0, "занос задним ходом",
+          "заряд %.3f с, разогнался назад до %.1f м/с"
+          % (peak, fastest_back[0]))
 
     # 5. Занос об стену: выталкивание из шага 14 дарит боковую скорость даром.
     #    Жёсткая стена всегда за кромкой асфальта, поэтому ловится по offtrack.
@@ -1140,11 +1176,26 @@ def report_drift_guard():
     def wall_pilot(i, state, v_fwd, v_lat):
         if state.x >= StubTrack.WALL_LIMIT - 1e-9:
             hits[0] += 1
-        return GAS | HANDBRAKE | RIGHT
+        return GAS | HANDBRAKE | LEFT      # LEFT растит yaw, нос — в стену
     peak, boosts, _st, _c = _drive_charge(
         wall_pilot, WIGGLE_SECONDS, 58.0, 0.0, 0.21, 22.0, wall)
     check(peak == 0.0 and hits[0] > 60, "занос об стену, 10 с",
           "заряд %.3f с, шагов в стене %d" % (peak, hits[0]))
+
+    # 6. Занос по газону: стену не трогаем, но полотно кончилось. Награда за
+    #    занос — плата за быстрый проход поворота, а не за катание по траве;
+    #    и это ровно та же проверка, что закрывает пункт 5.
+    grass = StubTrack()
+    off = [0]
+    arc_on_grass = _pilot_arc(30.0)
+    def grass_pilot(i, state, v_fwd, v_lat):
+        if state.offtrack:
+            off[0] += 1
+        return arc_on_grass(i, state, v_fwd, v_lat)
+    peak, boosts, _st, _c = _drive_charge(grass_pilot, 4.0, 50.0, 0.0, 0.0,
+                                          30.0, grass)
+    check(peak == 0.0 and off[0] > 120, "занос по газону, 4 с",
+          "заряд %.3f с, шагов вне трассы %d" % (peak, off[0]))
 
     # --- половина вторая: честный занос по-прежнему платит ----------------
     # Длинная дуга обязана давать все три уровня, шпилька — как минимум два

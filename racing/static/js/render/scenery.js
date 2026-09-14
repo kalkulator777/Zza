@@ -15,9 +15,49 @@
  * стоят на земле, а не висят над ней. Пресет качества обязан совпадать с тем,
  * на котором построена трасса.
  *
- * Инстансы не отсекаются по пирамиде видимости (ограничивающая сфера охватила
- * бы всю трассу и толку от проверки нет), поэтому плотность подобрана так,
- * чтобы весь декор целиком укладывался в свою долю бюджета треугольников.
+ * --------------------------------------------------------------------------
+ * ОТСЕЧЕНИЕ ПО ПИРАМИДЕ ВИДИМОСТИ — ПО ИНСТАНСАМ
+ * --------------------------------------------------------------------------
+ * Отсекать здесь можно только по инстансам: ограничивающая сфера целого
+ * InstancedMesh охватывает всю трассу, и отсечение меша целиком не даёт
+ * ничего. Поэтому каждый кадр буфер матриц заполняется заново — только
+ * видимыми экземплярами, — и выставляется `count`. Невидимые экземпляры
+ * не доходят даже до вершинного шейдера.
+ *
+ * Чтобы поиск видимых был дешёвым, объекты разложены по КОРЗИНАМ вдоль дуги
+ * трассы (~45 м на корзину). Трасса — замкнутая дуга, и декор живёт узкой
+ * полосой вдоль неё, поэтому одномерная раскладка по пройденному пути
+ * описывает пространство не хуже сетки, а стоит одно деление. В кадре
+ * проверяются КОРЗИНЫ (несколько десятков сфер на тип), а не тысячи
+ * объектов; экземпляры внутри корзины лежат в буфере подряд, так что
+ * видимая корзина копируется одним прогоном.
+ *
+ * Объекты, которым дуга не подходит (горные пики за краем карты), кладутся
+ * в «свободный» хвост и проверяются поштучно — их единицы.
+ *
+ * Плотность декора больше НЕ нормируется по длине круга: нормировка была
+ * лечением симптома ровно этой проблемы. Длинная трасса теперь стоит в кадре
+ * столько же, сколько короткая, потому что в кадр попадает не круг, а то,
+ * что видно.
+ *
+ * --------------------------------------------------------------------------
+ * ОКРУЖЕНИЕ ПРИХОДИТ ПАРАМЕТРОМ
+ * --------------------------------------------------------------------------
+ * Время суток (и дальше — погода) НЕ зашито в трассу: это настройка комнаты.
+ * buildScenery принимает объект окружения `opts.env` вида
+ *
+ *     { timeOfDay: 'day' | 'dusk' | 'night', weather: 'clear' }
+ *
+ * Принимаются и змеиные имена полей (`time_of_day`), потому что объект
+ * приходит из JSON настроек комнаты как есть. Неизвестные значения молча
+ * заменяются значениями по умолчанию — сцена обязана собраться всегда.
+ * Описание трассы может нести поле `time_of_day` — это ТОЛЬКО значение по
+ * умолчанию, которое лобби предлагает при выборе карты.
+ *
+ * Сумерки не заданы отдельной таблицей: они считаются интерполяцией между
+ * днём и ночью с тёплой подмешанной полосой у горизонта. Тот же приём
+ * готов принять погоду: она меняет те же поля (туман, свет, небо) и
+ * накладывается поверх времени суток.
  */
 
 import * as THREE from 'three';
@@ -35,7 +75,8 @@ import {
     bakeContactAO,
     bakeProximityAO,
     disposeObject,
-    countTriangles
+    countTriangles,
+    SphereAccum
 } from './geomutil.js';
 import { readTrack, createTerrainSampler } from './trackmesh.js';
 
@@ -44,9 +85,9 @@ import { readTrack, createTerrainSampler } from './trackmesh.js';
 // ---------------------------------------------------------------------------
 
 const QUALITY = {
-    low: { density: 0.5, seg: 5, clouds: 3, peaks: 10, skySeg: 12, fogFar: 260 },
-    medium: { density: 1.1, seg: 6, clouds: 5, peaks: 16, skySeg: 16, fogFar: 360 },
-    high: { density: 1.7, seg: 8, clouds: 8, peaks: 22, skySeg: 20, fogFar: 470 }
+    low: { density: 0.5, seg: 5, clouds: 3, peaks: 10, skySeg: 12, fogFar: 260, stars: 90 },
+    medium: { density: 1.1, seg: 6, clouds: 5, peaks: 16, skySeg: 16, fogFar: 360, stars: 150 },
+    high: { density: 1.7, seg: 8, clouds: 8, peaks: 22, skySeg: 20, fogFar: 470, stars: 230 }
 };
 
 /**
@@ -60,39 +101,151 @@ const DECOR_DENSITY = { sparse: 0.45, normal: 1.15, dense: 1.9 };
 // плотности там сдержаннее: коэффициент на тему.
 const THEME_DENSITY = { city: 1.0, mountain: 0.82, industrial: 1.0 };
 
-/**
- * Нормировка плотности по длине круга.
- *
- * Инстансы декора НЕ отсекаются по пирамиде видимости (см. шапку файла),
- * поэтому в кадр попадает весь декор трассы разом: его цена растёт прямо
- * пропорционально длине круга. Плотность в объектах на метр, одинаковая для
- * километрового кольца и для трёхкилометрового, означала бы втрое больший
- * кадровый счёт на длинной трассе — при том, что видно всё равно метров
- * триста вперёд.
- *
- * Поэтому число объектов держится примерно постоянным: длиннее опорных
- * DECOR_REF_LENGTH метров — реже на метр. Трёх исходных трасс это не
- * касается (все короче), а длинные перестают стоить вдвое.
- */
-const DECOR_REF_LENGTH = 1500;
+/** Целевая длина корзины вдоль дуги, м. */
+const BUCKET_LENGTH = 45.0;
 
-function lengthDensity(trackLength) {
-    if (!(trackLength > 0)) return 1;
-    return Math.min(1, DECOR_REF_LENGTH / trackLength);
+// ---------------------------------------------------------------------------
+// Окружение: время суток и (задел) погода
+// ---------------------------------------------------------------------------
+
+export const TIMES_OF_DAY = ['day', 'dusk', 'night'];
+export const WEATHERS = ['clear'];
+
+export const ENV_DEFAULT = { timeOfDay: 'day', weather: 'clear' };
+
+/**
+ * Привести описание окружения к внутреннему виду.
+ * Принимает и `{timeOfDay, weather}`, и `{time_of_day, weather}` — ровно то,
+ * что придёт из настроек комнаты, и строку `'night'` как сокращение.
+ */
+export function normalizeEnvironment(src, fallback) {
+    const base = fallback || ENV_DEFAULT;
+    let tod = base.timeOfDay;
+    let weather = base.weather;
+    if (typeof src === 'string') {
+        if (TIMES_OF_DAY.indexOf(src) >= 0) tod = src;
+    } else if (src) {
+        const t = src.timeOfDay !== undefined ? src.timeOfDay : src.time_of_day;
+        if (TIMES_OF_DAY.indexOf(t) >= 0) tod = t;
+        const w = src.weather;
+        if (WEATHERS.indexOf(w) >= 0) weather = w;
+    }
+    return { timeOfDay: tod || 'day', weather: weather || 'clear' };
+}
+
+/** Смесь двух цветов-строк: сумерки считаются из дня и ночи, а не пишутся руками. */
+function mixHex(a, b, t) {
+    const ca = toColor(a);
+    ca.lerp(toColor(b), t);
+    return '#' + ca.getHexString();
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
 }
 
 // ---------------------------------------------------------------------------
 // Темы: небо, туман, свет, палитры объектов
 // ---------------------------------------------------------------------------
+//
+// На тему задаются ДВА крайних состояния — день и ночь. Сумерки строятся из
+// них интерполяцией (makeDusk): так три времени суток стоят одной таблицы,
+// а следующая добавка (погода) ляжет тем же способом.
+
+const CITY_DAY = {
+    zenith: '#3f6fb5',
+    horizon: '#bcc9da',
+    fog: '#b9c6d7',
+    ambient: { color: '#c3cfe0', intensity: 0.88 },
+    dir: { color: '#fff4e2', intensity: 1.05, dir: [0.45, 0.82, 0.35] },
+    cloud: '#f4f7fb'
+};
+
+const CITY_NIGHT = {
+    zenith: '#050813',
+    horizon: '#131d35',
+    fog: '#0b1222',
+    ambient: { color: '#46557a', intensity: 0.40 },
+    dir: { color: '#8ea6d8', intensity: 0.30, dir: [-0.38, 0.86, -0.34] },
+    cloud: '#101828'
+};
+
+const MOUNTAIN_DAY = {
+    zenith: '#3877c4',
+    horizon: '#d4e3ec',
+    fog: '#cddfe9',
+    ambient: { color: '#c9d8e6', intensity: 0.85 },
+    dir: { color: '#fff0d2', intensity: 1.1, dir: [-0.4, 0.78, 0.48] },
+    cloud: '#ffffff'
+};
+
+const MOUNTAIN_NIGHT = {
+    zenith: '#03060f',
+    horizon: '#0d1728',
+    fog: '#0a1120',
+    ambient: { color: '#3d4e70', intensity: 0.38 },
+    dir: { color: '#9cb2e0', intensity: 0.34, dir: [-0.42, 0.84, 0.32] },
+    cloud: '#0e1524'
+};
+
+const INDUSTRIAL_DAY = {
+    zenith: '#5d7fa0',
+    horizon: '#d3cbb6',
+    fog: '#cfc8b6',
+    ambient: { color: '#d0ccbe', intensity: 0.86 },
+    dir: { color: '#fff2d6', intensity: 1.0, dir: [0.35, 0.8, -0.45] },
+    cloud: '#e8e4d8'
+};
+
+const INDUSTRIAL_NIGHT = {
+    zenith: '#06080f',
+    horizon: '#171b2b',
+    fog: '#0d1019',
+    ambient: { color: '#4a4d63', intensity: 0.40 },
+    dir: { color: '#96a0c2', intensity: 0.28, dir: [0.32, 0.82, -0.4] },
+    cloud: '#131624'
+};
+
+/** Сумерки: между днём и ночью, плюс тёплая полоса у горизонта. */
+function makeDusk(day, night) {
+    const t = 0.58;
+    return {
+        zenith: mixHex(day.zenith, night.zenith, 0.74),
+        horizon: mixHex(mixHex(day.horizon, night.horizon, t), '#e8813c', 0.46),
+        fog: mixHex(mixHex(day.fog, night.fog, t), '#b06a42', 0.34),
+        ambient: {
+            color: mixHex(mixHex(day.ambient.color, night.ambient.color, t), '#b07a58', 0.3),
+            intensity: lerp(day.ambient.intensity, night.ambient.intensity, t)
+        },
+        dir: {
+            // солнце у самого горизонта: длинные косые тени в вершинном свете
+            color: mixHex(mixHex(day.dir.color, night.dir.color, 0.35), '#ff8f45', 0.6),
+            intensity: lerp(day.dir.intensity, night.dir.intensity, 0.42),
+            dir: [day.dir.dir[0], 0.22, day.dir.dir[2]]
+        },
+        cloud: mixHex(mixHex(day.cloud, night.cloud, t), '#c47a64', 0.42)
+    };
+}
+
+/**
+ * Параметры, зависящие от времени суток, но не от темы:
+ *  fogK     — во столько раз ближе туман (ночью воздух «плотнее»)
+ *  lights   — строить ли ночные огни (фонари, окна, щиты)
+ *  lampK    — яркость этих огней
+ *  stars    — доля звёзд от пресета (0 — не строить)
+ *  clouds   — доля облаков (ночью они только мешают звёздам)
+ */
+const TOD_PARAMS = {
+    day: { fogK: 1.0, lights: false, lampK: 0.0, stars: 0.0, clouds: 1.0, moon: 0.0 },
+    dusk: { fogK: 0.92, lights: true, lampK: 0.55, stars: 0.35, clouds: 0.8, moon: 0.45 },
+    night: { fogK: 0.78, lights: true, lampK: 1.0, stars: 1.0, clouds: 0.0, moon: 1.0 }
+};
 
 const THEME_ENV = {
     city: {
-        zenith: '#3f6fb5',
-        horizon: '#bcc9da',
-        fog: '#b9c6d7',
-        ambient: { color: '#c3cfe0', intensity: 0.88 },
-        dir: { color: '#fff4e2', intensity: 1.05, dir: [0.45, 0.82, 0.35] },
-        cloud: '#f4f7fb',
+        day: CITY_DAY,
+        dusk: makeDusk(CITY_DAY, CITY_NIGHT),
+        night: CITY_NIGHT,
         palette: {
             concrete: ['#b9bfc6', '#cbcabe', '#a8aeb6', '#c4bbab', '#9aa2ac'],
             accent: ['#d0552f', '#3f7ea8', '#cbb04a'],
@@ -104,12 +257,9 @@ const THEME_ENV = {
         }
     },
     mountain: {
-        zenith: '#3877c4',
-        horizon: '#d4e3ec',
-        fog: '#cddfe9',
-        ambient: { color: '#c9d8e6', intensity: 0.85 },
-        dir: { color: '#fff0d2', intensity: 1.1, dir: [-0.4, 0.78, 0.48] },
-        cloud: '#ffffff',
+        day: MOUNTAIN_DAY,
+        dusk: makeDusk(MOUNTAIN_DAY, MOUNTAIN_NIGHT),
+        night: MOUNTAIN_NIGHT,
         palette: {
             needle: ['#3d7042', '#4a7d48', '#336038', '#578a48'],
             trunk: '#4a3a2c',
@@ -122,12 +272,9 @@ const THEME_ENV = {
         }
     },
     industrial: {
-        zenith: '#5d7fa0',
-        horizon: '#d3cbb6',
-        fog: '#cfc8b6',
-        ambient: { color: '#d0ccbe', intensity: 0.86 },
-        dir: { color: '#fff2d6', intensity: 1.0, dir: [0.35, 0.8, -0.45] },
-        cloud: '#e8e4d8',
+        day: INDUSTRIAL_DAY,
+        dusk: makeDusk(INDUSTRIAL_DAY, INDUSTRIAL_NIGHT),
+        night: INDUSTRIAL_NIGHT,
         palette: {
             hangar: ['#8d9298', '#7c8a90', '#98917f', '#6f7a80'],
             tank: ['#b0b4b0', '#9aa39a', '#c0b49a'],
@@ -152,23 +299,35 @@ const THEME_ENV = {
  * @param {string} quality low | medium | high
  * @param {object} [opts]  отдельные настройки графики, добавлены после
  *                         контракта и НЕОБЯЗАТЕЛЬНЫ:
- *                         { ao, decor: sparse|normal|dense, anim }
+ *                         { ao, decor: sparse|normal|dense, anim,
+ *                           env: {timeOfDay, weather}, nightLights: 0..1.5 }
  */
 export function buildScenery(track, theme, seed, quality, opts) {
     const T = readTrack(track);
     const qName = QUALITY[quality] ? quality : 'medium';
     const Q = QUALITY[qName];
     const themeName = theme || T.theme || 'city';
-    const env = THEME_ENV[themeName] || THEME_ENV.city;
+    const themeEnv = THEME_ENV[themeName] || THEME_ENV.city;
     const baseSeed = (seed === undefined || seed === null ? T.seed : seed) >>> 0;
 
     const o = opts || {};
     const ao = o.ao !== false;
     const anim = o.anim !== false;
+    const environment = normalizeEnvironment(o.env, ENV_DEFAULT);
+    const todName = environment.timeOfDay;
+    const tod = TOD_PARAMS[todName] || TOD_PARAMS.day;
+    // Яркость ночных огней — отдельная галочка; 0 полностью снимает их
+    // геометрию, то есть и draw call, и треугольники.
+    const nightK = o.nightLights === undefined ? 1 : Math.max(0, o.nightLights);
+    const lampK = tod.lampK * nightK;
+    const lights = tod.lights && lampK > 0.01;
+    const env = themeEnv[todName] || themeEnv.day;
+
     const decorLevel = DECOR_DENSITY[o.decor] !== undefined ? o.decor : null;
+    // Нормировка плотности по длине круга снята: отсечение по пирамиде
+    // видимости сделало её ненужной (см. шапку файла).
     const density = (decorLevel ? DECOR_DENSITY[decorLevel] : Q.density)
-        * (THEME_DENSITY[themeName] || 1)
-        * lengthDensity(T.length);
+        * (THEME_DENSITY[themeName] || 1);
 
     const sampler = createTerrainSampler(track, themeName, qName);
     const clearance = makeClearance(T);
@@ -186,21 +345,34 @@ export function buildScenery(track, theme, seed, quality, opts) {
     // ни аллокаций, ни перекомпиляции.
     const timeUniform = { value: 0 };
 
+    // корзины вдоль дуги: столько же для всех типов декора
+    const bucketCount = Math.max(6, Math.ceil(T.length / BUCKET_LENGTH));
+
     const ctx = {
         T: T,
         Q: Q,
         env: env,
-        pal: env.palette,
+        pal: themeEnv.palette,
         sampler: sampler,
         clearance: clearance,
         occupancy: occupancy,
+        locate: makeLocator(T),
+        bucketCount: bucketCount,
+        bucketLen: T.length / bucketCount,
         group: group,
         material: material,
         instances: {},
+        sets: [],
         materials: [material],
         density: density,
         ao: ao,
         anim: anim,
+        timeOfDay: todName,
+        lights: lights,
+        lampK: lampK,
+        tod: tod,
+        glowMat: null,
+        emitMat: null,
         timeUniform: timeUniform,
         swayMats: {}
     };
@@ -214,27 +386,43 @@ export function buildScenery(track, theme, seed, quality, opts) {
     buildCrowd(ctx, baseSeed ^ 0x77c1);
     buildCones(ctx, baseSeed ^ 0x1d4f);
 
-    // небо и облака
+    // небо: купол, облака, звёзды с луной
     const skyGroup = new THREE.Group();
     skyGroup.name = 'sky';
     const sky = buildSkyDome(env, Q);
-    const clouds = buildClouds(env, Q, new Rng(baseSeed ^ 0x0c10ad));
-    skyGroup.add(sky, clouds);
+    skyGroup.add(sky);
+    ctx.materials.push(sky.material);
+    let clouds = null;
+    if (tod.clouds > 0.01) {
+        clouds = buildClouds(env, Q, new Rng(baseSeed ^ 0x0c10ad), tod.clouds);
+        skyGroup.add(clouds);
+        ctx.materials.push(clouds.material);
+    }
+    let stars = null;
+    if (tod.stars > 0.01) {
+        stars = buildStars(Q, new Rng(baseSeed ^ 0x57a25), tod);
+        skyGroup.add(stars);
+        ctx.materials.push(stars.material);
+    }
     group.add(skyGroup);
-    ctx.materials.push(sky.material, clouds.material);
 
     const fogColor = toColor(env.fog);
+    const fogFar = Q.fogFar * tod.fogK;
+    const sets = ctx.sets;
     const api = {
         group: group,
         sky: sky,
         clouds: clouds,
+        stars: stars,
         skyGroup: skyGroup,
         instances: ctx.instances,
         theme: themeName,
         quality: qName,
+        timeOfDay: todName,
+        environment: environment,
 
         // параметры, которые применяет renderer.js
-        fog: { color: fogColor, near: Q.fogFar * 0.35, far: Q.fogFar },
+        fog: { color: fogColor, near: fogFar * 0.35, far: fogFar },
         background: fogColor.clone(),
         light: {
             ambient: { color: toColor(env.ambient.color), intensity: env.ambient.intensity },
@@ -266,16 +454,38 @@ export function buildScenery(track, theme, seed, quality, opts) {
             timeUniform.value = t;
         },
 
+        /**
+         * Отсечение декора по инстансам. Зовётся раз в кадр из renderer.js,
+         * ПОСЛЕ обновления матриц камеры. Ноль аллокаций.
+         */
+        cull: function (culler) {
+            let shown = 0;
+            let total = 0;
+            for (let i = 0; i < sets.length; i++) {
+                sets[i].cull(culler);
+                shown += sets[i].mesh.count;
+                total += sets[i].total;
+            }
+            api.stats.visibleInstances = shown;
+            api.stats.totalInstances = total;
+        },
+
         materials: ctx.materials,
         stats: {
             drawCalls: countInstanced(group),
-            triangles: countTriangles(group)
+            triangles: countSceneryTriangles(group, sets),
+            totalInstances: 0,
+            visibleInstances: 0
         },
 
         dispose: function () {
             disposeObject(group);
         }
     };
+    let totalInstances = 0;
+    for (let i = 0; i < sets.length; i++) totalInstances += sets[i].total;
+    api.stats.totalInstances = totalInstances;
+    api.stats.visibleInstances = totalInstances;
     return api;
 }
 
@@ -285,6 +495,22 @@ function countInstanced(root) {
         if (o.isMesh || o.isInstancedMesh) n++;
     });
     return n;
+}
+
+/**
+ * Треугольники всего декора при ПОЛНОЙ загрузке инстансов.
+ * countTriangles() смотрит на mesh.count, а он после сборки равен нулю:
+ * буфер заполняет первый же вызов cull(). Для отчёта нужен потолок.
+ */
+function countSceneryTriangles(root, sets) {
+    let total = countTriangles(root);
+    for (let i = 0; i < sets.length; i++) {
+        const set = sets[i];
+        const g = set.mesh.geometry;
+        const verts = g.index ? g.index.count : g.attributes.position.count;
+        total += (verts / 3) * (set.total - set.mesh.count);
+    }
+    return Math.round(total);
 }
 
 // ---------------------------------------------------------------------------

@@ -136,8 +136,10 @@ const SF_X = 0, SF_Z = 1, SF_YAW = 2, SF_VX = 3, SF_VZ = 4, SF_STEER = 5,
 const SI = 3;
 const SI_SAMPLE = 0, SI_LAP = 1, SI_CP = 2;
 
-const SB = 2;
-const SB_DRIFT_ACTIVE = 0, SB_OFFTRACK = 1;
+const SB = 3;
+// Сторона заноса (drift_dir, раздел 6.3) хранится со сдвигом +1,
+// потому что массив беззнаковый: -1 -> 0, 0 -> 1, +1 -> 2.
+const SB_DRIFT_ACTIVE = 0, SB_OFFTRACK = 1, SB_DRIFT_DIR = 2;
 
 // Коды бонусов раздела 8: это данные протокола, а не интерфейса, поэтому
 // таблица живёт здесь, а не тянется из ui/.
@@ -613,6 +615,7 @@ export class NetClient {
         state.steer = 0;
         state.driftCharge = 0;
         state.driftActive = false;
+        state.driftDir = 0;
         state.boostTime = 0;
         state.spinTime = 0;
         state.shieldTime = 0;
@@ -1008,6 +1011,7 @@ export class NetClient {
         const b = i * SB;
         this.ringB[b + SB_DRIFT_ACTIVE] = state.driftActive ? 1 : 0;
         this.ringB[b + SB_OFFTRACK] = state.offtrack ? 1 : 0;
+        this.ringB[b + SB_DRIFT_DIR] = (state.driftDir | 0) + 1;
         this.ringValid[i] = 1;
     }
 
@@ -1036,6 +1040,7 @@ export class NetClient {
         const b = i * SB;
         state.driftActive = this.ringB[b + SB_DRIFT_ACTIVE] === 1;
         state.offtrack = this.ringB[b + SB_OFFTRACK] === 1;
+        state.driftDir = this.ringB[b + SB_DRIFT_DIR] - 1;
     }
 
     _resetPrediction() {

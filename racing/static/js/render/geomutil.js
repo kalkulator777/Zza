@@ -904,3 +904,161 @@ export function countDrawCalls(root) {
     });
     return total;
 }
+
+// ============================================================================
+// Отсечение по пирамиде видимости
+// ============================================================================
+//
+// Это единственная часть geomutil.js, которая работает В КАДРОВОМ ЦИКЛЕ,
+// поэтому здесь особенно строго: ни одной аллокации. Матрица, пирамида и
+// вспомогательные объекты — модульные константы, заполняются на месте.
+//
+// Проверка ведётся по ОГРАНИЧИВАЮЩИМ СФЕРАМ. Сфера — самая дешёвая форма:
+// шесть скалярных произведений и одно сравнение, никаких ветвлений по осям.
+// Консервативность сферы здесь в плюс: объект скорее останется в кадре
+// лишний раз, чем пропадёт на краю экрана.
+
+const _cullMat = new THREE.Matrix4();
+
+/**
+ * Пирамида видимости камеры плюс отсечение по дальности.
+ *
+ * Дальность — не отсебятина, а следствие тумана: линейный `scene.fog`
+ * полностью заменяет цвет объекта цветом тумана на расстоянии `far`, и за
+ * этой чертой любой объект неотличим от фона. Поэтому отсечение по
+ * `maxDist = fog.far + запас` картинку не меняет, а работу снимает.
+ *
+ * Объекты, которые ЗАВЕДОМО дальше тумана и всё равно должны быть видны
+ * (горные пики на горизонте, облака), проверяются через inFrustum() —
+ * без дальности.
+ */
+export class ViewCuller {
+    constructor() {
+        this.frustum = new THREE.Frustum();
+        this.camX = 0;
+        this.camY = 0;
+        this.camZ = 0;
+        this.maxDist = 1e9;
+        this.enabled = true;
+    }
+
+    /**
+     * Перечитать камеру. Зовётся один раз в кадре, ПОСЛЕ updateMatrixWorld.
+     * @param {THREE.Camera} camera
+     * @param {number} maxDist дальность отсечения, м (0 или меньше — без предела)
+     */
+    update(camera, maxDist) {
+        _cullMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        this.frustum.setFromProjectionMatrix(_cullMat);
+        const e = camera.matrixWorld.elements;
+        this.camX = e[12];
+        this.camY = e[13];
+        this.camZ = e[14];
+        this.maxDist = maxDist > 0 ? maxDist : 1e9;
+    }
+
+    /** Отключить отсечение целиком (отладка и замеры «как было»). */
+    setEnabled(on) {
+        this.enabled = on !== false;
+    }
+
+    /** Сфера в пирамиде видимости, без учёта дальности. */
+    inFrustum(x, y, z, r) {
+        if (!this.enabled) return true;
+        const planes = this.frustum.planes;
+        for (let i = 0; i < 6; i++) {
+            const p = planes[i];
+            const n = p.normal;
+            if (n.x * x + n.y * y + n.z * z + p.constant < -r) return false;
+        }
+        return true;
+    }
+
+    /** Сфера видна: и в пирамиде, и ближе предела дальности. */
+    visible(x, y, z, r) {
+        if (!this.enabled) return true;
+        const dx = x - this.camX;
+        const dy = y - this.camY;
+        const dz = z - this.camZ;
+        const lim = this.maxDist + r;
+        if (dx * dx + dy * dy + dz * dz > lim * lim) return false;
+        return this.inFrustum(x, y, z, r);
+    }
+}
+
+/**
+ * Накопитель ограничивающей сферы: собирает объединение сфер и отдаёт
+ * центр и радиус. Работает через габаритный ящик — так объединение считается
+ * за одно сравнение на ось и остаётся консервативным.
+ * Используется ТОЛЬКО при сборке сцены.
+ */
+export class SphereAccum {
+    constructor() {
+        this.reset();
+    }
+
+    reset() {
+        this.n = 0;
+        this.minX = Infinity; this.minY = Infinity; this.minZ = Infinity;
+        this.maxX = -Infinity; this.maxY = -Infinity; this.maxZ = -Infinity;
+    }
+
+    add(x, y, z, r) {
+        this.n++;
+        if (x - r < this.minX) this.minX = x - r;
+        if (y - r < this.minY) this.minY = y - r;
+        if (z - r < this.minZ) this.minZ = z - r;
+        if (x + r > this.maxX) this.maxX = x + r;
+        if (y + r > this.maxY) this.maxY = y + r;
+        if (z + r > this.maxZ) this.maxZ = z + r;
+    }
+
+    /** Записать (cx, cy, cz, radius) в out по смещению off. Пустой набор — радиус -1. */
+    writeTo(out, off) {
+        if (this.n === 0) {
+            out[off] = 0; out[off + 1] = 0; out[off + 2] = 0; out[off + 3] = -1;
+            return;
+        }
+        const cx = (this.minX + this.maxX) * 0.5;
+        const cy = (this.minY + this.maxY) * 0.5;
+        const cz = (this.minZ + this.maxZ) * 0.5;
+        const hx = this.maxX - cx;
+        const hy = this.maxY - cy;
+        const hz = this.maxZ - cz;
+        out[off] = cx;
+        out[off + 1] = cy;
+        out[off + 2] = cz;
+        out[off + 3] = Math.sqrt(hx * hx + hy * hy + hz * hz);
+    }
+}
+
+/**
+ * Габаритная сфера диапазона вершин неиндексированной геометрии.
+ * Нужна нарезке полотна и рельефа на сегменты: у каждого сегмента своя сфера.
+ */
+export function rangeSphere(positions, start, count, out, off) {
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const end = (start + count) * 3;
+    for (let i = start * 3; i < end; i += 3) {
+        const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (z < minZ) minZ = z;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        if (z > maxZ) maxZ = z;
+    }
+    if (count <= 0) {
+        out[off] = 0; out[off + 1] = 0; out[off + 2] = 0; out[off + 3] = -1;
+        return;
+    }
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY + maxY) * 0.5;
+    const cz = (minZ + maxZ) * 0.5;
+    const hx = maxX - cx, hy = maxY - cy, hz = maxZ - cz;
+    out[off] = cx;
+    out[off + 1] = cy;
+    out[off + 2] = cz;
+    out[off + 3] = Math.sqrt(hx * hx + hy * hy + hz * hz);
+}
