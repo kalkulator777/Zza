@@ -79,6 +79,18 @@ YAW_TOL = 0.005     # рад, выше этого — провал
 # поэтому Python и JS обязаны совпадать почти до бита. Допуск здесь жёстче
 # позиционного на порядки: разойтись он может только веткой, а не округлением.
 CHARGE_TOL = 1e-9   # с
+# Высота полёта — тоже чистая сумма приращений по шагу: GRAVITY * dt плюс
+# уклон трамплина, никаких sin/cos. Единственный источник разницы — позиция
+# машины на въезде, а она к моменту отрыва расходится на 1e-13 м, то есть
+# на высоту это переносится ещё слабее.
+HEIGHT_TOL = 1e-9   # м
+# Свободный полёт обязан сохранять горизонтальную скорость. Точного нуля тут
+# не бывает: шаг 5 раскладывает скорость в осях машины, шаг 12 собирает её
+# обратно, и в float64 это не тождество — fx² + fz² не ровно единица, отсюда
+# около 1e-16 относительной ошибки на шаг. За полтора секунды полёта набегает
+# 1e-13 м/с. Допуск на четыре порядка выше наблюдаемого и на порядки ниже
+# всего, что можно заметить в игре.
+AIR_KEEP_TOL = 1e-9  # м/с
 # Порог подозрения. Реально наблюдаемый шум от разницы sin/cos в Python и V8 —
 # около 2e-13 м на 4200 шагов. Всё, что заметно больше, но ещё в допуске, —
 # почти наверняка не шум, а разошедшаяся константа или переставленная операция;
@@ -121,7 +133,15 @@ class StubTrack:
     """Прямой коридор вдоль +Z. Зеркалируется в STUB_JS слово в слово.
 
     Реализует ровно те четыре метода интерфейса раздела 7.3, которые нужны
-    шагу физики: nearest_index, surface, clamp_to_track, advance_progress.
+    шагу физики: nearest_index, surface, clamp_to_track, advance_progress,
+    и пишет высоту трамплина под машиной в ``state.ramp_h`` — её читает
+    шаг 14б.
+
+    Трамплин один, поперёк коридора: въезд от ``RAMP_S0`` длиной ``RAMP_LEN``
+    с уклоном ``RAMP_SLOPE`` (кромка вылета на высоте 1,2 м), шириной
+    ``RAMP_HW`` в каждую сторону от оси, с боковым скосом ``RAMP_EDGE``.
+    Профиль повторяет ``Track.ramp_height`` из game/track.py: коридор прямой,
+    поэтому путь по дуге здесь — это просто z, а смещение от оси — это x.
     """
 
     __slots__ = ("last_s",)
@@ -132,8 +152,28 @@ class StubTrack:
     COUNT = 1000            # точек осевой линии
     LENGTH = 2000.0         # COUNT * SAMPLE_STEP
 
+    RAMP_S0 = 1400.0        # z начала въезда, м
+    RAMP_LEN = 6.0          # длина въезда по дуге, м
+    RAMP_SLOPE = 0.2        # уклон въезда: кромка на высоте 1.2 м
+    RAMP_HW = 6.0           # половина ширины трамплина, м
+    RAMP_EDGE = 1.0         # боковой скос, м (RAMP_EDGE из game/track.py)
+
     def __init__(self):
         self.last_s = 0.0
+
+    def ramp_height(self, x, z):
+        """Высота полотна трамплина под машиной, м. Ноль — трамплина нет."""
+        ds = z - self.RAMP_S0
+        if ds < 0.0 or ds > self.RAMP_LEN:
+            return 0.0
+        du = -x if x < 0.0 else x
+        edge = self.RAMP_HW - du
+        if edge <= 0.0:
+            return 0.0
+        h = self.RAMP_SLOPE * ds
+        if edge < self.RAMP_EDGE:
+            h *= edge / self.RAMP_EDGE
+        return h
 
     def nearest_index(self, x, z, hint):
         """Ближайшая точка осевой линии: коридор прямой, индекс считается."""
@@ -144,8 +184,15 @@ class StubTrack:
         return (self.nearest_index(x, z, hint), x, self.HALF_WIDTH, 0.0, 0.0)
 
     def clamp_to_track(self, state, hint):
-        """Шаг 14: флаг травы, выталкивание из стены, гашение по нормали."""
+        """Шаг 14: трамплин, флаг травы, выталкивание из стены, гашение.
+
+        В полёте границы не действуют: машина летит НАД ними (см. 6.2, шаг 14).
+        """
+        state.ramp_h = self.ramp_height(state.x, state.z)
         lateral = state.x
+        if state.airborne:
+            state.offtrack = False
+            return
         state.offtrack = lateral > self.HALF_WIDTH or lateral < -self.HALF_WIDTH
         if lateral > self.WALL_LIMIT:
             state.x = self.WALL_LIMIT
@@ -191,9 +238,23 @@ SCRIPT = (
     (300, GAS | LEFT,          "вираж на «Турбо»"),
     (200, GAS | RIGHT | DRIFT, "дрифт под «Грозой»"),
     (200, 0,                   "накат, по пути удар о стену"),
+    # --- трамплин: сверка полёта Python и JS (вердикты выносит report_jump)
+    (200, GAS,                 "трамплин: разгон, отрыв, полёт, мягкая посадка"),
+    (200, GAS | DRIFT,         "трамплин с зажатым ручником"),
+    (200, GAS,                 "трамплин с подкруткой курса в полёте"),
 )
 
 SCRIPT_STEPS = sum(count for count, _mask, _why in SCRIPT)
+
+# Шаги фаз трамплина в общем плане. Считаются от конца прежнего сценария,
+# чтобы правка длины любой из фаз выше не разъехалась с INJECT.
+JUMP_A = SCRIPT_STEPS - 600      # мягкая посадка
+JUMP_B = SCRIPT_STEPS - 400      # ручник и руль в воздухе
+JUMP_C = SCRIPT_STEPS - 200      # подкрутка курса в полёте -> жёсткая посадка
+# Шаг, на котором третьей фазе подкручивается курс. Машина к этому моменту
+# заведомо в воздухе: отрыв случается примерно через 75 шагов после рестарта
+# (40 м разгона на 34 м/с), полёт длится около 75 шагов.
+JUMP_C_KICK = JUMP_C + 100
 
 # Внешние воздействия: (шаг, поле состояния, значение). Через них подаётся
 # то, чего не выразить кнопками: попадания, бонусы и постановка машины
@@ -202,6 +263,19 @@ SCRIPT_STEPS = sum(count for count, _mask, _why in SCRIPT)
 def _restart(at, speed):
     """Поставить машину в центр коридора носом в +Z на заданной скорости."""
     return ((at, "x", 0.0), (at, "yaw", 0.0), (at, "vx", 0.0), (at, "vz", speed))
+
+
+def _restart_at_z(at, speed, z):
+    """То же, но ещё и в заданную точку по ходу коридора.
+
+    Нужно фазам трамплина: он стоит на фиксированном z, и подъезжать к нему
+    надо с известного расстояния, иначе фаза выродится в «машина уже за ним».
+    Высота и полёт при этом обнуляются явно: рестарт — это постановка машины
+    на землю, а не продолжение прыжка.
+    """
+    return _restart(at, speed) + ((at, "z", z), (at, "height", 0.0),
+                                  (at, "v_vert", 0.0), (at, "airborne", False),
+                                  (at, "land_stun", 0.0))
 
 
 INJECT = (
@@ -224,6 +298,15 @@ INJECT = (
        (2900, "yaw", 1.5707963267948966),
        (2900, "vx", 22.0),
        (2900, "vz", 0.0))
+    # --- трамплин. Подъезд начинается за 40 м до въезда (z = 1400), этого
+    # хватает и на разгон, и на то, чтобы машина успела выпрямиться
+    + _restart_at_z(JUMP_A, 34.0, 1360.0)
+    + _restart_at_z(JUMP_B, 34.0, 1360.0)
+    + _restart_at_z(JUMP_C, 34.0, 1360.0)
+    # подкрутка курса В ПОЛЁТЕ: мировая скорость при этом не меняется,
+    # зато боковая составляющая в осях машины становится большой, и посадка
+    # обязана выйти жёсткой
+    + ((JUMP_C_KICK, "yaw", 0.32),)
     # перед блоком виляния ставим машину в центр коридора на 15 м/с: это
     # ровно та скорость, на которой заказчик показал абуз
     + _restart(SCRIPT_STEPS, 15.0)
@@ -237,7 +320,7 @@ INJECT = (
 WIGGLE_STEPS = 600          # 10 с виляния
 WIGGLE_HALF = 30            # 0.5 с на сторону — период перекладки 1 с
 
-TOTAL_STEPS = 4200
+TOTAL_STEPS = 4800
 
 # Сценарии столкновений. Проверяют resolve_collisions — форму (капсула),
 # расталкивание с учётом массы и обмен импульсом. Столкновения считает только
@@ -343,6 +426,8 @@ def run_python(plan):
     vzs = [0.0] * n
     charges = [0.0] * n
     offs = [0] * n
+    heights = [0.0] * n
+    airs = [0] * n
     events = []
 
     for i in range(n):
@@ -361,10 +446,13 @@ def run_python(plan):
         vzs[i] = state.vz
         charges[i] = state.drift_charge
         offs[i] = 1 if state.offtrack else 0
+        heights[i] = state.height
+        airs[i] = 1 if state.airborne else 0
 
     return {
         "x": xs, "z": zs, "yaw": yaws, "vx": vxs, "vz": vzs,
         "charge": charges, "offtrack": offs, "events": events,
+        "height": heights, "airborne": airs,
         "progress": state.progress, "lap": state.lap,
     }
 
@@ -424,6 +512,7 @@ STUB_JS = """
 import { readFileSync, writeFileSync } from 'node:fs';
 import {
     step, resolveCollisions, createCarState, createCarStats, WALL_BOUNCE,
+    WEATHER_GRIP,
 } from './physics.mjs';
 
 /* Зеркало StubTrack из tools/test_physics_parity.py */
@@ -433,9 +522,33 @@ const SAMPLE_STEP = 2.0;
 const COUNT = 1000;
 const LENGTH = 2000.0;
 
+/* трамплин поперёк коридора, зеркало констант RAMP_* из StubTrack */
+const RAMP_S0 = 1400.0;
+const RAMP_LEN = 6.0;
+const RAMP_SLOPE = 0.2;
+const RAMP_HW = 6.0;
+const RAMP_EDGE = 1.0;
+
 class StubTrack {
     constructor() {
         this.lastS = 0.0;
+    }
+
+    rampHeight(x, z) {
+        const ds = z - RAMP_S0;
+        if (ds < 0.0 || ds > RAMP_LEN) {
+            return 0.0;
+        }
+        const du = x < 0.0 ? -x : x;
+        const edge = RAMP_HW - du;
+        if (edge <= 0.0) {
+            return 0.0;
+        }
+        let h = RAMP_SLOPE * ds;
+        if (edge < RAMP_EDGE) {
+            h *= edge / RAMP_EDGE;
+        }
+        return h;
     }
 
     nearestIndex(x, z, hint) {
@@ -448,7 +561,12 @@ class StubTrack {
     }
 
     clampToTrack(state, hint) {
+        state.rampH = this.rampHeight(state.x, state.z);
         const lateral = state.x;
+        if (state.airborne) {
+            state.offtrack = false;
+            return;
+        }
         state.offtrack = lateral > HALF_WIDTH || lateral < -HALF_WIDTH;
         if (lateral > WALL_LIMIT) {
             state.x = WALL_LIMIT;
@@ -488,6 +606,10 @@ const FIELD_MAP = {
     slow_time: 'slowTime',
     shield_time: 'shieldTime',
     drift_charge: 'driftCharge',
+    height: 'height',
+    v_vert: 'vVert',
+    airborne: 'airborne',
+    land_stun: 'landStun',
     x: 'x',
     z: 'z',
     yaw: 'yaw',
@@ -518,6 +640,8 @@ const vxs = new Array(n);
 const vzs = new Array(n);
 const charges = new Array(n);
 const offs = new Array(n);
+const heights = new Array(n);
+const airs = new Array(n);
 const events = [];
 
 for (let i = 0; i < n; i++) {
@@ -538,6 +662,8 @@ for (let i = 0; i < n; i++) {
     vzs[i] = state.vz;
     charges[i] = state.driftCharge;
     offs[i] = state.offtrack ? 1 : 0;
+    heights[i] = state.height;
+    airs[i] = state.airborne ? 1 : 0;
 }
 
 /* сценарии столкновений машина-машина */
@@ -585,8 +711,10 @@ for (const rows of plan.collide_sets) {
 writeFileSync(process.argv[3], JSON.stringify({
     x: xs, z: zs, yaw: yaws, vx: vxs, vz: vzs,
     charge: charges, offtrack: offs, events: events,
+    height: heights, airborne: airs,
     progress: state.progress, lap: state.lap,
     collide: collide,
+    weather_grip: WEATHER_GRIP,
 }));
 """
 
@@ -643,6 +771,11 @@ def compare(py, js):
     # в позиции. А искры, HUD и звук читают именно его.
     max_charge = 0.0
     max_charge_at = 0
+    # высота в полёте не двигает машину по x и z (раздел 4: положение на
+    # трассе плоское), поэтому разъехавшаяся баллистика в позиции проявится
+    # не сразу — сверяем её отдельно, как и заряд заноса
+    max_height = 0.0
+    max_height_at = 0
     for i in range(n):
         dx = py["x"][i] - js["x"][i]
         dz = py["z"][i] - js["z"][i]
@@ -663,6 +796,10 @@ def compare(py, js):
         if dc > max_charge:
             max_charge = dc
             max_charge_at = i
+        dh = abs(py["height"][i] - js["height"][i])
+        if dh > max_height:
+            max_height = dh
+            max_height_at = i
 
     print("  расхождение позиции: %.3e м (максимум на шаге %d)"
           % (max_pos, max_pos_at))
@@ -671,6 +808,10 @@ def compare(py, js):
     print("  расхождение скорости: %.3e м/с" % max_vel)
     print("  расхождение заряда заноса: %.3e с (максимум на шаге %d)"
           % (max_charge, max_charge_at))
+    air_steps = sum(py["airborne"])
+    print("  расхождение высоты полёта: %.3e м (максимум на шаге %d), "
+          "в воздухе %d шагов, максимум %.2f м"
+          % (max_height, max_height_at, air_steps, max(py["height"])))
     print("  progress: python %.6f м, js %.6f м, разница %.6f м"
           % (py["progress"], js["progress"], abs(py["progress"] - js["progress"])))
 
@@ -678,6 +819,18 @@ def compare(py, js):
     if max_charge > CHARGE_TOL:
         print("  РАСХОЖДЕНИЕ: заряд заноса разъехался сверх допуска %.1e с"
               % CHARGE_TOL)
+        ok = False
+    if air_steps == 0:
+        print("  ОШИБКА: сценарий ни разу не оторвал машину от земли,")
+        print("  значит трамплин и полёт не сверены вовсе.")
+        ok = False
+    if max_height > HEIGHT_TOL:
+        print("  РАСХОЖДЕНИЕ: высота полёта разъехалась сверх допуска %.1e м"
+              % HEIGHT_TOL)
+        ok = False
+    if py["airborne"] != js["airborne"]:
+        bad = next(i for i in range(n) if py["airborne"][i] != js["airborne"][i])
+        print("  РАСХОЖДЕНИЕ: флаг полёта разошёлся на шаге %d" % bad)
         ok = False
     if POS_SUSPECT < max_pos <= POS_TOL:
         print("  ВНИМАНИЕ: расхождение сильно выше шума sin/cos (~2e-13 м).")
@@ -695,6 +848,19 @@ def compare(py, js):
         bad = next(i for i in range(n) if py["offtrack"][i] != js["offtrack"][i])
         print("  РАСХОЖДЕНИЕ: флаг «вне трассы» разошёлся на шаге %d" % bad)
         ok = False
+    # Таблица множителей сцепления по погоде лежит в трёх местах
+    # (game/physics.py, static/js/physics.js, server/config.py). Разъехавшееся
+    # число здесь — не косметика, а рассинхрон предсказания в каждом повороте,
+    # поэтому две зеркальные копии сверяются машиной, а не глазами.
+    if dict(js.get("weather_grip") or {}) != dict(physics.WEATHER_GRIP):
+        print("  РАСХОЖДЕНИЕ: таблица WEATHER_GRIP разъехалась")
+        print("    python: %r" % (physics.WEATHER_GRIP,))
+        print("    js:     %r" % (js.get("weather_grip"),))
+        ok = False
+    else:
+        print("  таблица WEATHER_GRIP совпала: %s"
+              % ", ".join("%s %.2f" % (k, physics.WEATHER_GRIP[k])
+                          for k in sorted(physics.WEATHER_GRIP)))
     if py["lap"] != js["lap"]:
         print("  РАСХОЖДЕНИЕ: круги не совпали (%d против %d)"
               % (py["lap"], js["lap"]))
@@ -819,7 +985,8 @@ class NullTrack:
     __slots__ = ()
 
     def clamp_to_track(self, state, hint):
-        pass
+        # трамплинов нет — высота полотна под машиной всегда нулевая
+        state.ramp_h = 0.0
 
     def advance_progress(self, state, hint):
         pass
@@ -1231,6 +1398,294 @@ def report_drift_guard():
     return ok
 
 
+# ---------------------------------------------------------------------------
+# Трамплин: вертикальная ось, свободный полёт, цена посадки (6.2, шаг 14б)
+# ---------------------------------------------------------------------------
+# Раздел 4 раньше говорил «высота на физику не влияет». Теперь влияет ровно
+# в одном месте — баллистике прыжка, — и всё, что ниже, это постоянная охрана
+# трёх обещаний, данных при добавлении вертикали:
+#
+#   1. в воздухе управления почти нет: горизонтальная скорость сохраняется
+#      бит в бит, газ не разгоняет, руль только доворачивает курс;
+#   2. в воздухе НЕ копится заряд заноса (четвёртый барьер к трём из 12.15);
+#   3. посадка платная ровно тогда, когда заход был кривой, и бесплатная,
+#      когда прямой.
+#
+# Если кто-нибудь вернёт шаг 10 или шаг 11 в полёт, первые же строки покажут
+# это: скорость в воздухе перестанет быть постоянной.
+
+JUMP_RUN_UP_Z = 1360.0          # с какого z начинается подъезд к трамплину
+JUMP_ENTRY_SPEED = 34.0         # м/с в начале подъезда
+
+
+def _jump_run(pilot, x0=0.0, yaw0=0.0, speed=JUMP_ENTRY_SPEED, steps=400,
+              inject=None):
+    """Проехать через трамплин заглушки и снять всё, что нужно проверкам.
+
+    ``pilot(i, state, airborne)`` возвращает маску кнопок, ``inject`` —
+    необязательная пара (номер шага полёта, функция от состояния).
+    """
+    stats = CarStats(**HATCH_STATS)
+    track = StubTrack()
+    state = CarState(x0, JUMP_RUN_UP_Z, yaw0)
+    state.vx = speed * sin(yaw0)
+    state.vz = speed * cos(yaw0)
+    track.last_s = JUMP_RUN_UP_Z
+
+    out = {
+        "air": 0, "apex": 0.0, "v_in": 0.0, "v_up": 0.0, "v_out": 0.0,
+        "yaw_in": 0.0, "yaw_turn": 0.0, "dir_drift": 0.0, "speed_drift": 0.0,
+        "charge": 0.0, "sliding": False, "boosts": 0, "stun": 0.0,
+        "off_in_air": False, "off_after": False, "x_in_air": 0.0,
+        "dist": 0.0, "x0": 0.0, "z0": 0.0, "took_off": False,
+    }
+    was_air = False
+    air_i = 0
+    dir_x = dir_z = 0.0
+    landed_at = None
+    for i in range(steps):
+        level = physics.step(state, stats, pilot(i, state, state.airborne),
+                             physics.DT, track, state.sample_idx)
+        if state.airborne:
+            if not was_air:
+                out["took_off"] = True
+                out["v_in"] = hypot(state.vx, state.vz)
+                out["v_up"] = state.v_vert
+                out["yaw_in"] = state.yaw
+                out["x0"] = state.x
+                out["z0"] = state.z
+                dir_x = state.vx
+                dir_z = state.vz
+                air_i = 0
+            out["air"] += 1
+            if state.height > out["apex"]:
+                out["apex"] = state.height
+            v = hypot(state.vx, state.vz)
+            d = abs(v - out["v_in"])
+            if d > out["speed_drift"]:
+                out["speed_drift"] = d
+            # покомпонентный уход мировой скорости от той, что была на
+            # отрыве. Меряем именно компоненты, а не угол: угол пришлось бы
+            # считать через нормировку, и её собственное округление дало бы
+            # 5e-15 на ровном месте — а здесь ожидается ТОЧНЫЙ ноль.
+            ddx = state.vx - dir_x
+            ddz = state.vz - dir_z
+            c = (-ddx if ddx < 0.0 else ddx) + (-ddz if ddz < 0.0 else ddz)
+            if c > out["dir_drift"]:
+                out["dir_drift"] = c
+            turn = abs(state.yaw - out["yaw_in"])
+            if turn > out["yaw_turn"]:
+                out["yaw_turn"] = turn
+            if state.drift_charge > out["charge"]:
+                out["charge"] = state.drift_charge
+            if state.drift_active:
+                out["sliding"] = True
+            if state.offtrack:
+                out["off_in_air"] = True
+            if level:
+                out["boosts"] += 1
+            if inject is not None and air_i == inject[0]:
+                inject[1](state)
+            out["x_in_air"] = state.x
+            air_i += 1
+        if was_air and not state.airborne:
+            out["v_out"] = hypot(state.vx, state.vz)
+            out["stun"] = state.land_stun
+            out["dist"] = hypot(state.x - out["x0"], state.z - out["z0"])
+            landed_at = i
+        if landed_at is not None and i == landed_at + 1:
+            # первый шаг уже на земле: здесь и выясняется, куда приземлились
+            out["off_after"] = state.offtrack
+            out["x_after"] = state.x
+            break
+        was_air = state.airborne
+    out["state"] = state
+    return out
+
+
+def _pilot_gas(i, state, airborne):
+    return GAS
+
+
+def _pilot_air_handbrake(i, state, airborne):
+    """Газ, а в воздухе ещё и полный руль с зажатым ручником.
+
+    На подъезде ручник не трогаем намеренно: зажатый заранее, он уводит
+    машину с трамплина, и фаза выродилась бы в «прыжка не было».
+    """
+    if airborne:
+        return GAS | LEFT | HANDBRAKE
+    return GAS
+
+
+def _pilot_air_fix(i, state, airborne):
+    """Газ, а в воздухе — доворот носом по вектору скорости.
+
+    Производная бокового скольжения по курсу равна -v_fwd, значит рост yaw
+    (кнопка «влево») уменьшает положительное скольжение. Это ровно то, для
+    чего в полёте вообще оставлен руль.
+    """
+    if not airborne:
+        return GAS
+    fx = sin(state.yaw)
+    fz = cos(state.yaw)
+    lat = state.vx * fz - state.vz * fx
+    if lat > 0.2:
+        return GAS | LEFT
+    if lat < -0.2:
+        return GAS | RIGHT
+    return GAS
+
+
+def _kick_yaw(value):
+    def apply(state):
+        state.yaw += value
+    return apply
+
+
+def _ground_gain(seconds, speed=JUMP_ENTRY_SPEED):
+    """Сколько та же машина набрала бы за то же время НА ЗЕМЛЕ, м/с."""
+    stats = CarStats(**HATCH_STATS)
+    track = NullTrack()
+    state = CarState(0.0, 0.0, 0.0)
+    state.vz = speed
+    for _ in range(int(seconds / physics.DT + 0.5)):
+        physics.step(state, stats, GAS, physics.DT, track, 0)
+    return hypot(state.vx, state.vz) - speed
+
+
+def report_jump():
+    """Трамплин и полёт: постоянные проверки. False — что-то сломалось."""
+    print("  трамплин (въезд %.0f м под уклон %.2f, кромка на %.2f м; "
+          "тяготение %.1f м/с²):"
+          % (StubTrack.RAMP_LEN, StubTrack.RAMP_SLOPE,
+             StubTrack.RAMP_LEN * StubTrack.RAMP_SLOPE, physics.GRAVITY))
+    ok = True
+
+    def check(mark, name, extra=""):
+        nonlocal ok
+        if not mark:
+            ok = False
+        print("    [%s] %-46s %s" % ("ок" if mark else "ПРОВАЛ", name, extra))
+
+    # 1. Отрыв вообще случается, и прыжок похож на прыжок, а не на кочку.
+    plain = _jump_run(_pilot_gas)
+    air_s = plain["air"] / 60.0
+    check(plain["took_off"] and 0.8 < air_s < 1.8 and 1.2 < plain["apex"] < 4.0
+          and 25.0 < plain["dist"] < 80.0,
+          "трамплин отрывает машину от земли",
+          "отрыв %.2f м/с вверх, верх %.2f м, в воздухе %.2f с, дальность %.1f м"
+          % (plain["v_up"], plain["apex"], air_s, plain["dist"]))
+
+    # 2. Свободный полёт: горизонтальная скорость сохраняется. Шаги 10 и 11
+    #    в воздухе пропущены целиком, а шаги 5 и 12 раскладывают и собирают
+    #    скорость в ОДНОМ И ТОМ ЖЕ базисе, так что менять её нечему.
+    #    Алгебраически это тождество; в float64 разложить и собрать обратно
+    #    стоит около 1e-16 относительной ошибки на шаг, потому что fx² + fz²
+    #    не ровно единица. За весь полёт набегает 1e-13 м/с — на два порядка
+    #    меньше, чем расхождение Python и JS по позиции, и одинаково в обеих
+    #    реализациях. Допуск здесь про это, а не про «примерно сохраняется».
+    check(plain["speed_drift"] < AIR_KEEP_TOL and plain["dir_drift"] < AIR_KEEP_TOL,
+          "в полёте скорость сохраняется",
+          "изменение модуля %.3e м/с, увод вектора %.3e м/с (допуск %.0e)"
+          % (plain["speed_drift"], plain["dir_drift"], AIR_KEEP_TOL))
+
+    # 3. Газ в воздухе не разгоняет — и это стоит игроку разгона, который он
+    #    сделал бы на земле. Ради этого числа проверка и существует: прыжок
+    #    обязан чего-то стоить, иначе он бесплатный.
+    gain = _ground_gain(air_s)
+    check(plain["v_out"] - plain["v_in"] < AIR_KEEP_TOL and gain > 1.0,
+          "газ в воздухе не разгоняет",
+          "за те же %.2f с на земле машина набрала бы +%.1f м/с" % (air_s, gain))
+
+    # 4. Руль в воздухе крутит ТОЛЬКО курс: вектор скорости не шелохнётся.
+    turned = _jump_run(lambda i, st, air: (GAS | LEFT) if air else GAS)
+    check(turned["took_off"] and turned["dir_drift"] < AIR_KEEP_TOL
+          and degrees(turned["yaw_turn"]) > 8.0,
+          "руль в воздухе доворачивает курс, но не траекторию",
+          "курс довёрнут на %.1f°, вектор скорости ушёл на %.3e м/с"
+          % (degrees(turned["yaw_turn"]), turned["dir_drift"]))
+
+    # 5. Доворота хватает выровнять машину и не хватает развернуть её.
+    check(turned["took_off"] and degrees(turned["yaw_turn"]) < 35.0,
+          "доворота в воздухе не хватает на разворот",
+          "полный лок за весь полёт даёт %.1f°" % degrees(turned["yaw_turn"]))
+
+    # 6. Заряд заноса в воздухе не копится и занос не начинается — четвёртый
+    #    барьер к трём из 12.15. Ручник в воздухе заглушен шагом 1, а шаг 15
+    #    сжигает копилку без награды.
+    hand = _jump_run(_pilot_air_handbrake)
+    check(hand["took_off"] and hand["charge"] == 0.0 and not hand["sliding"]
+          and hand["boosts"] == 0,
+          "в воздухе заряд заноса не копится",
+          "ручник и полный руль весь полёт: пик заряда %.3f с, заносов %d, "
+          "ускорений %d"
+          % (hand["charge"], 1 if hand["sliding"] else 0, hand["boosts"]))
+
+    # 6б. И копилка, принесённая на трамплин, в воздухе сгорает без награды:
+    #     иначе прыжок стал бы способом обналичить заряд там, где за занос
+    #     уже ничем не платишь.
+    def bring_charge(state):
+        state.drift_charge = 3.0        # выше третьего уровня
+        state.drift_active = True
+
+    carried = _jump_run(_pilot_air_handbrake, inject=(0, bring_charge))
+    st = carried["state"]
+    check(carried["took_off"] and carried["boosts"] == 0
+          and st.drift_charge == 0.0 and not st.drift_active,
+          "заряд, принесённый в прыжок, сгорает без награды",
+          "занос с копилкой 3.00 с на отрыве: ускорений %d, осталось %.2f с"
+          % (carried["boosts"], st.drift_charge))
+
+    # 7. Прямая посадка не стоит ничего.
+    check(plain["v_in"] - plain["v_out"] < AIR_KEEP_TOL and plain["stun"] == 0.0,
+          "прямая посадка не стоит ничего",
+          "%.1f -> %.1f м/с, потери управления нет"
+          % (plain["v_in"], plain["v_out"]))
+
+    # 8. Кривая посадка стоит скорости и управления. Курс подкручивается
+    #    в середине полёта: мировая скорость от этого не меняется, зато
+    #    машина прилетает боком — ровно то, что и должно наказываться.
+    crook = _jump_run(_pilot_gas, inject=(20, _kick_yaw(0.32)))
+    loss = (1.0 - crook["v_out"] / crook["v_in"]) * 100.0
+    check(loss > 8.0 and crook["stun"] > 0.0,
+          "посадка боком стоит скорости и управления",
+          "перекос 18°: %.1f -> %.1f м/с (−%.0f %%), без управления %.2f с"
+          % (crook["v_in"], crook["v_out"], loss, crook["stun"]))
+
+    # 9. И спасается доворотом — иначе доворот был бы украшением.
+    saved = _jump_run(_pilot_air_fix, inject=(20, _kick_yaw(0.32)))
+    saved_loss = (1.0 - saved["v_out"] / saved["v_in"]) * 100.0
+    check(saved_loss < 1.0 and saved["stun"] == 0.0,
+          "тот же перекос спасается доворотом в воздухе",
+          "потеря %.1f %% вместо %.0f %%, потери управления нет"
+          % (saved_loss, loss))
+
+    # 10. В полёте границ трассы нет: машина летит НАД ними. Проверяем в лоб —
+    #     в середине полёта уносим её за стену коридора и смотрим, что её
+    #     никто не вытолкнул и флаг «вне трассы» не поднялся.
+    def fly_out(state):
+        state.x = StubTrack.WALL_LIMIT + 10.0
+
+    over = _jump_run(_pilot_gas, inject=(20, fly_out))
+    check(over["x_in_air"] == StubTrack.WALL_LIMIT + 10.0
+          and not over["off_in_air"],
+          "в полёте границы трассы не действуют",
+          "унесло на x = %.1f (стена на %.1f), выталкивания нет, флаг «вне "
+          "трассы» снят" % (over["x_in_air"], StubTrack.WALL_LIMIT))
+
+    # 11. А вот приземление за полотном карается как обычный вылет: на первом
+    #     же шаге на земле работает и стена, и флаг.
+    check(over["off_after"] and over["x_after"] <= StubTrack.WALL_LIMIT,
+          "приземление за полотном карается как обычный вылет",
+          "после посадки x = %.1f, флаг «вне трассы» поднят"
+          % over["x_after"])
+
+    if not ok:
+        print("  ОШИБКА: вертикальная ось ведёт себя не так, как обещано")
+    return ok
+
+
 def main():
     print("Проверка совпадения физики Python и JS")
     print("  шагов в сценарии: %d (%.1f с игрового времени)"
@@ -1276,6 +1731,10 @@ def main():
 
     print()
     if not report_drift_guard():
+        ok = False
+
+    print()
+    if not report_jump():
         ok = False
 
     print()

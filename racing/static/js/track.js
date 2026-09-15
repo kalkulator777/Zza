@@ -14,6 +14,11 @@
 //
 // Аллокаций в горячих методах ноль: surface() заполняет заранее выделенный
 // объект-приёмник и возвращает его же.
+//
+// Трамплины (правка контракта к 7.1 и 12.1): поле ramps формата 12.1 —
+// уже выведенная геометрия въезда, по которой clampToTrack пишет в
+// state.rampH высоту полотна трамплина под машиной. Читает её шаг 14б
+// физики в том же шаге. Формат и смысл полей — в game/track.py.
 
 export const CHECKPOINT_COUNT = 12;
 
@@ -25,6 +30,13 @@ const LOST_D2 = LOST_DISTANCE * LOST_DISTANCE;
 
 export const WALL_MARGIN = 2.5;      // зона вылета за кромкой асфальта, м
 export const WALL_BOUNCE = 0.35;     // отражение нормальной скорости (6.4)
+
+// Трамплины: боковой скос, на котором высота сходит на нет. Зеркало
+// RAMP_EDGE из game/track.py. Вся остальная геометрия трамплина приезжает
+// с сервера готовыми числами (поле ramps формата 12.1), в том числе тангенс
+// угла въезда: считать его на двух реализациях — верный способ разойтись
+// в последнем разряде.
+export const RAMP_EDGE = 1.0;        // м, боковой скос трамплина
 
 const LAP_EPS = 1e-9;                // запас при floor(progress / length)
 
@@ -78,6 +90,33 @@ export class Track {
 
         this.itemBoxes = data.item_boxes;
         this.startGrid = data.start_grid;
+
+        // Трамплины. Плоские параллельные массивы, а не список объектов:
+        // clampToTrack зовётся 60 раз в секунду и обязана обходиться без
+        // разыменований по ключам. Float64Array, а НЕ Float32Array: сервер
+        // считает по этим же числам в float64, и округлять их до float32
+        // здесь значило бы разъехаться с ним на ровном месте (у массивов
+        // осевой линии всё наоборот — там float32 как раз и есть общий вид).
+        const ramps = data.ramps || [];
+        const rn = ramps.length;
+        this.rampCount = rn;
+        this.ramps = ramps;
+        this.rampS0 = new Float64Array(rn);
+        this.rampSpan = new Float64Array(rn);
+        this.rampSlope = new Float64Array(rn);
+        this.rampOff = new Float64Array(rn);
+        this.rampHw = new Float64Array(rn);
+        this.rampRise = new Float64Array(rn);
+        for (let k = 0; k < rn; k++) {
+            const r = ramps[k];
+            this.rampS0[k] = r.s0;
+            this.rampSpan[k] = r.length;
+            this.rampSlope[k] = r.slope;
+            this.rampOff[k] = r.offset;
+            this.rampHw[k] = r.half_width;
+            this.rampRise[k] = r.rise;
+        }
+        this.rampInvEdge = 1.0 / RAMP_EDGE;
 
         // приёмник для surface(): один на трассу, новых объектов в кадре нет
         this.surf = { index: 0, lateral: 0.0, halfWidth: 0.0, y: 0.0, pitch: 0.0 };
@@ -183,10 +222,52 @@ export class Track {
     }
 
     /**
+     * Высота полотна трамплина под машиной, м. Ноль — трамплина здесь нет.
+     * index / lateral / along — то, что уже посчитала clampToTrack.
+     *
+     * Профиль: вдоль трассы высота растёт линейно от нуля на въезде до rise
+     * на кромке вылета, поперёк — держится по всей ширине и сходит на нет
+     * на боковом скосе RAMP_EDGE. Скос нужен не для красоты: без него въезд
+     * сбоку давал бы мгновенную ступеньку.
+     */
+    rampHeight(index, lateral, along) {
+        const length = this.length;
+        const s = this.cs[index] + along;
+        let best = 0.0;
+        const count = this.rampCount;
+        for (let k = 0; k < count; k++) {
+            let ds = s - this.rampS0[k];
+            if (ds < 0.0) {
+                ds += length;
+            } else if (ds >= length) {
+                ds -= length;
+            }
+            if (ds <= this.rampSpan[k]) {
+                let du = lateral - this.rampOff[k];
+                if (du < 0.0) { du = -du; }
+                const edge = this.rampHw[k] - du;
+                if (edge > 0.0) {
+                    let h = this.rampSlope[k] * ds;
+                    if (edge < RAMP_EDGE) {
+                        h *= edge * this.rampInvEdge;
+                    }
+                    if (h > best) { best = h; }
+                }
+            }
+        }
+        return best;
+    }
+
+    /**
      * Шаг 14 физики: выталкивание из стены, гашение скорости.
      * Полотно halfWidth — асфальт, дальше зона вылета шириной WALL_MARGIN
      * (там уже стоит offtrack, его читает шаг 11), за ней — жёсткая стена.
-     * Обновляет: x, z, vx, vz, sampleIdx, offtrack.
+     * Обновляет: x, z, vx, vz, sampleIdx, offtrack, rampH.
+     *
+     * В полёте (state.airborne) границы не действуют: машина летит НАД ними.
+     * Флаг offtrack при этом снят — травы под колёсами нет, пока колёс
+     * на земле нет. Приземление за кромкой наказывается обычным путём,
+     * уже на следующем шаге.
      */
     clampToTrack(state, hint) {
         const s = this.surface(state.x, state.z, hint);
@@ -194,6 +275,21 @@ export class Track {
         const lateral = s.lateral;
         const halfWidth = s.halfWidth;
         state.sampleIdx = i;
+        // Высота трамплина под машиной — для шага 14б. Считается до
+        // выталкивания: трамплин лежит на асфальте, а выталкивание случается
+        // только за зоной вылета, то есть заведомо мимо любого трамплина.
+        if (this.rampCount) {
+            const dx = state.x - this.cx[i];
+            const dz = state.z - this.cz[i];
+            const along = dx * this.ctx[i] + dz * this.ctz[i];
+            state.rampH = this.rampHeight(i, lateral, along);
+        } else {
+            state.rampH = 0.0;
+        }
+        if (state.airborne) {
+            state.offtrack = false;
+            return;
+        }
         state.offtrack = lateral > halfWidth || lateral < -halfWidth;
         const limit = halfWidth + WALL_MARGIN;
         let over = 0.0;

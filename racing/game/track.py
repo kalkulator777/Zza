@@ -14,6 +14,15 @@ forward = (sin yaw, cos yaw), right = (cos yaw, -sin yaw). Отсюда для �
 Клиент кладёт присланные числа в Float32Array, то есть получает ровно ``_c*``.
 Счёт на обеих сторонах идёт в float64 над одинаковыми входными числами, поэтому
 nearest_index / surface / clamp_to_track / advance_progress сходятся бит в бит.
+
+Трамплины (правка контракта к разделам 7.1 и 12.1). Поле ``ramps`` в описании
+трассы — это въезд под углом, с которого машина уходит в свободный полёт
+(шаг 14б в ``game/physics.py``). Формат и пределы — у констант ``RAMP_*``
+ниже. Производная геометрия считается на загрузке (в том числе тангенс угла:
+в шаге физики тригонометрии быть не может) и уезжает клиенту готовыми
+числами в ``to_client()``. Во время гонки трамплин стоит ровно одно
+обращение: ``clamp_to_track`` пишет высоту полотна трамплина под машиной
+в ``state.ramp_h``, и шаг 14б читает её в том же шаге.
 """
 
 from __future__ import annotations
@@ -53,6 +62,28 @@ GRID_LANE_FRACTION = 0.42  # доля половины ширины под см�
 GRID_LANE_MAX = 3.4        # м, дальше от оси не отходим даже на широкой трассе
 
 ITEM_ROW_SPREAD = 0.72     # доля половины ширины, по которой раскидан ряд боксов
+
+# --- трамплины --------------------------------------------------------------
+# Описание в JSON трассы (поле `ramps`), по одному объекту на трамплин:
+#
+#   {"at": 0.412, "angle": 11.5, "rise": 1.25, "half_width": 4.2,
+#    "offset": 0.0, "note": "..."}
+#
+#   at          доля круга, на которой стоит КРОМКА ВЫЛЕТА (0..1). Въезд
+#               лежит ПЕРЕД ней, то есть трамплин занимает [at*L - length, at*L]
+#   angle       угол въезда, градусы (3..20)
+#   rise        высота кромки над полотном, м (0.2..3.0)
+#   half_width  половина ширины трамплина, м
+#   offset      смещение центра трамплина от оси полотна, м, плюс — влево
+#               (раздел 4); необязательное, по умолчанию 0
+#
+# Длина въезда выводится: length = rise / tan(angle). Тангенс считается ЗДЕСЬ,
+# на загрузке, и уезжает к клиенту готовым числом — в шаге физики никаких
+# тригонометрий нет и быть не может (раздел 6).
+RAMP_EDGE = 1.0            # м, боковой скос трамплина: высота сходит на нет
+RAMP_ANGLE_LIMITS = (3.0, 20.0)     # градусы
+RAMP_RISE_LIMITS = (0.2, 3.0)       # м
+RAMP_HALF_WIDTH_MIN = 1.5           # м
 
 # Время суток, предложенное описанием трассы (§12.16). Это ТОЛЬКО умолчание:
 # настоящее время суток выбирается в лобби и живёт в настройках комнаты.
@@ -237,6 +268,7 @@ class Track(object):
 
         self.item_boxes = self._build_item_boxes(data.get('item_rows', ()))
         self.start_grid = self._build_start_grid()
+        self._build_ramps(data.get('ramps', ()))
         self._client = None
 
     # ------------------------------------------------------- служебные куски
@@ -261,6 +293,108 @@ class Track(object):
                     's': self._js[idx],
                 })
         return boxes
+
+    def _build_ramps(self, rows):
+        """Трамплины: из описания в JSON — в плоские массивы для шага физики.
+
+        Хранится всё, что нужно посчитать высоту полотна трамплина под
+        машиной, и ничего лишнего. Массивы плоские и параллельные, а не
+        список словарей: ``clamp_to_track`` зовётся 480 раз в секунду и
+        обязана обходиться без разыменований по ключам и без аллокаций.
+
+        Зеркальная трасса (``mirror``) трамплинов не трогает: доля круга и
+        длина при отражении не меняются, а ``offset`` отсчитывается от оси
+        полотна, и его знак вместе с нормалью отражается сам.
+        """
+        length = self.length
+        s0 = []
+        span = []
+        slope = []
+        off = []
+        hw = []
+        rise = []
+        public = []
+        for row in rows:
+            at = float(row['at']) % 1.0
+            angle = float(row['angle'])
+            r = float(row['rise'])
+            k = math.tan(math.radians(angle))
+            span_v = r / k
+            s_lip = at * length
+            s_start = s_lip - span_v
+            while s_start < 0.0:
+                s_start += length
+            o = float(row.get('offset', 0.0))
+            w = float(row['half_width'])
+            # округление — ровно то же число уедет клиенту в to_client(),
+            # и обе стороны будут считать по одинаковым битам
+            s_start = round(s_start, 6)
+            span_v = round(span_v, 6)
+            k = round(k, 9)
+            o = round(o, 6)
+            w = round(w, 6)
+            r = round(r, 6)
+            s0.append(s_start)
+            span.append(span_v)
+            slope.append(k)
+            off.append(o)
+            hw.append(w)
+            rise.append(r)
+            public.append({
+                'at': round(at, 6),
+                's0': s_start,
+                'length': span_v,
+                'slope': k,
+                'offset': o,
+                'half_width': w,
+                'rise': r,
+            })
+        self._ramp_s0 = s0
+        self._ramp_span = span
+        self._ramp_slope = slope
+        self._ramp_off = off
+        self._ramp_hw = hw
+        self._ramp_rise = rise
+        self._ramp_count = len(s0)
+        self._ramp_inv_edge = 1.0 / RAMP_EDGE
+        self.ramps = public
+
+    def ramp_height(self, index: int, lateral: float, along: float) -> float:
+        """Высота полотна трамплина под машиной, м. Ноль — трамплина нет.
+
+        ``index`` / ``lateral`` / ``along`` — то, что уже посчитала
+        ``clamp_to_track``: индекс ближайшей точки, смещение от оси и
+        смещение вдоль касательной. Своего поиска здесь нет.
+
+        Профиль: вдоль трассы высота растёт линейно от нуля на въезде до
+        ``rise`` на кромке вылета, поперёк — держится по всей ширине и
+        сходит на нет на боковом скосе ``RAMP_EDGE``. Скос нужен не для
+        красоты: без него въезд сбоку давал бы мгновенную ступеньку.
+        """
+        length = self.length
+        s = self._cs[index] + along
+        best = 0.0
+        k = 0
+        count = self._ramp_count
+        while k < count:
+            ds = s - self._ramp_s0[k]
+            if ds < 0.0:
+                ds += length
+            elif ds >= length:
+                ds -= length
+            if ds <= self._ramp_span[k]:
+                du = lateral - self._ramp_off[k]
+                if du < 0.0:
+                    du = -du
+                edge = self._ramp_hw[k] - du
+                if edge > 0.0:
+                    h = self._ramp_slope[k] * ds
+                    if edge < RAMP_EDGE:
+                        h *= edge * self._ramp_inv_edge
+                    if h > best:
+                        best = h
+            k += 1
+        return best
 
     def _build_start_grid(self):
         """Восемь мест: две шахматные колонны позади линии старта."""
@@ -405,10 +539,29 @@ class Track(object):
         Полотно шириной ``half_width`` — асфальт. Дальше идёт зона вылета
         шириной WALL_MARGIN: там уже выставлен флаг ``offtrack`` (его читает
         шаг 11 на следующем шаге), но машина ещё едет. За ней — жёсткая стена.
-        Обновляет: x, z, vx, vz, sample_idx, offtrack.
+        Обновляет: x, z, vx, vz, sample_idx, offtrack, ramp_h.
+
+        В полёте (``state.airborne``) границы не действуют: машина летит НАД
+        ними, выталкивать её неоткуда. Флаг ``offtrack`` при этом снят —
+        травы под колёсами нет, пока колёс на земле нет. Приземление за
+        кромкой наказывается обычным путём: на следующем шаге машина уже
+        на земле, и всё это заработает как всегда.
         """
         i, lateral, half_width, _y, _pitch = self.surface(state.x, state.z, hint)
         state.sample_idx = i
+        # Высота полотна трамплина под машиной — для шага 14б. Считается до
+        # выталкивания: трамплин лежит на асфальте, а выталкивание случается
+        # только за зоной вылета, то есть заведомо мимо любого трамплина.
+        if self._ramp_count:
+            dx = state.x - self._cx[i]
+            dz = state.z - self._cz[i]
+            along = dx * self._ctx[i] + dz * self._ctz[i]
+            state.ramp_h = self.ramp_height(i, lateral, along)
+        else:
+            state.ramp_h = 0.0
+        if state.airborne:
+            state.offtrack = False
+            return
         state.offtrack = lateral > half_width or lateral < -half_width
         limit = half_width + WALL_MARGIN
         over = 0.0
@@ -578,6 +731,11 @@ class Track(object):
                 'checkpoints': self.checkpoints,
                 'item_boxes': self.item_boxes,
                 'start_grid': self.start_grid,
+                # Трамплины: уже выведенная геометрия, а не исходное описание.
+                # Клиенту нужны ровно те же числа, по которым считает сервер,
+                # а тангенс угла на двух реализациях мог бы разойтись
+                # в последнем разряде — поэтому он считается один раз здесь.
+                'ramps': self.ramps,
                 'decor_seed': self.decor_seed,
             }
         return self._client
@@ -789,6 +947,33 @@ def _validate(data):
             raise ValueError('item_rows: at вне 0..1')
         if not 1 <= int(row['count']) <= 9:
             raise ValueError('item_rows: count вне 1..9')
+    half_full = width * 0.5
+    for row in data.get('ramps', ()):
+        for field in ('at', 'angle', 'rise', 'half_width'):
+            if field not in row:
+                raise ValueError('ramps: нет поля %r' % field)
+        if not 0.0 <= float(row['at']) <= 1.0:
+            raise ValueError('ramps: at вне 0..1')
+        angle = float(row['angle'])
+        if not RAMP_ANGLE_LIMITS[0] <= angle <= RAMP_ANGLE_LIMITS[1]:
+            raise ValueError('ramps: angle %r вне %g..%g градусов'
+                             % (angle, RAMP_ANGLE_LIMITS[0], RAMP_ANGLE_LIMITS[1]))
+        rise = float(row['rise'])
+        if not RAMP_RISE_LIMITS[0] <= rise <= RAMP_RISE_LIMITS[1]:
+            raise ValueError('ramps: rise %r вне %g..%g м'
+                             % (rise, RAMP_RISE_LIMITS[0], RAMP_RISE_LIMITS[1]))
+        hw = float(row['half_width'])
+        if hw < RAMP_HALF_WIDTH_MIN:
+            raise ValueError('ramps: half_width %r меньше %g м'
+                             % (hw, RAMP_HALF_WIDTH_MIN))
+        # Трамплин обязан помещаться в полотно: улететь с него мимо трассы
+        # игрок должен по своей вине, а не потому, что он так построен.
+        # Проверка идёт по НОМИНАЛЬНОЙ ширине; сужения width_overrides
+        # проверяются уже на геометрии, в тесте трассы.
+        if abs(float(row.get('offset', 0.0))) + hw > half_full:
+            raise ValueError('ramps: трамплин шире полотна (offset %r + '
+                             'half_width %r > %g м)'
+                             % (row.get('offset', 0.0), hw, half_full))
 
 
 _CATALOG_CACHE = {}

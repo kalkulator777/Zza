@@ -10,7 +10,10 @@
 //     затухания заданы сразу «на шаг» при фиксированном dt = 1/60;
 //   * внутри шага ноль аллокаций: ни массивов, ни объектов, ни замыканий,
 //     ни деструктуризации. Состояние — плоские поля объекта из createCarState;
-//   * высота (y) на физику не влияет, всё считается в плоскости (x, z).
+//   * положение на трассе считается строго в плоскости (x, z). Вертикаль
+//     появилась ровно под баллистику прыжка с трамплина (шаг 14б) и меряется
+//     ОТ ПОЛОТНА, поэтому профиль высот трассы на движение не влияет
+//     (раздел 4). Подробности — в докстринге game/physics.py.
 //
 // Имена полей состояния здесь в camelCase (driftCharge, boostTime, sampleIdx),
 // как и имена методов трассы в разделе 7.3 (nearestIndex, clampToTrack).
@@ -33,6 +36,19 @@
 // driftDir в снапшот НЕ едет: клиент считает её сам тем же шагом. Кольцо
 // предсказания в net.js обязано сохранять и восстанавливать это поле
 // вместе с driftCharge, иначе после реконсиляции сторона отстанет.
+//
+// ТО ЖЕ КАСАЕТСЯ ПОЛЁТА. Поля height, vVert, airborne и landStun несут
+// состояние между шагами и в снапшот не едут, поэтому кольцо предсказания
+// обязано сохранять и восстанавливать их наравне с driftDir — иначе после
+// реконсиляции машина приземлится посреди прыжка. Поле rampH исключение:
+// его пишет трасса в шаге 14 и читает шаг 14б В ТОМ ЖЕ шаге, между шагами
+// оно ничего не несёт и кольцу не нужно.
+//
+// Множитель сцепления от покрытия — state.gripMul, по умолчанию 1.0. Кольцу
+// предсказания он НЕ нужен: restoreState переписывает только перечисленные
+// поля, а погода за окно переигровки не меняется. resetCarState его тоже не
+// трогает: это свойство покрытия, а не движения машины. Полное обоснование
+// (и почему не характеристики) — в докстринге game/physics.py.
 
 // ---------------------------------------------------------------------------
 // КОНСТАНТЫ (раздел 6.4)
@@ -119,6 +135,52 @@ export const COLLISION_RESTITUTION = 0.35; // упругость обмена и
 export const CAR_RADIUS = 0.95;            // м, радиус капсулы = полуширина кузова
 export const CAR_AXIS_HALF = 1.05;         // м, полуотрезок капсулы вдоль оси
 
+// --- вертикальная ось: трамплины и свободный полёт (шаг 14б) ----------------
+// Одна степень свободы под баллистику прыжка и ничего больше: ни вращения
+// через крышу, ни подвески, ни влияния рельефа. Высота считается ОТ ПОЛОТНА.
+// Тяготение аркадное: на 9.81 прыжок висит 1.3 с и уезжает на 45 м, машина
+// успевает «зависнуть». 12.0 даёт ту же высоту при коротком читаемом полёте.
+export const GRAVITY = 12.0;               // м/с², тяготение для баллистики
+// Потолок вертикальной скорости отрыва. Без него скорость отрыва растёт
+// вместе со скоростью захода, и БЫСТРЫЙ заход сам себя наказывает жёсткой
+// посадкой. С потолком быстрее — значит дальше, а не больнее.
+export const RAMP_LIFT_MAX = 6.5;          // м/с, потолок вертикали на вылете
+// Руль в воздухе: 0.28..0.41 рад/с, то есть 18..26° за типичный полёт 1.1 с.
+// Хватит выровнять машину под посадку и не хватит развернуть её в воздухе.
+export const AIR_TURN_GAIN = 0.14;         // во сколько раз слабее руль в полёте
+
+// --- посадка ---------------------------------------------------------------
+// Приведённая скорость удара: вертикальная плюс боковое скольжение с весом.
+// Второе слагаемое и есть «хороший заход»: носом по ходу движения — мягко
+// на любой разумной скорости, боком на 12 м/с — плюс 6.6 м/с удара.
+export const LAND_SLIP_FACTOR = 0.55;      // вес |vLat| в скорости удара
+export const LAND_HARD_SPEED = 10.5;       // м/с, выше — посадка жёсткая
+export const LAND_SPEED_LOSS = 0.055;      // доля скорости за м/с сверх порога
+export const LAND_KEEP_MIN = 0.55;         // больше 45 % скорости не отнимаем
+export const LAND_STUN_TIME = 0.35;        // с потери управления после посадки
+
+// --- множитель сцепления от покрытия (крюк под погоду) ---------------------
+// Приходит снаружи, в характеристиках машины (carStats.gripMul), по умолчанию
+// 1.0. Домножает и предел поперечного ускорения в шаге 9, и гашение боковой
+// скорости в шаге 10. Рамки — защита шага 10 от чужого нуля или двойки.
+export const GRIP_MUL_MIN = 0.25;          // 1/4 сцепления — это уже лёд
+export const GRIP_MUL_MAX = 2.0;           // выше не бывает даже у слика
+
+// Готовые значения множителя по погоде. Таблица продублирована в
+// game/physics.py и в server/config.py (WEATHER_GRIP) — числа обязаны
+// совпадать ВО ВСЕХ ТРЁХ местах до последнего разряда. Разойдутся — сервер
+// и клиент посчитают разный поворот, и это будет не косметика, а рассинхрон
+// предсказания. Здесь лежит именно таблица, а не механика погоды: физика
+// умеет только домножать сцепление, а ставит его владелец погоды одной
+// строкой на машину:  state.gripMul = WEATHER_GRIP[weather];
+// 'fog' стоит единицей намеренно: туман — это видимость, а не покрытие.
+export const WEATHER_GRIP = Object.freeze({
+    clear: 1.0,
+    wet: 0.86,
+    snow: 0.72,
+    fog: 1.0,
+});
+
 // Биты ввода. Значения обязаны совпадать с BTN_* из static/js/protocol.js;
 // продублированы здесь, чтобы физика не тянула за собой сетевой модуль.
 export const BTN_THROTTLE = 1 << 0;
@@ -164,6 +226,16 @@ export const CAR_CONSTANTS = Object.freeze({
     COLLISION_RESTITUTION,
     CAR_RADIUS,
     CAR_AXIS_HALF,
+    GRAVITY,
+    RAMP_LIFT_MAX,
+    AIR_TURN_GAIN,
+    LAND_SLIP_FACTOR,
+    LAND_HARD_SPEED,
+    LAND_SPEED_LOSS,
+    LAND_KEEP_MIN,
+    LAND_STUN_TIME,
+    GRIP_MUL_MIN,
+    GRIP_MUL_MAX,
 });
 
 /**
@@ -192,6 +264,15 @@ export function createCarState(x, z, yaw) {
         offtrack: false,          // вне трассы (выставляет clampToTrack)
         lap: 0,                   // пройдено полных кругов (advanceProgress)
         checkpoint: 0,            // индекс следующей ожидаемой отсечки
+        // --- вертикальная ось: трамплины (шаг 14б)
+        height: 0.0,              // высота НАД ПОЛОТНОМ, м; 0 — колёса на земле
+        vVert: 0.0,               // вертикальная скорость, м/с
+        airborne: false,          // идёт свободный полёт
+        landStun: 0.0,            // остаток потери управления после посадки, с
+        rampH: 0.0,               // высота трамплина под машиной (пишет трасса)
+        // --- крюк под покрытие: 1.0 — сухой асфальт. resetCarState его НЕ
+        //     трогает, это свойство покрытия, а не движения машины
+        gripMul: 1.0,
     };
 }
 
@@ -215,6 +296,11 @@ export function resetCarState(state, x, z, yaw) {
     state.offtrack = false;
     state.lap = 0;
     state.checkpoint = 0;
+    state.height = 0.0;
+    state.vVert = 0.0;
+    state.airborne = false;
+    state.landStun = 0.0;
+    state.rampH = 0.0;
 }
 
 /** Скопировать чужое состояние поверх своего (реконсиляция, раздел 10.2). */
@@ -237,6 +323,12 @@ export function copyCarState(dst, src) {
     dst.offtrack = src.offtrack;
     dst.lap = src.lap;
     dst.checkpoint = src.checkpoint;
+    dst.height = src.height;
+    dst.vVert = src.vVert;
+    dst.airborne = src.airborne;
+    dst.landStun = src.landStun;
+    dst.rampH = src.rampH;
+    dst.gripMul = src.gripMul;
 }
 
 /**
@@ -283,10 +375,23 @@ export function step(state, carStats, buttons, dt, track, hint) {
     let driftDir = state.driftDir;       // сторона заноса с прошлого шага
     let vx = state.vx;
     let vz = state.vz;
+    // вертикальная ось: значения с конца прошлого шага
+    let airborne = state.airborne;
+    let height = state.height;
+    let vVert = state.vVert;
+    let landStun = state.landStun;
 
     const maxSpeed = carStats.maxSpeed;
     const boostSpeed = carStats.boostSpeed;
     const turnRate = carStats.turnRate;
+    // Множитель сцепления от покрытия. Читается один раз за шаг и сразу
+    // зажимается в рамки: дальше он просто домножает gripStep в шагах 9 и 10.
+    let gripMul = state.gripMul;
+    if (gripMul > GRIP_MUL_MAX) {
+        gripMul = GRIP_MUL_MAX;
+    } else if (gripMul < GRIP_MUL_MIN) {
+        gripMul = GRIP_MUL_MIN;
+    }
 
     let btnGas = buttons & BTN_THROTTLE;
     let btnBrake = buttons & BTN_BRAKE;
@@ -317,6 +422,29 @@ export function step(state, carStats, buttons, dt, track, hint) {
         if (shieldTime < 0.0) {
             shieldTime = 0.0;
         }
+    }
+    // шаг 1, расширение: жёсткая посадка ненадолго отбирает управление.
+    // В отличие от раскрутки после ракеты машину не крутит: она просто
+    // не слушается — ни газа, ни тормоза, ни руля, ни ручника.
+    if (landStun > 0.0) {
+        btnGas = 0;
+        btnBrake = 0;
+        btnLeft = 0;
+        btnRight = 0;
+        btnHandbrake = 0;
+        landStun -= dt;
+        if (landStun < 0.0) {
+            landStun = 0.0;
+        }
+    }
+    // шаг 1, расширение: в воздухе колёс на земле нет. Газ, тормоз и ручник
+    // не делают ничего; руль остаётся, но работает в AIR_TURN_GAIN раз слабее
+    // (шаг 9). Ручник глушится здесь же, поэтому шаг 15 в воздухе физически
+    // не может ни начать занос, ни накопить заряд.
+    if (airborne) {
+        btnGas = 0;
+        btnBrake = 0;
+        btnHandbrake = 0;
     }
 
     // шаг 2: целевой угол руля
@@ -402,15 +530,19 @@ export function step(state, carStats, buttons, dt, track, hint) {
     }
 
     // шаг 7: ускорение от бонуса (и от заноса — уровни 1..3)
+    // В воздухе «Турбо» не тянет: разгоняться нечем. Таймер при этом ТИКАЕТ,
+    // иначе прыжок стал бы способом придержать буст до удобного момента.
     if (boostTime > 0.0) {
-        const boostDelta = boostSpeed - vFwd;
-        const boostStep = BOOST_ACCEL * dt;
-        if (boostDelta > boostStep) {
-            vFwd += boostStep;
-        } else if (boostDelta < -boostStep) {
-            vFwd -= boostStep;
-        } else {
-            vFwd = boostSpeed;
+        if (!airborne) {
+            const boostDelta = boostSpeed - vFwd;
+            const boostStep = BOOST_ACCEL * dt;
+            if (boostDelta > boostStep) {
+                vFwd += boostStep;
+            } else if (boostDelta < -boostStep) {
+                vFwd -= boostStep;
+            } else {
+                vFwd = boostSpeed;
+            }
         }
         boostTime -= dt;
         if (boostTime < 0.0) {
@@ -419,8 +551,11 @@ export function step(state, carStats, buttons, dt, track, hint) {
     }
 
     // шаг 8: замедление от «Грозы»
+    // Симметрично шагу 7: в воздухе не тормозит, но таймер тикает.
     if (slowTime > 0.0) {
-        vFwd *= SLOW_FACTOR;
+        if (!airborne) {
+            vFwd *= SLOW_FACTOR;
+        }
         slowTime -= dt;
         if (slowTime < 0.0) {
             slowTime = 0.0;
@@ -454,35 +589,53 @@ export function step(state, carStats, buttons, dt, track, hint) {
     if (vFwd < 0.0) {
         turn = -turn;            // задним ходом руль работает наоборот
     }
-    if (sliding) {
-        turn *= HANDBRAKE_TURN_GAIN;
-    }
-    // шаг 9, расширение: предел по сцеплению. Поперечное ускорение в повороте
-    // есть |vFwd * turn|; выше aLatMax машина просто не поворачивает. Отсюда
-    // скорость в дуге радиуса R равна sqrt(aLatMax * R) — именно это делает
-    // gripStep характеристикой, а не украшением карточки машины. На ручнике
-    // потолок поднят: занос и нужен, чтобы повернуть круче, чем позволяет
-    // сцепление.
-    let latLimit = carStats.gripStep * GRIP_LAT_ACCEL;
-    if (sliding) {
-        latLimit *= HANDBRAKE_LAT_GAIN;
-    }
-    let turnCap;
-    if (absFwd > LAT_CAP_MIN_SPEED) {
-        turnCap = latLimit / absFwd;
+    if (airborne) {
+        // шаг 9 в воздухе: доворот под посадку, и только он. Ни скорости,
+        // ни сцепления здесь нет — предел по поперечному ускорению про шины
+        // и неприменим, ограничителем работает сам AIR_TURN_GAIN.
+        // Поворачивается ТОЛЬКО курс: вектор скорости не трогается, потому
+        // что шаг 10 в воздухе пропущен, а шаг 12 собирает скорость обратно
+        // в том же базисе (шаг 4), в котором её разложил шаг 5.
+        turn = steer * turnRate * AIR_TURN_GAIN;
     } else {
-        turnCap = latLimit / LAT_CAP_MIN_SPEED;
-    }
-    if (turn > turnCap) {
-        turn = turnCap;
-    } else if (turn < -turnCap) {
-        turn = -turnCap;
+        if (sliding) {
+            turn *= HANDBRAKE_TURN_GAIN;
+        }
+        // шаг 9, расширение: предел по сцеплению. Поперечное ускорение
+        // в повороте есть |vFwd * turn|; выше aLatMax машина просто не
+        // поворачивает. Отсюда скорость в дуге радиуса R равна
+        // sqrt(aLatMax * R) — именно это делает gripStep характеристикой,
+        // а не украшением карточки машины. На ручнике потолок поднят: занос
+        // и нужен, чтобы повернуть круче, чем позволяет сцепление.
+        // gripMul — крюк под покрытие: на мокром предел падает вместе с ним.
+        let latLimit = carStats.gripStep * gripMul * GRIP_LAT_ACCEL;
+        if (sliding) {
+            latLimit *= HANDBRAKE_LAT_GAIN;
+        }
+        let turnCap;
+        if (absFwd > LAT_CAP_MIN_SPEED) {
+            turnCap = latLimit / absFwd;
+        } else {
+            turnCap = latLimit / LAT_CAP_MIN_SPEED;
+        }
+        if (turn > turnCap) {
+            turn = turnCap;
+        } else if (turn < -turnCap) {
+            turn = -turnCap;
+        }
     }
     yaw += turn * dt;
 
     // шаг 10: боковое сцепление (на ручнике оно резко ниже)
-    if (sliding) {
-        vLat *= 1.0 - carStats.driftGripStep;
+    // В воздухе шаг пропущен целиком: сцепления нет, боковая скорость не
+    // гасится, и мировой вектор скорости остаётся тем, каким был на отрыве.
+    // Алгебраически это тождество (шаги 5 и 12 работают в одном базисе);
+    // в float64 круг «разложить и собрать» стоит 1e-16 на шаг, то есть
+    // 1e-13 м/с за весь полёт.
+    if (airborne) {
+        /* в полёте шины ни за что не держатся */
+    } else if (sliding) {
+        vLat *= 1.0 - carStats.driftGripStep * gripMul;
         // потолок угла скольжения: без него курс убегает от вектора скорости,
         // занос вырождается в раскрутку на месте и срывается сам (см. докстринг
         // game/physics.py). Срезанное не выбрасывается, а частью возвращается
@@ -497,14 +650,18 @@ export function step(state, carStats, buttons, dt, track, hint) {
             vLat = -maxLat;
         }
     } else {
-        vLat *= 1.0 - carStats.gripStep;
+        vLat *= 1.0 - carStats.gripStep * gripMul;
     }
 
     // шаг 11: сопротивление; вне трассы дополнительно вязнем
-    absFwd = vFwd < 0.0 ? -vFwd : vFwd;
-    vFwd -= (carStats.drag * vFwd * absFwd + carStats.roll * vFwd) * dt;
-    if (state.offtrack) {
-        vFwd *= OFFTRACK_FACTOR;
+    // В воздухе не действует ни то, ни другое: качению не по чему катиться,
+    // а трава под колёсами не считается, пока колёс на ней нет.
+    if (!airborne) {
+        absFwd = vFwd < 0.0 ? -vFwd : vFwd;
+        vFwd -= (carStats.drag * vFwd * absFwd + carStats.roll * vFwd) * dt;
+        if (state.offtrack) {
+            vFwd *= OFFTRACK_FACTOR;
+        }
     }
 
     // шаг 12: сборка скорости обратно в мировые координаты
@@ -528,15 +685,76 @@ export function step(state, carStats, buttons, dt, track, hint) {
     state.boostTime = boostTime;
 
     // шаг 14: границы трассы, выталкивание и гашение по WALL_BOUNCE
+    // В полёте границы не действуют (машина летит НАД ними): трасса видит
+    // state.airborne и ограничивается тем, что обновляет sampleIdx, снимает
+    // offtrack и пишет высоту трамплина под машиной в state.rampH.
     track.clampToTrack(state, hint);
+
+    // шаг 14б: вертикальная ось — трамплин, полёт, посадка
+    // Высота считается ОТ ПОЛОТНА. Пока машина на земле, её высоту диктует
+    // геометрия трамплина; как только полотно трамплина под машиной
+    // кончилось, а она ещё наверху — начинается свободный полёт.
+    const rampH = state.rampH;
+    if (airborne) {
+        vVert -= GRAVITY * dt;
+        height += vVert * dt;
+        if (height <= rampH) {
+            // посадка. Приведённая скорость удара: вертикальная плюс боковое
+            // скольжение с весом. Носом по ходу движения — мягко на любой
+            // разумной скорости; боком — потеря скорости и LAND_STUN_TIME
+            // без управления.
+            const absLat = vLat < 0.0 ? -vLat : vLat;
+            const impact = -vVert + LAND_SLIP_FACTOR * absLat;
+            if (impact > LAND_HARD_SPEED) {
+                let keep = 1.0 - LAND_SPEED_LOSS * (impact - LAND_HARD_SPEED);
+                if (keep < LAND_KEEP_MIN) {
+                    keep = LAND_KEEP_MIN;
+                }
+                state.vx *= keep;
+                state.vz *= keep;
+                landStun = LAND_STUN_TIME;
+            }
+            height = rampH;
+            vVert = 0.0;
+            airborne = false;
+        }
+    } else if (rampH > 0.0) {
+        // едем по въезду: высоту задаёт геометрия, а вертикальная скорость —
+        // это её приращение за шаг. Отдельно умножать на уклон не нужно:
+        // (rampH - height) / dt и есть slope * скорость вдоль трассы.
+        vVert = (rampH - height) / dt;
+        height = rampH;
+    } else if (height > 0.0) {
+        // полотно трамплина кончилось, машина ещё наверху — отрыв
+        if (vVert > RAMP_LIFT_MAX) {
+            vVert = RAMP_LIFT_MAX;
+        }
+        if (vVert > 0.0) {
+            airborne = true;
+        } else {
+            // съехали с трамплина вниз (назад или вбок) — просто на землю
+            height = 0.0;
+            vVert = 0.0;
+        }
+    } else {
+        height = 0.0;
+        vVert = 0.0;
+    }
+    state.height = height;
+    state.vVert = vVert;
+    state.airborne = airborne;
+    state.landStun = landStun;
 
     // (столкновения машина-машина считает только сервер, между шагами 14 и 15;
     //  клиент их не предсказывает, в шаг они не входят)
 
     // шаг 15: заряд заноса и награда за него (раздел 6.3)
     let level = 0;
-    if (spinning) {
-        // раскрутило — занос сбит, заряд сгорает без награды
+    if (spinning || airborne) {
+        // Раскрутило или оторвало от земли — занос сбит, заряд сгорает БЕЗ
+        // награды. Для полёта это четвёртый барьер к трём из 12.15: в воздухе
+        // заряд не копится (ручник заглушен в шаге 1), не сохраняется и не
+        // выплачивается.
         if (sliding) {
             state.driftActive = false;
         }

@@ -43,10 +43,15 @@
 
     car  = (slot, flags, x, z, yaw, vx, vz, lap, place, steer_q, drift_charge)
     proj = (proj_id, kind, x, z, yaw)
+    traf = (ident, s_q, lat_q, dyaw_q, spd_q)
+    evt  = (event_id, kind, phase, s_q, lat_q, hl_q, hw_q)
 
 Целочисленные поля должны быть уже приведены к диапазону: ``steer_q`` — через
 ``quantize_steer``, ``drift_charge`` — через ``quantize_drift_charge``,
-``flags`` — побитовое ИЛИ констант ``FLAG_*``.
+``flags`` — побитовое ИЛИ констант ``FLAG_*``; поля траффика и происшествий —
+через ``quantize_arc``, ``quantize_lateral``, ``quantize_angle``,
+``quantize_speed``, ``quantize_half_length``, ``quantize_half_width``.
+``ident`` болванки — ``traffic_id | (look << 4)``.
 """
 
 import struct
@@ -67,7 +72,9 @@ import struct
 #   off 0   u8    type = 0x10 (MSG_SNAPSHOT)
 #   off 1   u32   tick          номер тика сервера
 #   off 5   u32   ack_seq       ACK_OFFSET: единственное поле, зависящее от клиента
-#   off 9   u8    car_count
+#   off 9   u8    car_count     младшие 7 бит — число машин (0..8),
+#                               бит 7 (SNAPSHOT_FLAG_EXTRA) — есть ли за
+#                               маской боксов секции траффика и происшествий
 #   далее car_count записей по 26 байт:
 #     u8 slot, u8 flags, f32 x, f32 z, f32 yaw, f32 vx, f32 vz,
 #     u8 lap, u8 place, i8 steer_q (-127..127 <-> -1..1), u8 drift_charge (charge*100)
@@ -77,17 +84,46 @@ import struct
 #   u8 box_mask_len
 #   box_mask_len байт маски активных боксов:
 #     бокс i -> байт i >> 3, бит i & 7 (младший бит — первый бокс)
+#   --- дальше только если в car_count поднят бит 7 (FLAG_EXTRA) ---
+#   u8 traffic_count
+#   далее traffic_count записей по 6 байт (машины-болванки):
+#     u8 ident   младшие 4 бита — id в пуле, старшие 4 — вид (силуэт и цвет)
+#     u16 s_q    положение вдоль дуги трассы, s * 65535 / length
+#     i8 lat_q   смещение от оси, 0.1 м на единицу (+-12.7 м)
+#     i8 dyaw_q  курс МИНУС курс касательной трассы, pi/127 на единицу
+#     u8 spd_q   модуль скорости, 0.25 м/с на единицу (0..63.75)
+#   u8 event_count
+#   далее event_count записей по 8 байт (происшествия на дороге):
+#     u8 id, u8 kind, u8 phase,
+#     u16 s_q    центр вдоль дуги, как у траффика
+#     i8 lat_q   центр поперёк, 0.1 м
+#     u8 hl_q    полудлина вдоль трассы, 0.25 м на единицу
+#     u8 hw_q    полуширина поперёк трассы, 0.1 м на единицу
 #
 # buttons:   0 газ, 1 тормоз/задний ход, 2 влево, 3 вправо,
 #            4 дрифт (ручник), 5 применить бонус, 6 взгляд назад, 7 резерв
 # car flags: 0 вне трассы, 1 дрифтует, 2 ускорение, 3 крутит (урон),
 #            4 щит, 5 финишировал, 6 призрак (отключился), 7 тормозит
 #
-# Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len.
-# Для 8 машин, 4 снарядов и маски в 2 байта это 282 байта (5,6 КБ/с на клиента
-# при 20 Гц). В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
+# Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len,
+# и ЕСЛИ есть траффик или происшествия, ещё + 1 + 6*traffic_count
+#                                            + 1 + 8*event_count.
+# Для 8 машин, 4 снарядов и маски в 2 байта без траффика и происшествий это
+# ровно прежние 282 байта, байт в байт: выключенная настройка не стоит НИ
+# ОДНОГО лишнего байта, за это и отвечает флаг в car_count. Плотный траффик
+# (12 машин) добавляет 1 + 72 = 73 байта, шесть происшествий — ещё 1 + 48 = 49.
+# Потолок наполнения: 404 байта, 8,1 КБ/с против 5,6 КБ/с у пустого.
+# В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
 # с собственным списком полей: в ней снаряд посчитан как 11 байт (потерян f32 yaw)
 # и не учтён байт box_mask_len. Здесь реализован список полей, он первичен.
+#
+# ПОЧЕМУ ТРАФФИК НЕ ЕДЕТ ОБЫЧНОЙ ЗАПИСЬЮ МАШИНЫ (26 байт). Запись гонщика
+# несёт то, чего у болванки нет и не будет: круг, место, заряд заноса, угол
+# руля, вектор скорости в мировых координатах. Болванка же по построению
+# держится трассы, поэтому её положение описывается дугой и смещением от оси
+# точнее и вчетверо дешевле: 6 байт против 26. Двенадцать болванок стоят
+# 72 байта — столько же, сколько ТРИ записи гонщиков. Потолок MAX_CARS = 8
+# при этом не тронут: гонщики и траффик — разные массивы.
 # ---------------------------------------------------------------------------
 
 __all__ = [
@@ -98,13 +134,18 @@ __all__ = [
     "FLAG_SHIELD", "FLAG_FINISHED", "FLAG_GHOST", "FLAG_BRAKING",
     "INPUT_SIZE", "SNAPSHOT_HEADER_SIZE", "SNAPSHOT_CAR_SIZE",
     "SNAPSHOT_PROJ_SIZE", "ACK_OFFSET",
+    "SNAPSHOT_TRAFFIC_SIZE", "SNAPSHOT_EVENT_SIZE",
+    "SNAPSHOT_FLAG_EXTRA", "SNAPSHOT_CAR_COUNT_MASK",
     "MAX_CARS", "MAX_PROJECTILES", "MAX_BOX_MASK_LEN",
+    "MAX_TRAFFIC", "MAX_ROAD_EVENTS", "TRAFFIC_LOOKS",
     "decode_input",
     "has_throttle", "has_brake", "has_left", "has_right",
     "has_drift", "has_item", "has_look_back",
     "is_off_track", "is_drifting", "is_boosting", "is_spinning",
     "has_shield", "has_finished", "is_ghost", "is_braking",
     "quantize_steer", "quantize_drift_charge",
+    "quantize_arc", "quantize_lateral", "quantize_angle",
+    "quantize_speed", "quantize_half_length", "quantize_half_width",
     "pack_box_mask", "box_active",
     "build_snapshot_base", "stamp_ack", "encode_snapshot", "snapshot_size",
 ]
@@ -142,6 +183,21 @@ MAX_CARS = 8             # мест в гонке
 MAX_PROJECTILES = 32     # столько снарядов держит буфер клиента
 MAX_BOX_MASK_LEN = 32    # 32 байта маски = до 256 боксов с бонусами
 
+# Траффик и происшествия на дороге. Оба потолка выбраны так, чтобы
+# идентификатор влезал в половину байта (см. поле ident в шпаргалке):
+# больше шестнадцати болванок на круг — это уже пробка, а не поток.
+# Бит 7 поля car_count: за маской боксов идут секции траффика и происшествий.
+# Нужен ради обратной совместимости по байтам — комната с выключенными
+# траффиком и происшествиями обязана слать ровно тот же пакет, что слала
+# до их появления. Номер машин 0..8 умещается в четыре бита, старшие три
+# свободны, поэтому отдельного байта под флаг не понадобилось.
+SNAPSHOT_FLAG_EXTRA = 0x80
+SNAPSHOT_CAR_COUNT_MASK = 0x7F
+
+MAX_TRAFFIC = 12         # машин-болванок в снапшоте
+TRAFFIC_LOOKS = 12       # видов болванки (силуэт + цвет), 0..15
+MAX_ROAD_EVENTS = 6      # одновременных происшествий на дороге
+
 # --- скомпилированные форматы ----------------------------------------------
 # Компилируем один раз на импорт: struct.pack со строкой формата в цикле
 # каждый тик обходится заметно дороже.
@@ -151,12 +207,16 @@ _HEADER = struct.Struct("<BIIB")         # type, tick, ack_seq, car_count
 _CAR = struct.Struct("<BBfffffBBbB")     # slot, flags, x, z, yaw, vx, vz,
                                          # lap, place, steer_q, drift_charge
 _PROJ = struct.Struct("<HBfff")          # id, kind, x, z, yaw
+_TRAFFIC = struct.Struct("<BHbbB")       # ident, s_q, lat_q, dyaw_q, spd_q
+_EVENT = struct.Struct("<BBBHbBB")       # id, kind, phase, s_q, lat_q, hl_q, hw_q
 _ACK = struct.Struct("<I")               # только поле ack_seq
 
 INPUT_SIZE = _INPUT.size                 # 7
 SNAPSHOT_HEADER_SIZE = _HEADER.size      # 10
 SNAPSHOT_CAR_SIZE = _CAR.size            # 26
 SNAPSHOT_PROJ_SIZE = _PROJ.size          # 15
+SNAPSHOT_TRAFFIC_SIZE = _TRAFFIC.size    # 6
+SNAPSHOT_EVENT_SIZE = _EVENT.size        # 8
 ACK_OFFSET = 5                           # смещение поля ack_seq в снапшоте
 
 _STEER_SCALE = 127.0                     # -1..1 <-> -127..127
@@ -283,6 +343,86 @@ def quantize_drift_charge(charge):
     return 255 if q > 255 else q
 
 
+# --- квантование траффика и происшествий ------------------------------------
+#
+# Болванка и происшествие описываются НЕ мировыми координатами, а положением
+# на трассе: дуга + смещение от оси. Так они вчетверо дешевле записи гонщика
+# (6 и 8 байт против 26) и при этом точнее: клиент восстанавливает точку по
+# той же осевой линии, по которой её считал сервер, поэтому ошибка округления
+# не уводит машину с полотна, а остаётся вдоль него.
+
+_ARC_SCALE = 65535.0
+_LATERAL_SCALE = 10.0            # 0.1 м на единицу, потолок +-12.7 м
+_ANGLE_SCALE = 127.0 / 3.141592653589793
+_SPEED_SCALE = 4.0               # 0.25 м/с на единицу, потолок 63.75 м/с
+_HALF_LENGTH_SCALE = 4.0         # 0.25 м на единицу, потолок 63.75 м
+_HALF_WIDTH_SCALE = 10.0         # 0.1 м на единицу, потолок 25.5 м
+
+
+def quantize_arc(s, length):
+    """Положение вдоль дуги трассы -> u16. ``length`` — длина круга, м.
+
+    Разрешение: длина круга / 65535, то есть 3..5 см на здешних трассах.
+    Значение заворачивается по модулю длины: дуга замкнута.
+    """
+    if length <= 0.0:
+        return 0
+    u = s / length
+    u -= int(u)                  # дробная часть, знак сохраняется
+    if u < 0.0:
+        u += 1.0
+    q = int(u * _ARC_SCALE + 0.5)
+    if q > 65535:
+        q = 65535
+    elif q < 0:
+        q = 0
+    return q
+
+
+def quantize_lateral(lateral):
+    """Смещение от оси в метрах -> i8 с шагом 0.1 м (потолок +-12.7 м)."""
+    q = int(lateral * _LATERAL_SCALE + (0.5 if lateral >= 0.0 else -0.5))
+    if q > 127:
+        return 127
+    if q < -127:
+        return -127
+    return q
+
+
+def quantize_angle(angle):
+    """Угол в радианах (-pi..pi) -> i8. Шаг около 1.4 градуса."""
+    q = int(angle * _ANGLE_SCALE + (0.5 if angle >= 0.0 else -0.5))
+    if q > 127:
+        return 127
+    if q < -127:
+        return -127
+    return q
+
+
+def quantize_speed(speed):
+    """Модуль скорости, м/с -> u8 с шагом 0.25 м/с (потолок 63.75)."""
+    if speed <= 0.0:
+        return 0
+    q = int(speed * _SPEED_SCALE + 0.5)
+    return 255 if q > 255 else q
+
+
+def quantize_half_length(metres):
+    """Полудлина происшествия вдоль трассы -> u8 с шагом 0.25 м."""
+    if metres <= 0.0:
+        return 0
+    q = int(metres * _HALF_LENGTH_SCALE + 0.5)
+    return 255 if q > 255 else q
+
+
+def quantize_half_width(metres):
+    """Полуширина происшествия поперёк трассы -> u8 с шагом 0.1 м."""
+    if metres <= 0.0:
+        return 0
+    q = int(metres * _HALF_WIDTH_SCALE + 0.5)
+    return 255 if q > 255 else q
+
+
 # --- маска активных боксов -------------------------------------------------
 
 def pack_box_mask(active, buf=None):
@@ -316,25 +456,38 @@ def box_active(mask, box_id):
 
 # --- снапшот: сервер -> клиент ---------------------------------------------
 
-def snapshot_size(car_count, proj_count, box_mask_len):
-    """Размер снапшота в байтах при заданном наполнении."""
-    return (SNAPSHOT_HEADER_SIZE
+def snapshot_size(car_count, proj_count, box_mask_len,
+                  traffic_count=0, event_count=0):
+    """Размер снапшота в байтах при заданном наполнении.
+
+    Секции траффика и происшествий появляются в пакете только когда в них
+    что-то есть: комната с выключенными настройками шлёт ровно тот пакет,
+    что и до их появления, без единого лишнего байта. Признак — бит
+    ``SNAPSHOT_FLAG_EXTRA`` в поле ``car_count``.
+    """
+    size = (SNAPSHOT_HEADER_SIZE
             + car_count * SNAPSHOT_CAR_SIZE
             + 1 + proj_count * SNAPSHOT_PROJ_SIZE
             + 1 + box_mask_len)
+    if traffic_count or event_count:
+        size += (1 + traffic_count * SNAPSHOT_TRAFFIC_SIZE
+                 + 1 + event_count * SNAPSHOT_EVENT_SIZE)
+    return size
 
 
-def build_snapshot_base(tick, cars, projectiles, box_mask):
+def build_snapshot_base(tick, cars, projectiles, box_mask,
+                        traffic=(), events=()):
     """Собрать общую для всех клиентов часть снапшота.
 
-    ``cars`` и ``projectiles`` — последовательности кортежей в порядке полей
-    (см. докстринг модуля), ``box_mask`` — bytes-подобная маска активных боксов.
-    Поле ``ack_seq`` заполняется нулём: его проставляет ``stamp_ack`` для
-    каждого клиента отдельно.
+    ``cars``, ``projectiles``, ``traffic`` и ``events`` — последовательности
+    кортежей в порядке полей (см. докстринг модуля), ``box_mask`` —
+    bytes-подобная маска активных боксов. Поле ``ack_seq`` заполняется нулём:
+    его проставляет ``stamp_ack`` для каждого клиента отдельно.
 
     Возвращает ``bytearray`` — изменяемый буфер, который дальше штампуется
     и отправляется. Переполнение потолков (больше ``MAX_CARS`` машин,
-    ``MAX_PROJECTILES`` снарядов, ``MAX_BOX_MASK_LEN`` байт маски) не является
+    ``MAX_PROJECTILES`` снарядов, ``MAX_BOX_MASK_LEN`` байт маски,
+    ``MAX_TRAFFIC`` болванок, ``MAX_ROAD_EVENTS`` происшествий) не является
     ошибкой: лишнее отбрасывается, потому что принять такой пакет клиент
     всё равно не сможет, а ронять тик из-за этого нельзя.
     """
@@ -350,9 +503,20 @@ def build_snapshot_base(tick, cars, projectiles, box_mask):
     if mask_len > MAX_BOX_MASK_LEN:
         box_mask = box_mask[:MAX_BOX_MASK_LEN]
         mask_len = MAX_BOX_MASK_LEN
+    traffic_count = len(traffic)
+    if traffic_count > MAX_TRAFFIC:
+        traffic = traffic[:MAX_TRAFFIC]
+        traffic_count = MAX_TRAFFIC
+    event_count = len(events)
+    if event_count > MAX_ROAD_EVENTS:
+        events = events[:MAX_ROAD_EVENTS]
+        event_count = MAX_ROAD_EVENTS
 
-    buf = bytearray(snapshot_size(car_count, proj_count, mask_len))
-    _HEADER.pack_into(buf, 0, MSG_SNAPSHOT, tick & 0xFFFFFFFF, 0, car_count)
+    extra = bool(traffic_count or event_count)
+    buf = bytearray(snapshot_size(car_count, proj_count, mask_len,
+                                  traffic_count, event_count))
+    _HEADER.pack_into(buf, 0, MSG_SNAPSHOT, tick & 0xFFFFFFFF, 0,
+                      car_count | SNAPSHOT_FLAG_EXTRA if extra else car_count)
 
     offset = SNAPSHOT_HEADER_SIZE
     pack_car = _CAR.pack_into
@@ -371,6 +535,23 @@ def build_snapshot_base(tick, cars, projectiles, box_mask):
     offset += 1
     if mask_len:
         buf[offset:offset + mask_len] = box_mask
+        offset += mask_len
+    if not extra:
+        return buf
+
+    buf[offset] = traffic_count
+    offset += 1
+    pack_traffic = _TRAFFIC.pack_into
+    for car in traffic:
+        pack_traffic(buf, offset, *car)
+        offset += SNAPSHOT_TRAFFIC_SIZE
+
+    buf[offset] = event_count
+    offset += 1
+    pack_event = _EVENT.pack_into
+    for event in events:
+        pack_event(buf, offset, *event)
+        offset += SNAPSHOT_EVENT_SIZE
     return buf
 
 
@@ -384,12 +565,13 @@ def stamp_ack(buf, ack_seq):
     _ACK.pack_into(buf, ACK_OFFSET, ack_seq & 0xFFFFFFFF)
 
 
-def encode_snapshot(tick, ack_seq, cars, projectiles, box_mask):
+def encode_snapshot(tick, ack_seq, cars, projectiles, box_mask,
+                    traffic=(), events=()):
     """Собрать законченный снапшот для одного клиента, вернуть ``bytes``.
 
     Обёртка над ``build_snapshot_base`` + ``stamp_ack``. Для рассылки восьми
     клиентам используйте эту пару напрямую, чтобы не собирать пакет восемь раз.
     """
-    buf = build_snapshot_base(tick, cars, projectiles, box_mask)
+    buf = build_snapshot_base(tick, cars, projectiles, box_mask, traffic, events)
     _ACK.pack_into(buf, ACK_OFFSET, ack_seq & 0xFFFFFFFF)
     return bytes(buf)

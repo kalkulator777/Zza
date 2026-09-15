@@ -41,8 +41,11 @@ import {
     itemIconSvg,
     trackIconSvg,
     timeOfDayIconSvg,
+    weatherIconSvg,
     ROOM_TIMES_OF_DAY,
     ROOM_TOD_LABELS,
+    ROOM_WEATHERS,
+    ROOM_WEATHER_LABELS,
     ROOM_MODES,
     ROOM_MODE_LABELS,
     CHAMP_PHASE_LABELS,
@@ -577,29 +580,21 @@ export class LobbyScreen {
         this.trackChoice = el('div', 'set-track-row');
         body.appendChild(this.trackChoice);
 
-        // Время суток: настройка комнаты (§9), а не личная галочка графики.
-        // Стоит сразу под картой, потому что умолчание берётся из карты.
-        body.appendChild(el('div', 'label', 'Время суток'));
-        this.todChoice = el('div', 'set-track-row');
-        this.todButtons = [];
-        for (let i = 0; i < ROOM_TIMES_OF_DAY.length; i++) {
-            const tod = ROOM_TIMES_OF_DAY[i];
-            const btn = el('button', 'set-track-btn');
-            btn.type = 'button';
-            btn.title = ROOM_TOD_LABELS[tod];
-            const art = el('span');
-            art.innerHTML = timeOfDayIconSvg(tod, 40);
-            btn.appendChild(art.firstChild);
-            btn.appendChild(el('span', 'tn', ROOM_TOD_LABELS[tod]));
-            btn.addEventListener('click', () => this._pushSettings({ time_of_day: tod }));
-            this.todChoice.appendChild(btn);
-            this.todButtons.push({ id: tod, node: btn });
-        }
-        body.appendChild(this.todChoice);
-        // Выбор руками сменой карты не перетирается, поэтому расхождение
-        // с предложением карты видно строкой, а не остаётся сюрпризом.
-        this.todHint = el('div', 'gfx-hint');
-        body.appendChild(this.todHint);
+        // Окружение: время суток и погода. Обе — настройки комнаты (§9),
+        // а не личные галочки графики, и обе стоят сразу под картой, потому
+        // что умолчание обеих берётся из карты. Это два поля одного
+        // механизма (§12.16), поэтому ряды строит один и тот же код.
+        const tod = this._buildEnvRow(body, 'Время суток', ROOM_TIMES_OF_DAY,
+            ROOM_TOD_LABELS, timeOfDayIconSvg,
+            (id) => this._pushSettings({ time_of_day: id }));
+        this.todButtons = tod.buttons;
+        this.todHint = tod.hint;
+
+        const weather = this._buildEnvRow(body, 'Погода', ROOM_WEATHERS,
+            ROOM_WEATHER_LABELS, weatherIconSvg,
+            (id) => this._pushSettings({ weather: id }));
+        this.weatherButtons = weather.buttons;
+        this.weatherHint = weather.hint;
 
         // Круги и игроки
         const lapsRow = el('div', 'set-row');
@@ -735,6 +730,41 @@ export class LobbyScreen {
         wrap.appendChild(this.countdownNumber);
         this.countdownRoot.appendChild(wrap);
         this.countdownRoot.hidden = true;
+    }
+
+    /**
+     * Ряд кнопок выбора для поля окружения (время суток, погода).
+     *
+     * Кнопки те же, что у выбора трассы: иконка и подпись. Сетка задана
+     * в стилях на три колонки; когда значений больше, число колонок и размер
+     * иконки правятся здесь же инлайном — ряд из четырёх не должен
+     * переноситься на вторую строку, а стили трогать нельзя.
+     */
+    _buildEnvRow(body, title, values, labels, iconSvg, onPick) {
+        body.appendChild(el('div', 'label', title));
+        const row = el('div', 'set-track-row');
+        const wide = values.length > 3;
+        if (wide) row.style.gridTemplateColumns = 'repeat(' + values.length + ', 1fr)';
+        const buttons = [];
+        for (let i = 0; i < values.length; i++) {
+            const id = values[i];
+            const btn = el('button', 'set-track-btn');
+            btn.type = 'button';
+            btn.title = labels[id] || id;
+            const art = el('span');
+            art.innerHTML = iconSvg(id, wide ? 34 : 40);
+            btn.appendChild(art.firstChild);
+            btn.appendChild(el('span', 'tn', labels[id] || id));
+            btn.addEventListener('click', () => onPick(id));
+            row.appendChild(btn);
+            buttons.push({ id: id, node: btn });
+        }
+        body.appendChild(row);
+        // Выбор руками сменой карты не перетирается, поэтому расхождение
+        // с предложением карты видно строкой, а не остаётся сюрпризом.
+        const hint = el('div', 'gfx-hint');
+        body.appendChild(hint);
+        return { row: row, buttons: buttons, hint: hint };
     }
 
     _buildMiniStepper(min, max, onChange) {
@@ -1007,7 +1037,7 @@ export class LobbyScreen {
                     this.trackButtons[i].id === shownTrack);
             }
         }
-        this._syncTimeOfDay(settings);
+        this._syncEnvironment(settings);
         this.lapsControl.set(settings.laps || 3, true);
         this.maxControl.set(settings.max_players || 8, true);
         this.itemsEnabledInput.checked = !!settings.items_enabled;
@@ -1032,28 +1062,40 @@ export class LobbyScreen {
         }
     }
 
-    /** Время суток комнаты: подсветка выбранного и предложение карты. */
-    _syncTimeOfDay(settings) {
-        if (!this.todButtons) return;
-        const chosen = settings.time_of_day;
-        for (let i = 0; i < this.todButtons.length; i++) {
-            const entry = this.todButtons[i];
-            entry.node.classList.toggle('is-active', entry.id === chosen);
-        }
-        const proposed = this._trackTimeOfDay(settings.track);
-        this.todHint.textContent = (!chosen || proposed === chosen)
-            ? '' : 'Карта предлагает: ' + ROOM_TOD_LABELS[proposed];
+    /** Окружение комнаты: подсветка выбранного и предложение карты. */
+    _syncEnvironment(settings) {
+        this._syncEnvRow(this.todButtons, this.todHint, settings.time_of_day,
+            this._trackTimeOfDay(settings.track), ROOM_TOD_LABELS);
+        this._syncEnvRow(this.weatherButtons, this.weatherHint, settings.weather,
+            this._trackWeather(settings.track), ROOM_WEATHER_LABELS);
     }
 
-    /** Время суток, предложенное описанием карты (welcome.content.tracks[]). */
-    _trackTimeOfDay(trackId) {
+    _syncEnvRow(buttons, hint, chosen, proposed, labels) {
+        if (!buttons) return;
+        for (let i = 0; i < buttons.length; i++) {
+            buttons[i].node.classList.toggle('is-active', buttons[i].id === chosen);
+        }
+        hint.textContent = (!chosen || proposed === chosen)
+            ? '' : 'Карта предлагает: ' + (labels[proposed] || proposed);
+    }
+
+    /** Поле окружения, предложенное описанием карты (welcome.content.tracks[]). */
+    _trackEnvField(trackId, field, values) {
         for (let i = 0; i < this.tracks.length; i++) {
             if (this.tracks[i].id === trackId) {
-                const tod = this.tracks[i].time_of_day;
-                if (ROOM_TIMES_OF_DAY.indexOf(tod) >= 0) return tod;
+                const value = this.tracks[i][field];
+                if (values.indexOf(value) >= 0) return value;
             }
         }
-        return ROOM_TIMES_OF_DAY[0];
+        return values[0];
+    }
+
+    _trackTimeOfDay(trackId) {
+        return this._trackEnvField(trackId, 'time_of_day', ROOM_TIMES_OF_DAY);
+    }
+
+    _trackWeather(trackId) {
+        return this._trackEnvField(trackId, 'weather', ROOM_WEATHERS);
     }
 
     _syncOwnerControls(room) {
@@ -1081,17 +1123,9 @@ export class LobbyScreen {
                 this.trackButtons[i].node.disabled = !seriesEditable;
             }
         }
-        if (this.todButtons) {
-            for (let i = 0; i < this.todButtons.length; i++) {
-                const node = this.todButtons[i].node;
-                node.disabled = !editable;
-                // У .seg-подобных кнопок нет стиля для disabled, а у выбора
-                // трассы он есть: повторяем его, чтобы «только чтение»
-                // выглядело одинаково в обеих строках.
-                node.style.opacity = (!editable && !node.classList.contains('is-active'))
-                    ? '0.5' : '';
-            }
-        }
+        // Оба ряда окружения: владелец меняет, остальные видят только чтение.
+        this._setEnvRowEditable(this.todButtons, editable);
+        this._setEnvRowEditable(this.weatherButtons, editable);
         for (let i = 0; i < this.itemButtons.length; i++) {
             this.itemButtons[i].node.disabled = !editable || !this.itemsEnabledInput.checked;
         }
@@ -1111,6 +1145,19 @@ export class LobbyScreen {
             ? 'Гонка уже идёт' : (players.length ? '' : 'В комнате никого нет');
     }
 
+    _setEnvRowEditable(buttons, editable) {
+        if (!buttons) return;
+        for (let i = 0; i < buttons.length; i++) {
+            const node = buttons[i].node;
+            node.disabled = !editable;
+            // У .seg-подобных кнопок нет стиля для disabled, а у выбора
+            // трассы он есть: повторяем его, чтобы «только чтение»
+            // выглядело одинаково во всех рядах.
+            node.style.opacity = (!editable && !node.classList.contains('is-active'))
+                ? '0.5' : '';
+        }
+    }
+
     _toggleItem(itemId) {
         const settings = this.currentSettings || {};
         const items = (settings.items || []).slice();
@@ -1120,18 +1167,20 @@ export class LobbyScreen {
     }
 
     /**
-     * Время суток для следующего пакета настроек.
+     * Поле окружения для следующего пакета настроек.
      *
-     * Правило то же, что на сервере (см. validate_settings в server/room.py):
-     * значение, равное предложению ПРЕДЫДУЩЕЙ карты, ехало за картой — пусть
-     * едет и за новой; выбранное руками остаётся как есть. Считаем это здесь
-     * же, чтобы кнопки переключились сразу, не дожидаясь ответа сервера.
+     * Правило то же, что на сервере (см. validate_settings в server/room.py),
+     * и одно на оба поля: значение, равное предложению ПРЕДЫДУЩЕЙ карты,
+     * ехало за картой — пусть едет и за новой; выбранное руками остаётся как
+     * есть. Считаем это здесь же, чтобы кнопки переключились сразу,
+     * не дожидаясь ответа сервера.
      */
-    _nextTimeOfDay(current, patch) {
-        if (patch.time_of_day !== undefined) return patch.time_of_day;
-        const chosen = current.time_of_day;
-        if (patch.track !== undefined && chosen === this._trackTimeOfDay(current.track)) {
-            return this._trackTimeOfDay(patch.track);
+    _nextEnvField(current, patch, field, values) {
+        if (patch[field] !== undefined) return patch[field];
+        const chosen = current[field];
+        if (patch.track !== undefined
+            && chosen === this._trackEnvField(current.track, field, values)) {
+            return this._trackEnvField(patch.track, field, values);
         }
         return chosen;
     }
@@ -1141,15 +1190,18 @@ export class LobbyScreen {
      * целиком объект settings, поэтому шлём текущий с наложенным изменением.
      *
      * Настройки копируются как есть, а не переписываются полем за полем:
-     * поле, которого этот экран ещё не знает (следующей приедет погода),
-     * уедет обратно нетронутым, а сервер всё равно проверяет каждое сам.
+     * поле, которого этот экран ещё не знает, уедет обратно нетронутым,
+     * а сервер всё равно проверяет каждое сам.
      */
     _pushSettings(patch) {
         if (!this.isOwner || !this.room || this.room.state !== 'LOBBY') return;
         const current = this.currentSettings || {};
         const settings = Object.assign({}, current, patch);
         settings.items = (settings.items || []).slice();
-        settings.time_of_day = this._nextTimeOfDay(current, patch);
+        settings.time_of_day = this._nextEnvField(current, patch,
+            'time_of_day', ROOM_TIMES_OF_DAY);
+        settings.weather = this._nextEnvField(current, patch,
+            'weather', ROOM_WEATHERS);
         this._applySettings(settings);
         this._syncOwnerControls(this.room);
         if (this.handlers.onUpdateSettings) this.handlers.onUpdateSettings(settings);

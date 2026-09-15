@@ -7,6 +7,7 @@
     sim.set_input(slot, seq, buttons)
     events = sim.tick()                       # 60 Гц
     cars, projectiles, box_mask = sim.snapshot_args()   # 20 Гц
+    traffic, events = sim.extra_snapshot_args()         # 20 Гц, траффик и ДТП
     sim.ack_seq(slot)
     sim.is_over()
     sim.results()
@@ -14,11 +15,16 @@
 
 Порядок работы тика зафиксирован контрактом (разделы 6.2 и 12.4):
 
-1. шаг физики каждой машине — ``physics.step``, он же двигает progress;
-2. столкновения машина-машина одним проходом, если включены в комнате;
-3. бонусы: снаряды и боксы (``ItemSystem.update``), затем применение бонусов
+1. происшествия на дороге: фазы и появление (``RoadEvents.update``);
+2. шаг физики каждой машине — ``physics.step``, он же двигает progress;
+   вокруг шага навешаны происшествия: масло правит характеристики ДО шага,
+   обломки и твёрдые препятствия — ПОСЛЕ;
+3. шаг потока машин-болванок (``TrafficSystem.step``) тем же ``physics.step``
+   со скриптовым вводом вместо сетевого;
+4. столкновения одним проходом по гонщикам И болванкам, если включены;
+5. бонусы: снаряды и боксы (``ItemSystem.update``), затем применение бонусов
    по кнопке, затем подбор (``ItemSystem.check_pickups``);
-4. круги, финиш и места.
+6. круги, финиш и места.
 
 Производительность
 ------------------
@@ -42,6 +48,8 @@ import os
 from . import physics
 from . import protocol
 from .items import ItemSystem, ITEM_ID_BY_CODE
+from .events import RoadEvents
+from .traffic import TrafficSystem
 
 __all__ = ['Simulation', 'RaceCar', 'GHOST_TIME', 'set_car_catalog',
            'car_catalog']
@@ -123,6 +131,7 @@ class RaceCar(object):
         'laps', 'best_lap', 'lap_start',
         'finished', 'finish_order', 'finish_time',
         'dnf', 'ghost', 'ghost_time', 'removed',
+        'oil_stats', 'oil_src', 'oil_factor',
     )
 
     def __init__(self, slot, name, car_id, color, stats, grid):
@@ -150,6 +159,41 @@ class RaceCar(object):
         self.ghost = False
         self.ghost_time = 0.0
         self.removed = False
+        # Копия характеристик со сниженным сцеплением: ею подменяется
+        # ``stats`` на тех шагах, где машина стоит в масле или на обломках
+        # (см. game/events.py). Объект создаётся при первой надобности и
+        # дальше переиспользуется — в тике ни одной аллокации.
+        self.oil_stats = None
+        self.oil_src = None
+        self.oil_factor = 0.0
+
+    def slippery(self, factor):
+        """Характеристики с сцеплением, умноженным на ``factor``.
+
+        Подменять сами ``stats`` нельзя: объект характеристик приходит из
+        каталога и общий у всех машин этой модели — правка задела бы соседей.
+        Поэтому держим личную копию и пересобираем её только когда изменился
+        либо множитель, либо источник (гандикап подменяет stats на свои).
+        """
+        stats = self.stats
+        if self.oil_stats is None:
+            self.oil_stats = physics.CarStats()
+        if self.oil_src is not stats or self.oil_factor != factor:
+            self.oil_src = stats
+            self.oil_factor = factor
+            out = self.oil_stats
+            out.engine_force = stats.engine_force
+            out.max_speed = stats.max_speed
+            out.brake_force = stats.brake_force
+            out.reverse_force = stats.reverse_force
+            out.turn_rate = stats.turn_rate
+            out.grip_step = stats.grip_step * factor
+            out.drift_grip_step = stats.drift_grip_step * factor
+            out.drag = stats.drag
+            out.roll = stats.roll
+            out.boost_speed = stats.boost_speed
+            out.mass = stats.mass
+        return self.oil_stats
 
     def __repr__(self):
         return '<RaceCar slot=%d %r %s место %d круг %d>' % (
@@ -201,13 +245,27 @@ class Simulation(object):
         self._count = count
         self._finish_count = 0
 
+        # --- происшествия и траффик ----------------------------------------
+        # Порядок важен: поток обязан знать про перекрытия, чтобы их объезжать,
+        # а размещение происшествий — про поток, чтобы не появляться под ним.
+        self.road = RoadEvents(track, self.settings)
+        self.traffic = TrafficSystem(track, self.settings)
+        self.traffic.attach_events(self.road)
+        self.traffic.spawn()
+
         # --- преаллоцированные буферы горячего пути ------------------------
+        # Буфер столкновений рассчитан на гонщиков И болванок сразу: они
+        # расталкиваются одним проходом, иначе болванку можно было бы
+        # проехать насквозь.
+        coll_size = count + self.traffic.count
         self.rank = list(range(count))          # индексы cars по местам
         self.events = []                        # события тика, переиспользуется
-        self._coll_states = [None] * count      # аргументы resolve_collisions
-        self._coll_stats = [None] * count
+        self._coll_states = [None] * coll_size  # аргументы resolve_collisions
+        self._coll_stats = [None] * coll_size
         self._snap_cars = []                    # кортежи машин для снапшота
         self._snap_proj = []                    # кортежи снарядов
+        self._snap_traffic = []                 # кортежи болванок
+        self._snap_events = []                  # кортежи происшествий
         self._empty_mask = b''
 
         self.items = ItemSystem(track, self.settings)
@@ -251,7 +309,11 @@ class Simulation(object):
         dt = DT
         self.race_time += dt
 
+        road = self.road
+        if road.enabled:
+            road.update(dt, self)
         self._step_cars(dt, events)
+        self.traffic.step(dt, self)
         if self.collisions:
             self._resolve_collisions()
         items = self.items
@@ -263,9 +325,18 @@ class Simulation(object):
         return events
 
     def _step_cars(self, dt, events):
-        """Шаг физики каждой машине; призраки доживают и катятся без ввода."""
+        """Шаг физики каждой машине; призраки доживают и катятся без ввода.
+
+        Происшествия на дороге навешаны ВОКРУГ шага, а не внутрь него:
+        масло и обломки подменяют характеристики до шага (сцепление),
+        твёрдые препятствия выталкивают после (как стена трассы, шаг 14).
+        Порядок операций раздела 6.2 при этом остаётся дословно прежним,
+        а ``game/physics.py`` не тронут ни строкой.
+        """
         track = self.track
         step = physics.step
+        road = self.road
+        road_on = road.enabled
         for car in self.cars:
             if car.removed:
                 continue
@@ -280,7 +351,18 @@ class Simulation(object):
             else:
                 buttons = car.buttons
             state = car.state
-            level = step(state, car.stats, buttons, dt, track, state.sample_idx)
+            stats = car.stats
+            if road_on:
+                scale = road.grip_scale(state)
+                if scale < 1.0:
+                    stats = car.slippery(scale)
+            level = step(state, stats, buttons, dt, track, state.sample_idx)
+            if road_on:
+                road.apply_after_step(state, dt)
+                spin = road.blast_spin(state, car.slot)
+                if spin > 0.0 and state.shield_time <= 0.0 and not car.ghost:
+                    if spin > state.spin_time:
+                        state.spin_time = spin
             if level:
                 events.append({'t': 'race_event', 'kind': 'drift_boost',
                                'slot': car.slot, 'level': level})
@@ -296,6 +378,10 @@ class Simulation(object):
             states[count] = car.state
             stats[count] = car.stats
             count += 1
+        # Болванки идут тем же проходом и по тем же правилам (капсула
+        # 4,00 x 1,90 м, раздел 6.2): въехать в траффик обязано быть
+        # ровно так же ощутимо, как въехать в соседа.
+        count = self.traffic.collect(states, stats, count)
         if count > 1:
             physics.resolve_collisions(states, stats, count)
 
@@ -434,6 +520,26 @@ class Simulation(object):
         else:
             mask = self._empty_mask
         return out, projectiles, mask
+
+    def extra_snapshot_args(self):
+        """(traffic, events) в формате раздела 12.3 — дополнение к снапшоту.
+
+        Отдельный метод, а не расширение ``snapshot_args`` до пяти значений:
+        интерфейс раздела 12.4 зафиксирован тройкой, на неё завязаны
+        ``server/_stub_sim.py`` и тесты. Сервер зовёт этот метод, если он
+        у симуляции есть, и шлёт пустые списки, если его нет.
+
+        Списки переиспользуются, зовётся это 20 раз в секунду.
+        """
+        traffic = self._snap_traffic
+        if traffic:
+            del traffic[:]
+        self.traffic.fill_snapshot(traffic)
+        events = self._snap_events
+        if events:
+            del events[:]
+        self.road.fill_snapshot(events)
+        return traffic, events
 
     # --- окончание гонки ------------------------------------------------------
 

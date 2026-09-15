@@ -302,7 +302,35 @@ class ContentLibrary(object):
         settings['items'] = list(config.DEFAULT_SETTINGS['items'])
         settings['track'] = self.default_track_id()
         settings.update(self.environment(settings['track']))
+        for name, allowed, _code, _label in ROAD_FIELDS:
+            settings.setdefault(name, allowed[0])
         return settings
+
+
+# --- траффик и происшествия на дороге ---------------------------------------
+#
+# Две настройки по три значения каждая, одной таблицей: проверка идёт по ней
+# циклом, как ENV_FIELDS для времени суток. Допустимые значения объявлены
+# не здесь, а в самих модулях (game/traffic.py и game/events.py) — они же
+# их и толкуют, дублировать список в двух местах незачем.
+#
+# Умолчание у обоих — первое значение, то есть «выключено»: старые клиенты
+# и tools/smoke_test.py настроек не шлют и обязаны получить ровно прежнее
+# поведение. Если модули по какой-то причине не импортировались (заглушка
+# симуляции), таблица вырождается в пустую и поля просто игнорируются.
+
+try:
+    from game.traffic import TRAFFIC_LEVELS
+    from game.events import EVENT_LEVELS
+except Exception:                     # pragma: no cover — только со заглушкой
+    TRAFFIC_LEVELS = ('off',)
+    EVENT_LEVELS = ('off',)
+
+# (имя поля, допустимые значения, код ошибки, подпись для сообщения)
+ROAD_FIELDS = (
+    ('traffic', TRAFFIC_LEVELS, 'bad_traffic', 'траффик'),
+    ('events', EVENT_LEVELS, 'bad_events', 'происшествия'),
+)
 
 
 # --- проверка настроек комнаты ----------------------------------------------
@@ -417,6 +445,19 @@ def validate_settings(raw, content, base=None, min_players=1):
             if not isinstance(value, bool):
                 raise SettingsError('bad_flag', 'поле %s: нужно true или false' % flag)
             out[flag] = value
+
+    # Траффик и происшествия на дороге. Значение, которого нет в таблице,
+    # это ошибка, а не повод молча подставить умолчание: владелец комнаты
+    # должен узнать, что его настройка не применилась.
+    for name, allowed, code, label in ROAD_FIELDS:
+        if name in raw:
+            value = raw[name]
+            if not isinstance(value, str) or value not in allowed:
+                raise SettingsError(code, '%s: ожидается одно из %s'
+                                    % (label, ', '.join(allowed)))
+            out[name] = value
+        elif out.get(name) not in allowed:
+            out[name] = allowed[0]
 
     if 'items' in raw:
         items = raw['items']
@@ -1351,7 +1392,22 @@ class Room(object):
         except Exception as exc:
             self._log('комната %s: snapshot_args() упал: %s' % (self.id, exc))
             return
-        buf = protocol.build_snapshot_base(sim.tick_no, cars, projectiles, box_mask)
+        # Траффик и происшествия едут отдельным методом, а не пятёркой из
+        # snapshot_args: тройка зафиксирована §12.4, на неё завязаны
+        # server/_stub_sim.py и тесты. Нет метода — шлём пустые секции,
+        # они стоят два байта.
+        extra = getattr(sim, 'extra_snapshot_args', None)
+        if extra is None:
+            traffic = events = ()
+        else:
+            try:
+                traffic, events = extra()
+            except Exception as exc:
+                self._log('комната %s: extra_snapshot_args() упал: %s'
+                          % (self.id, exc))
+                traffic = events = ()
+        buf = protocol.build_snapshot_base(sim.tick_no, cars, projectiles,
+                                           box_mask, traffic, events)
         race_slots = self._race_slots
         stamp = protocol.stamp_ack
         for player in self.order:
@@ -1364,8 +1420,8 @@ class Room(object):
             else:
                 ack = 0
             stamp(buf, ack)
-            # Tornado принимает только bytes: копия 282 байт на клиента дешевле
-            # пересборки всего пакета (§12.3).
+            # Tornado принимает только bytes: копия 284..404 байт на клиента
+            # дешевле пересборки всего пакета (§12.3).
             player.send_binary(bytes(buf))
 
     def set_input(self, player, seq, buttons):

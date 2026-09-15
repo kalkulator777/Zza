@@ -53,6 +53,8 @@
 
 import {
     MAX_CARS,
+    MAX_TRAFFIC,
+    MAX_ROAD_EVENTS,
     encodeInput,
     createSnapshotBuffer,
     decodeSnapshot,
@@ -61,6 +63,12 @@ import {
     FLAG_BOOST,
     FLAG_SPIN,
     FLAG_SHIELD,
+    ROAD_EXPLOSION,
+    ROAD_OIL,
+    ROAD_WRECK,
+    ROAD_BLOCKADE,
+    ROAD_PHASE_ACTIVE,
+    ROAD_PHASE_DEBRIS,
 } from './protocol.js';
 
 import { DT, createCarState, createCarStats, step as physicsStep } from './physics.js';
@@ -125,6 +133,29 @@ const CLOCK_RESYNC_GAP = 250;           // мс, выше этого разры�
 const CLOCK_RESYNC_HITS = 20;           // столько замеров подряд — и окно сбрасывается
 
 const TAU = Math.PI * 2;
+
+// ---------------------------------------------------------------------------
+// Траффик и происшествия на дороге
+// ---------------------------------------------------------------------------
+//
+// ТРАФФИК. Болванки приезжают в координатах трассы (дуга + смещение от оси),
+// поэтому и интерполируются там же: Эрмит по дуге со скоростью в качестве
+// касательной, линейно по смещению и по разнице курса. Интерполировать их
+// в мировых координатах было бы хуже — на дуге радиусом 20 м прямая между
+// двумя снапшотами срезает до 30 см и машина «ныряет» в поребрик.
+//
+// ПРОИСШЕСТВИЯ интерполировать нечего: они неподвижны, а фазу присылает
+// сервер. Клиент берёт их из последнего снапшота как есть.
+//
+// ФИЗИКА ПРОИСШЕСТВИЙ. Числа ниже — зеркало game/events.py, ровно как
+// константы физики зеркалируются между physics.py и physics.js. Разойдутся
+// — разойдётся предсказание с сервером, и это будет не косметика.
+const ROAD_OIL_GRIP = 0.45;      // во столько раз масло режет сцепление
+const ROAD_DEBRIS_GRIP = 0.72;   // обломки после взрыва
+const ROAD_DEBRIS_DAMP = 0.9960; // на шаг: тряска по обломкам
+const ROAD_SOLID_BOUNCE = 0.30;  // доля нормальной скорости после препятствия
+const ROAD_CAR_LONG = 2.0;       // м, полудлина машины (CAR_AXIS_HALF + CAR_RADIUS)
+const ROAD_CAR_SIDE = 0.95;      // м, полуширина машины (CAR_RADIUS)
 
 // Раскладка кольцевого буфера состояний: один Float64Array со страйдом
 // вместо дюжины отдельных массивов — одна аллокация и одна кэш-линия.
@@ -272,6 +303,43 @@ export class NetClient {
         this.viewDrift = new Uint8Array(MAX_CARS);
         this.viewLap = new Uint8Array(MAX_CARS);
         this.viewPlace = new Uint8Array(MAX_CARS);
+
+        // --- траффик: своя история и свой выход ------------------------------
+        // Раскладка та же, что у машин: кольцо на SNAP_HISTORY кадров,
+        // в каждом — слот на каждую болванку пула. Всё выделено один раз.
+        const trafCells = SNAP_HISTORY * MAX_TRAFFIC;
+        this.trafPresent = new Uint8Array(trafCells);
+        this.trafArc = new Float32Array(trafCells);     // доля круга 0..1
+        this.trafLat = new Float32Array(trafCells);
+        this.trafDyaw = new Float32Array(trafCells);
+        this.trafSpeed = new Float32Array(trafCells);
+        this.trafLook = new Uint8Array(MAX_TRAFFIC);
+
+        // Курс касательной в каждой выборке осевой линии: болванка везёт
+        // РАЗНИЦУ курса с ней, и без этой таблицы пришлось бы звать atan2
+        // на каждую болванку в каждом кадре. Строится один раз на гонку.
+        this.trackYaw = null;
+
+        // --- происшествия на дороге ------------------------------------------
+        // Предфильтр «в какой выборке что лежит» — зеркало _zone из
+        // game/events.py. Пересобирается только когда меняется состав или
+        // фаза происшествий, то есть в среднем раз в несколько секунд.
+        this.roadZone = null;
+        this.roadCount = 0;
+        this.roadId = new Uint8Array(MAX_ROAD_EVENTS);
+        this.roadKind = new Uint8Array(MAX_ROAD_EVENTS);
+        this.roadPhase = new Uint8Array(MAX_ROAD_EVENTS);
+        this.roadArc = new Float64Array(MAX_ROAD_EVENTS);      // метры дуги
+        this.roadLat = new Float64Array(MAX_ROAD_EVENTS);
+        this.roadHalfLen = new Float64Array(MAX_ROAD_EVENTS);
+        this.roadHalfWidth = new Float64Array(MAX_ROAD_EVENTS);
+        this.roadStamp = 0;        // подпись состава: меняется — пересобрать зону
+        this._poseLat = 0;         // выход _roadPose: смещение от оси, м
+        // Скользкая копия характеристик своей машины: ею подменяется
+        // localStats на шагах в масле и на обломках. Создаётся при первой
+        // надобности и переиспользуется — в кадре ноль аллокаций.
+        this.oilStats = null;
+        this.oilFactor = 0;
 
         // --- то, чего нет в снапшоте (12.6) ----------------------------------
         this.lapStartTime = 0;          // время гонки, когда начался текущий круг
@@ -594,6 +662,7 @@ export class NetClient {
         this.track = Track.fromServer(msg.track);
         this.lapsTotal = msg.laps | 0;
         this.racing = false;
+        this._buildTrackTables();
         this._resetRaceInfo();
 
         // Расстановка своей машины на решётке и характеристики для физики.
@@ -792,6 +861,189 @@ export class NetClient {
             this.snapLap[k] = snap.carLap[i];
             this.snapPlace[k] = snap.carPlace[i];
         }
+
+        const tbase = h * MAX_TRAFFIC;
+        const tpresent = this.trafPresent;
+        for (let s = 0; s < MAX_TRAFFIC; s++) tpresent[tbase + s] = 0;
+        const tcount = snap.trafCount;
+        for (let i = 0; i < tcount; i++) {
+            const id = snap.trafId[i];
+            if (id >= MAX_TRAFFIC) continue;
+            const k = tbase + id;
+            tpresent[k] = 1;
+            this.trafArc[k] = snap.trafArc[i];
+            this.trafLat[k] = snap.trafLat[i];
+            this.trafDyaw[k] = snap.trafDyaw[i];
+            this.trafSpeed[k] = snap.trafSpeed[i];
+            this.trafLook[id] = snap.trafLook[i];
+        }
+
+        this._takeRoadEvents(snap);
+    }
+
+    /**
+     * Происшествия из свежего снапшота: список для физики и байт предфильтра.
+     *
+     * Пересборка предфильтра стоит прохода по всей осевой линии, поэтому
+     * делается только когда состав или фаза действительно изменились.
+     * Подпись состава — дешёвая свёртка полей, которых достаточно: тронется
+     * фаза или появится новое происшествие — свёртка изменится.
+     */
+    _takeRoadEvents(snap) {
+        const track = this.track;
+        if (!track || !this.roadZone) return;
+        const count = snap.evtCount;
+        let stamp = count * 8191;
+        for (let i = 0; i < count; i++) {
+            stamp = (stamp * 31 + snap.evtId[i] * 97 + snap.evtKind[i] * 13
+                     + snap.evtPhase[i] * 7
+                     + Math.round(snap.evtArc[i] * 65535)) | 0;
+        }
+        const length = track.length;
+        this.roadCount = count;
+        for (let i = 0; i < count; i++) {
+            this.roadId[i] = snap.evtId[i];
+            this.roadKind[i] = snap.evtKind[i];
+            this.roadPhase[i] = snap.evtPhase[i];
+            this.roadArc[i] = snap.evtArc[i] * length;
+            this.roadLat[i] = snap.evtLat[i];
+            this.roadHalfLen[i] = snap.evtHalfLen[i];
+            this.roadHalfWidth[i] = snap.evtHalfWidth[i];
+        }
+        if (stamp === this.roadStamp) return;
+        this.roadStamp = stamp;
+
+        const zone = this.roadZone;
+        zone.fill(0);
+        const n = track.count;
+        const invStep = track.invStep;
+        for (let i = 0; i < count; i++) {
+            const phase = this.roadPhase[i];
+            if (phase !== ROAD_PHASE_ACTIVE && phase !== ROAD_PHASE_DEBRIS) continue;
+            const reach = this.roadHalfLen[i] + ROAD_CAR_LONG + track.step;
+            const first = Math.floor((this.roadArc[i] - reach) * invStep);
+            const last = Math.floor((this.roadArc[i] + reach) * invStep) + 1;
+            for (let j = first; j <= last; j++) {
+                let k = j % n;
+                if (k < 0) k += n;
+                zone[k] = 1;
+            }
+        }
+    }
+
+    /**
+     * Множитель сцепления в точке машины — зеркало RoadEvents.grip_scale.
+     * Зовётся ДО шага физики: масло и обломки меняют не сам шаг, а
+     * характеристики, которые в него подаются, поэтому physics.js не тронут.
+     */
+    roadGrip(state) {
+        if (this.roadCount === 0) return 1;
+        const idx = state.sampleIdx;
+        if (idx < 0 || !this.roadZone[idx]) return 1;
+        const pose = this._roadPose(state, idx);
+        const arc = pose;                 // дуга; смещение лежит в _poseLat
+        const lat = this._poseLat;
+        let scale = 1;
+        for (let i = 0; i < this.roadCount; i++) {
+            const kind = this.roadKind[i];
+            const phase = this.roadPhase[i];
+            let factor;
+            if (kind === ROAD_OIL) {
+                if (phase !== ROAD_PHASE_ACTIVE) continue;
+                factor = ROAD_OIL_GRIP;
+            } else if (kind === ROAD_EXPLOSION && phase === ROAD_PHASE_DEBRIS) {
+                factor = ROAD_DEBRIS_GRIP;
+            } else {
+                continue;
+            }
+            if (Math.abs(this._wrapArc(arc - this.roadArc[i])) > this.roadHalfLen[i]) continue;
+            if (Math.abs(lat - this.roadLat[i]) > this.roadHalfWidth[i]) continue;
+            if (factor < scale) scale = factor;
+        }
+        return scale;
+    }
+
+    /**
+     * Обломки и твёрдые препятствия — зеркало RoadEvents.apply_after_step.
+     * Зовётся ПОСЛЕ шага физики. Препятствие ведёт себя как стена трассы
+     * (шаг 14): выталкивание по оси меньшего перекрытия плюс гашение
+     * нормальной составляющей скорости.
+     */
+    roadAfterStep(state) {
+        if (this.roadCount === 0) return;
+        const idx = state.sampleIdx;
+        if (idx < 0 || !this.roadZone[idx]) return;
+        const track = this.track;
+        let arc = this._roadPose(state, idx);
+        let lat = this._poseLat;
+        let damp = 1;
+        for (let i = 0; i < this.roadCount; i++) {
+            const kind = this.roadKind[i];
+            const phase = this.roadPhase[i];
+            if (kind === ROAD_EXPLOSION && phase === ROAD_PHASE_DEBRIS) {
+                if (Math.abs(this._wrapArc(arc - this.roadArc[i])) <= this.roadHalfLen[i]
+                    && Math.abs(lat - this.roadLat[i]) <= this.roadHalfWidth[i]) {
+                    damp *= ROAD_DEBRIS_DAMP;
+                }
+                continue;
+            }
+            if (phase !== ROAD_PHASE_ACTIVE) continue;
+            if (kind !== ROAD_WRECK && kind !== ROAD_BLOCKADE) continue;
+            const ds = this._wrapArc(arc - this.roadArc[i]);
+            const penS = (this.roadHalfLen[i] + ROAD_CAR_LONG) - Math.abs(ds);
+            if (penS <= 0) continue;
+            const dLat = lat - this.roadLat[i];
+            const penL = (this.roadHalfWidth[i] + ROAD_CAR_SIDE) - Math.abs(dLat);
+            if (penL <= 0) continue;
+            let nx, nz;
+            if (penL <= penS) {
+                const sign = dLat >= 0 ? 1 : -1;
+                nx = track.cnx[idx] * sign;
+                nz = track.cnz[idx] * sign;
+                state.x += nx * penL;
+                state.z += nz * penL;
+                lat += sign * penL;
+            } else {
+                const sign = ds >= 0 ? 1 : -1;
+                nx = track.ctx[idx] * sign;
+                nz = track.ctz[idx] * sign;
+                state.x += nx * penS;
+                state.z += nz * penS;
+                arc += sign * penS;
+            }
+            const vn = state.vx * nx + state.vz * nz;
+            if (vn < 0) {
+                const k = vn * (1 + ROAD_SOLID_BOUNCE);
+                state.vx -= nx * k;
+                state.vz -= nz * k;
+            }
+        }
+        if (damp < 1) {
+            state.vx *= damp;
+            state.vz *= damp;
+        }
+    }
+
+    /** (дуга, смещение) машины по её же sampleIdx. Смещение — в _poseLat. */
+    _roadPose(state, idx) {
+        const track = this.track;
+        const dx = state.x - track.cx[idx];
+        const dz = state.z - track.cz[idx];
+        this._poseLat = dx * track.cnx[idx] + dz * track.cnz[idx];
+        let arc = track.cs[idx] + dx * track.ctx[idx] + dz * track.ctz[idx];
+        const length = track.length;
+        if (arc >= length) arc -= length;
+        else if (arc < 0) arc += length;
+        return arc;
+    }
+
+    /** Кратчайшая разница двух дуг замкнутого круга. */
+    _wrapArc(d) {
+        const length = this.track.length;
+        const half = length * 0.5;
+        if (d > half) d -= length;
+        else if (d < -half) d += length;
+        return d;
     }
 
     /**
@@ -899,12 +1151,23 @@ export class NetClient {
         const state = this.state;
         const buttons = this.ringButtons;
         const valid = this.ringValid;
+        const road = this.roadCount > 0;
         for (let s = base + 1; s <= this.seq; s++) {
             const i = s % INPUT_RING;
             if (!valid[i]) continue;
+            // Переигрывать надо ровно то, что делал stepLocal, вместе
+            // с происшествиями: иначе машина, стоящая в масле, каждую
+            // реконсиляцию переигрывалась бы по сухому сцеплению и
+            // расхождение не гасло бы, а копилось.
+            let replayStats = stats;
+            if (road) {
+                const scale = this.roadGrip(state);
+                if (scale < 1) replayStats = this._slippery(scale);
+            }
             // step() сам делает шаги 14 и 16 (границы и progress): track
             // передан ему аргументом, звать их отдельно — двойная работа.
-            physicsStep(state, stats, buttons[i], DT, track, state.sampleIdx);
+            physicsStep(state, replayStats, buttons[i], DT, track, state.sampleIdx);
+            if (road) this.roadAfterStep(state);
             this._recordState(i);
         }
 
@@ -1058,6 +1321,26 @@ export class NetClient {
         this.tickLead = 0;
     }
 
+    /**
+     * Таблицы, зависящие только от геометрии трассы: курс касательной в
+     * каждой выборке и байт предфильтра происшествий на неё же. Строятся
+     * один раз на гонку — n вызовов atan2 при загрузке против n на кадр.
+     */
+    _buildTrackTables() {
+        const track = this.track;
+        const n = track.count;
+        if (!this.trackYaw || this.trackYaw.length !== n) {
+            this.trackYaw = new Float32Array(n);
+            this.roadZone = new Uint8Array(n);
+        } else {
+            this.roadZone.fill(0);
+        }
+        const yaw = this.trackYaw;
+        for (let i = 0; i < n; i++) yaw[i] = Math.atan2(track.ctx[i], track.ctz[i]);
+        this.roadCount = 0;
+        this.roadStamp = 0;
+    }
+
     _resetSnapshots() {
         this.snapHead = -1;
         this.snapStored = 0;
@@ -1072,6 +1355,12 @@ export class NetClient {
         this.snapshotCount = 0;
         const present = this.viewPresent;
         for (let i = 0; i < MAX_CARS; i++) present[i] = 0;
+        this.trafPresent.fill(0);
+        this.roadCount = 0;
+        this.roadStamp = 0;
+        if (this.roadZone) this.roadZone.fill(0);
+        this.snap.trafViewCount = 0;
+        this.snap.evtViewCount = 0;
     }
 
     _resetRaceInfo() {
@@ -1114,8 +1403,18 @@ export class NetClient {
         this.prevZ = state.z;
         this.prevYaw = state.yaw;
 
+        // Происшествия на дороге навешаны ВОКРУГ шага — теми же правилами
+        // и теми же числами, что на сервере (game/events.py): масло и
+        // обломки правят сцепление до шага, твёрдое препятствие выталкивает
+        // после. Порядок операций раздела 6.2 внутри шага не тронут.
+        let stats = this.localStats;
+        if (this.roadCount > 0) {
+            const scale = this.roadGrip(state);
+            if (scale < 1) stats = this._slippery(scale);
+        }
         // step() включает шаги 14 (границы) и 16 (progress) — им передан track.
-        physicsStep(state, this.localStats, buttons, DT, this.track, state.sampleIdx);
+        physicsStep(state, stats, buttons, DT, this.track, state.sampleIdx);
+        if (this.roadCount > 0) this.roadAfterStep(state);
 
         const seq = this.seq + 1;
         this.seq = seq;
@@ -1129,6 +1428,42 @@ export class NetClient {
             // Бинарный кадр обязателен (раздел 5, 12.6).
             ws.send(encodeInput(seq, buttons));
         }
+    }
+
+    /**
+     * Характеристики со сцеплением, умноженным на factor. Подменять поля
+     * самого localStats нельзя: тот же объект переигрывается в реконсиляции,
+     * и забытая правка утекла бы на все шаги подряд.
+     */
+    _slippery(factor) {
+        let out = this.oilStats;
+        if (out === null) {
+            // Литерал, а не createCarStats: та принимает snake_case из
+            // cars.json, а здесь копируется уже готовый объект физики.
+            out = {
+                engineForce: 0, maxSpeed: 0, brakeForce: 0, reverseForce: 0,
+                turnRate: 0, gripStep: 0, driftGripStep: 0, drag: 0,
+                roll: 0, boostSpeed: 0, mass: 1
+            };
+            this.oilStats = out;
+            this.oilFactor = 0;
+        }
+        if (this.oilFactor !== factor) {
+            this.oilFactor = factor;
+            const base = this.localStats;
+            out.engineForce = base.engineForce;
+            out.maxSpeed = base.maxSpeed;
+            out.brakeForce = base.brakeForce;
+            out.reverseForce = base.reverseForce;
+            out.turnRate = base.turnRate;
+            out.gripStep = base.gripStep * factor;
+            out.driftGripStep = base.driftGripStep * factor;
+            out.drag = base.drag;
+            out.roll = base.roll;
+            out.boostSpeed = base.boostSpeed;
+            out.mass = base.mass;
+        }
+        return out;
     }
 
     /**
@@ -1181,8 +1516,11 @@ export class NetClient {
         const present = this.viewPresent;
         if (this.snapStored === 0) {
             for (let s = 0; s < MAX_CARS; s++) present[s] = 0;
+            this.snap.trafViewCount = 0;
+            this.snap.evtViewCount = 0;
             return;
         }
+        this._fillRoadView();
 
         const renderTime = this._localMs(nowMs) - INTERP_DELAY;
         const head = this.snapHead;
@@ -1204,6 +1542,7 @@ export class NetClient {
             let oldest = head - (this.snapStored - 1);
             if (oldest < 0) oldest += SNAP_HISTORY;
             this._copyFrame(oldest);
+            this._trafficFrame(oldest, 0);
             return;
         }
         if (ib < 0) {
@@ -1211,13 +1550,14 @@ export class NetClient {
             let ahead = renderTime - times[ia];
             if (ahead > EXTRAPOLATE_MAX) ahead = EXTRAPOLATE_MAX;
             this._extrapolateFrame(ia, ahead * 0.001);
+            this._trafficFrame(ia, ahead * 0.001);
             return;
         }
 
         const t0 = times[ia];
         const t1 = times[ib];
         const span = t1 - t0;
-        if (span <= 0) { this._copyFrame(ib); return; }
+        if (span <= 0) { this._copyFrame(ib); this._trafficFrame(ib, 0); return; }
 
         const u = (renderTime - t0) / span;
         const hs = span * 0.001;            // длина интервала в секундах
@@ -1268,6 +1608,145 @@ export class NetClient {
             this.viewLap[s] = this.snapLap[kb];
             this.viewPlace[s] = this.snapPlace[kb];
         }
+
+        this._trafficPair(ia, ib, u, hs);
+    }
+
+    // =======================================================================
+    // Траффик: интерполяция и перевод в мировые координаты
+    // =======================================================================
+
+    /**
+     * Болванки между двумя кадрами истории. Эрмит считается ПО ДУГЕ (скорость
+     * — касательная), а не по мировым x и z: болванка по построению держится
+     * трассы, и прямая между двумя её положениями срезает дугу. На радиусе
+     * 20 м и шаге снапшота 50 мс срез доходит до 0,3 м — машина заметно
+     * «ныряет» к внутренней кромке двадцать раз в секунду.
+     */
+    _trafficPair(ia, ib, u, hs) {
+        const snap = this.snap;
+        const track = this.track;
+        if (!track) { snap.trafViewCount = 0; return; }
+        const sp = this.trafPresent;
+        const baseA = ia * MAX_TRAFFIC;
+        const baseB = ib * MAX_TRAFFIC;
+        const length = track.length;
+        const u2 = u * u;
+        const u3 = u2 * u;
+        const h00 = 2 * u3 - 3 * u2 + 1;
+        const h10 = u3 - 2 * u2 + u;
+        const h01 = -2 * u3 + 3 * u2;
+        const h11 = u3 - u2;
+        let out = 0;
+        for (let id = 0; id < MAX_TRAFFIC; id++) {
+            const ka = baseA + id;
+            const kb = baseB + id;
+            if (!sp[kb]) continue;
+            let arc;
+            let lat;
+            let dyaw;
+            if (!sp[ka]) {
+                arc = this.trafArc[kb] * length;
+                lat = this.trafLat[kb];
+                dyaw = this.trafDyaw[kb];
+            } else {
+                const a0 = this.trafArc[ka] * length;
+                let ds = this.trafArc[kb] * length - a0;
+                if (ds > length * 0.5) ds -= length;
+                else if (ds < -length * 0.5) ds += length;
+                const v0 = this.trafSpeed[ka];
+                const v1 = this.trafSpeed[kb];
+                // Эрмит с p0 = 0 и p1 = ds: член h00 * p0 обнуляется.
+                arc = a0 + h10 * hs * v0 + h01 * ds + h11 * hs * v1;
+                lat = this.trafLat[ka] + (this.trafLat[kb] - this.trafLat[ka]) * u;
+                const d0 = this.trafDyaw[ka];
+                dyaw = d0 + shortAngle(d0, this.trafDyaw[kb]) * u;
+            }
+            out = this._writeTraffic(out, id, arc, lat, dyaw);
+        }
+        snap.trafViewCount = out;
+    }
+
+    /** Болванки одного кадра истории, сдвинутые вперёд по скорости. */
+    _trafficFrame(index, ahead) {
+        const snap = this.snap;
+        const track = this.track;
+        if (!track) { snap.trafViewCount = 0; return; }
+        const base = index * MAX_TRAFFIC;
+        const sp = this.trafPresent;
+        const length = track.length;
+        let out = 0;
+        for (let id = 0; id < MAX_TRAFFIC; id++) {
+            const k = base + id;
+            if (!sp[k]) continue;
+            const arc = this.trafArc[k] * length + this.trafSpeed[k] * ahead;
+            out = this._writeTraffic(out, id, arc, this.trafLat[k], this.trafDyaw[k]);
+        }
+        snap.trafViewCount = out;
+    }
+
+    /**
+     * Дуга и смещение -> мировая точка и курс, прямо в буфер снапшота.
+     * Это обратное преобразование к тому, которым сервер собирал запись:
+     * точка берётся с той же осевой линии, поэтому болванка не уезжает
+     * с полотна из-за квантования.
+     */
+    _writeTraffic(out, id, arc, lat, dyaw) {
+        const track = this.track;
+        const snap = this.snap;
+        const n = track.count;
+        const length = track.length;
+        let a = arc % length;
+        if (a < 0) a += length;
+        let i = Math.floor(a * track.invStep);
+        if (i >= n) i = n - 1;
+        else if (i < 0) i = 0;
+        const along = a - track.cs[i];
+        const j = i + 1 < n ? i + 1 : 0;
+        let f = along * track.invStep;
+        if (f > 1) f = 1;
+        else if (f < 0) f = 0;
+        snap.trafViewX[out] = track.cx[i] + track.ctx[i] * along + track.cnx[i] * lat;
+        snap.trafViewZ[out] = track.cz[i] + track.ctz[i] * along + track.cnz[i] * lat;
+        snap.trafViewY[out] = track.cy[i] + (track.cy[j] - track.cy[i]) * f;
+        snap.trafViewYaw[out] = this.trackYaw[i] + dyaw;
+        snap.trafViewLook[out] = this.trafLook[id];
+        return out + 1;
+    }
+
+    /**
+     * Происшествия в мировые координаты — прямо в буфер снапшота. Двигать
+     * их нечем, поэтому берутся из последнего снапшота как есть; их не
+     * больше шести, и считается это раз в кадр за десяток умножений.
+     */
+    _fillRoadView() {
+        const snap = this.snap;
+        const track = this.track;
+        const count = this.roadCount;
+        if (!track || count === 0) { snap.evtViewCount = 0; return; }
+        const n = track.count;
+        for (let i = 0; i < count; i++) {
+            const a = this.roadArc[i];
+            let k = Math.floor(a * track.invStep);
+            if (k >= n) k = n - 1;
+            else if (k < 0) k = 0;
+            const along = a - track.cs[k];
+            const j = k + 1 < n ? k + 1 : 0;
+            let f = along * track.invStep;
+            if (f > 1) f = 1;
+            else if (f < 0) f = 0;
+            const lat = this.roadLat[i];
+            snap.evtViewId[i] = this.roadId[i];
+            snap.evtViewKind[i] = this.roadKind[i];
+            snap.evtViewPhase[i] = this.roadPhase[i];
+            snap.evtViewX[i] = track.cx[k] + track.ctx[k] * along + track.cnx[k] * lat;
+            snap.evtViewZ[i] = track.cz[k] + track.ctz[k] * along + track.cnz[k] * lat;
+            snap.evtViewY[i] = track.cy[k] + (track.cy[j] - track.cy[k]) * f;
+            snap.evtViewYaw[i] = this.trackYaw[k];
+            snap.evtViewHalfLen[i] = this.roadHalfLen[i];
+            snap.evtViewHalfWidth[i] = this.roadHalfWidth[i];
+        }
+        snap.evtViewCount = count;
     }
 
     /** Кадр истории как есть (заморозка). */

@@ -64,7 +64,7 @@ const GFX_VALUE_LABELS = {
     viewDistance: { near: 'Ближе', normal: 'Обычно', far: 'Дальше' },
     nightLights:  { off: 'Выкл', normal: 'Норма', bright: 'Ярче' },
     timeOfDay:    { auto: 'Авто', day: 'День', dusk: 'Закат', night: 'Ночь' },
-    weather:      { auto: 'Авто', clear: 'Ясно', wet: 'Дождь' },
+    weather:      { auto: 'Авто', clear: 'Ясно', wet: 'Дождь', snow: 'Снег', fog: 'Туман' },
 };
 
 /** Безопасное чтение localStorage: в приватном окне доступ может бросать. */
@@ -156,15 +156,17 @@ export function itemIconSvg(itemId, size, fill) {
         + ITEM_PATHS[def.id] + '</svg>';
 }
 
-// --- время суток комнаты ----------------------------------------------------
+// --- время суток и погода комнаты -------------------------------------------
 //
-// Это НАСТРОЙКА КОМНАТЫ (settings.time_of_day), а не личная галочка графики:
-// её видят все игроки. Личное переопределение живёт отдельно, в блоке
-// настроек графики (`racing.gfx.timeofday`, значение `auto` = «как в комнате»).
+// Это НАСТРОЙКИ КОМНАТЫ (settings.time_of_day, settings.weather), а не личные
+// галочки графики: их видят все игроки. Личное переопределение живёт отдельно,
+// в блоке настроек графики (`racing.gfx.timeofday` и `racing.gfx.weather`,
+// значение `auto` = «как в комнате»).
 //
-// Список и подписи держатся здесь одним местом: их берёт и форма создания
-// комнаты, и панель настроек лобби. Погода, когда приедет, ляжет рядом
-// такой же тройкой (значения, подписи, иконка).
+// Списки и подписи держатся здесь одним местом: их берёт и форма создания
+// комнаты, и панель настроек лобби. Погода устроена ровно как время суток —
+// той же тройкой (значения, подписи, иконка) и тем же правилом при смене
+// карты, поэтому оба блока строятся почти одинаковым кодом.
 
 // --- режим комнаты: одиночная гонка или чемпионат ---------------------------
 //
@@ -215,6 +217,56 @@ const TOD_COLORS = { day: '#ffc53d', dusk: '#ff8a3d', night: '#7aa7ff' };
 export function timeOfDayIconSvg(tod, size) {
     const art = TOD_ART[tod] || TOD_ART.day;
     const color = TOD_COLORS[tod] || TOD_COLORS.day;
+    return envIconSvg(art, color, size);
+}
+
+// --- погода комнаты ---------------------------------------------------------
+//
+// Зеркало server/config.WEATHERS. Сервер всё равно проверяет поле сам
+// (код ошибки bad_weather), здесь это только для формы и подписей.
+//
+// Порядок значений тот же, что на сервере: первое — умолчание.
+
+export const ROOM_WEATHERS = ['clear', 'wet', 'snow', 'fog'];
+
+export const ROOM_WEATHER_LABELS = {
+    clear: 'Ясно', wet: 'Дождь', snow: 'Снег', fog: 'Туман',
+};
+
+// Пояснение говорит про сцепление, а не только про картинку: погода —
+// не украшение, она меняет то, как машина едет.
+const ROOM_WEATHER_DESC = {
+    clear: 'Сухо, полное сцепление',
+    wet: 'Мокрое полотно, сцепления меньше',
+    snow: 'Снегопад, скользко сильнее всего',
+    fog: 'Сухо, но видно недалеко',
+};
+
+// Тот же приём, что у TOD_ART: контур из штрихов, обводится дважды.
+const WEATHER_ART = {
+    clear: '<circle cx="34" cy="28" r="8"/>'
+        + '<path d="M34 10v4M34 42v4M12 28h4M52 28h4M19 13l3 3M46 40l3 3'
+        + 'M49 13l-3 3M22 40l-3 3"/>',
+    wet: '<path d="M20 31a8 8 0 0 1 1-15 12 12 0 0 1 23 2 7 7 0 0 1 0 13z"/>'
+        + '<path d="M23 38l-3 8M34 38l-3 8M45 38l-3 8"/>',
+    snow: '<path d="M34 10v36M18 19l32 18M50 19L18 37"/>'
+        + '<path d="M29 14l5 5 5-5M29 42l5-5 5 5"/>',
+    fog: '<path d="M13 18h30M22 27h33M11 36h28M20 45h32"/>',
+};
+
+const WEATHER_COLORS = {
+    clear: '#ffc53d', wet: '#5aa9ff', snow: '#cfe8ff', fog: '#9aa6b5',
+};
+
+/** Иконка погоды в том же кадре 68x56, что и силуэт трассы. */
+export function weatherIconSvg(weather, size) {
+    const art = WEATHER_ART[weather] || WEATHER_ART.clear;
+    const color = WEATHER_COLORS[weather] || WEATHER_COLORS.clear;
+    return envIconSvg(art, color, size);
+}
+
+/** Общий кадр иконок окружения: тёмный «карандаш» под цветным контуром. */
+function envIconSvg(art, color, size) {
     return '<svg viewBox="0 0 68 56" width="' + size + '" height="' + (size * 56 / 68)
         + '" fill="none" stroke-linecap="round" stroke-linejoin="round">'
         + '<g stroke="#080a12" stroke-width="10">' + art + '</g>'
@@ -283,12 +335,14 @@ const STATE_LABELS = {
 };
 
 // Настройки комнаты по умолчанию — ровно схема из раздела 9.
-// time_of_day здесь только заглушка: настоящее умолчание приходит из
-// описания выбранной карты (welcome.content.tracks[].time_of_day).
+// time_of_day и weather здесь только заглушки: настоящее умолчание приходит
+// из описания выбранной карты (welcome.content.tracks[] несёт оба поля —
+// сервер кладёт их туда таблицей config.ENV_FIELDS).
 function defaultRoomSettings() {
     return {
         track: 'office',
         time_of_day: ROOM_TIMES_OF_DAY[0],
+        weather: ROOM_WEATHERS[0],
         laps: 3,
         max_players: 8,
         items_enabled: true,
@@ -711,29 +765,21 @@ export class MenuScreen {
         trackField.appendChild(this.trackCards);
         grid.appendChild(trackField);
 
-        // Время суток: настройка комнаты, стоит сразу под выбором карты,
-        // потому что умолчание берётся именно из карты.
-        const todField = el('div', 'field form-wide');
-        todField.appendChild(el('div', 'label', 'Время суток'));
-        this.todCards = el('div', 'track-cards');
-        this.todButtons = [];
-        for (let i = 0; i < ROOM_TIMES_OF_DAY.length; i++) {
-            const tod = ROOM_TIMES_OF_DAY[i];
-            const card = el('button', 'track-card');
-            card.type = 'button';
-            const art = el('div');
-            art.innerHTML = timeOfDayIconSvg(tod, 68);
-            card.appendChild(art);
-            card.appendChild(el('div', 't-name', ROOM_TOD_LABELS[tod]));
-            card.appendChild(el('div', 't-desc', ROOM_TOD_DESC[tod]));
-            card.addEventListener('click', () => this._selectTimeOfDay(tod));
-            this.todCards.appendChild(card);
-            this.todButtons.push({ id: tod, node: card });
-        }
-        todField.appendChild(this.todCards);
-        this.todHint = el('div', 'gfx-hint');
-        todField.appendChild(this.todHint);
-        grid.appendChild(todField);
+        // Окружение: время суток и погода. Оба — настройки комнаты, оба
+        // стоят сразу под выбором карты, потому что умолчание обоих берётся
+        // именно из карты. Ряды строятся одним и тем же кодом: это два поля
+        // одного механизма (§12.16), и выглядеть они обязаны одинаково.
+        const tod = this._buildEnvField(grid, 'Время суток', ROOM_TIMES_OF_DAY,
+            ROOM_TOD_LABELS, ROOM_TOD_DESC, timeOfDayIconSvg,
+            (id) => this._selectTimeOfDay(id));
+        this.todButtons = tod.buttons;
+        this.todHint = tod.hint;
+
+        const weather = this._buildEnvField(grid, 'Погода', ROOM_WEATHERS,
+            ROOM_WEATHER_LABELS, ROOM_WEATHER_DESC, weatherIconSvg,
+            (id) => this._selectWeather(id));
+        this.weatherButtons = weather.buttons;
+        this.weatherHint = weather.hint;
 
         // Круги
         const lapsField = el('div', 'field');
@@ -867,6 +913,42 @@ export class MenuScreen {
         return back;
     }
 
+    /**
+     * Ряд карточек выбора для поля окружения (время суток, погода).
+     *
+     * Карточки те же, что у выбора трассы: иконка, название, пояснение.
+     * Сетка задана в стилях на три колонки; когда значений больше, число
+     * колонок правится здесь же инлайном — так ряд из четырёх карточек
+     * не переносится на вторую строку, а стили трогать не приходится.
+     */
+    _buildEnvField(grid, title, values, labels, descs, iconSvg, onPick) {
+        const field = el('div', 'field form-wide');
+        field.appendChild(el('div', 'label', title));
+        const cards = el('div', 'track-cards');
+        if (values.length !== 3) {
+            cards.style.gridTemplateColumns = 'repeat(' + values.length + ', 1fr)';
+        }
+        const buttons = [];
+        for (let i = 0; i < values.length; i++) {
+            const id = values[i];
+            const card = el('button', 'track-card');
+            card.type = 'button';
+            const art = el('div');
+            art.innerHTML = iconSvg(id, 68);
+            card.appendChild(art);
+            card.appendChild(el('div', 't-name', labels[id] || id));
+            card.appendChild(el('div', 't-desc', descs[id] || ''));
+            card.addEventListener('click', () => onPick(id));
+            cards.appendChild(card);
+            buttons.push({ id: id, node: card });
+        }
+        field.appendChild(cards);
+        const hint = el('div', 'gfx-hint');
+        field.appendChild(hint);
+        grid.appendChild(field);
+        return { field: field, cards: cards, buttons: buttons, hint: hint };
+    }
+
     _buildStepper(min, max, onChange) {
         const node = el('div', 'stepper');
         const minus = el('button', 'step', '–');
@@ -927,9 +1009,10 @@ export class MenuScreen {
         if (tracks.length && !this._hasTrack(this.draft.track)) {
             this.draft.track = tracks[0].id;
             this.draft.time_of_day = this._trackTimeOfDay(this.draft.track);
+            this.draft.weather = this._trackWeather(this.draft.track);
         }
         this._syncTrackCards();
-        this._syncTimeOfDay();
+        this._syncEnvironment();
     }
 
     _hasTrack(id) {
@@ -939,32 +1022,49 @@ export class MenuScreen {
     }
 
     _selectTrack(id) {
-        // Правило то же, что на сервере (см. validate_settings): время суток,
-        // равное предложению ПРЕДЫДУЩЕЙ карты, ехало за картой — пусть едет
-        // и за новой. Выбранное руками (отличное от предложения) остаётся.
+        // Правило то же, что на сервере (см. validate_settings) и одно на оба
+        // поля окружения: значение, равное предложению ПРЕДЫДУЩЕЙ карты, ехало
+        // за картой — пусть едет и за новой. Выбранное руками (отличное от
+        // предложения) остаётся.
         if (this.draft.time_of_day === this._trackTimeOfDay(this.draft.track)) {
             this.draft.time_of_day = this._trackTimeOfDay(id);
         }
+        if (this.draft.weather === this._trackWeather(this.draft.track)) {
+            this.draft.weather = this._trackWeather(id);
+        }
         this.draft.track = id;
         this._syncTrackCards();
-        this._syncTimeOfDay();
+        this._syncEnvironment();
     }
 
-    /** Время суток, предложенное описанием карты (welcome.content.tracks[]). */
-    _trackTimeOfDay(id) {
+    /** Поле окружения, предложенное описанием карты (welcome.content.tracks[]). */
+    _trackEnvField(id, field, values) {
         const tracks = (this.content && this.content.tracks) || [];
         for (let i = 0; i < tracks.length; i++) {
             if (tracks[i].id === id) {
-                const tod = tracks[i].time_of_day;
-                if (ROOM_TIMES_OF_DAY.indexOf(tod) >= 0) return tod;
+                const value = tracks[i][field];
+                if (values.indexOf(value) >= 0) return value;
             }
         }
-        return ROOM_TIMES_OF_DAY[0];
+        return values[0];
+    }
+
+    _trackTimeOfDay(id) {
+        return this._trackEnvField(id, 'time_of_day', ROOM_TIMES_OF_DAY);
+    }
+
+    _trackWeather(id) {
+        return this._trackEnvField(id, 'weather', ROOM_WEATHERS);
     }
 
     _selectTimeOfDay(tod) {
         this.draft.time_of_day = tod;
-        this._syncTimeOfDay();
+        this._syncEnvironment();
+    }
+
+    _selectWeather(weather) {
+        this.draft.weather = weather;
+        this._syncEnvironment();
     }
 
     _selectMode(mode) {
@@ -997,18 +1097,23 @@ export class MenuScreen {
         this.extraHint.textContent = parts.join(' ');
     }
 
-    _syncTimeOfDay() {
-        if (!this.todButtons) return;
-        const chosen = this.draft.time_of_day;
-        for (let i = 0; i < this.todButtons.length; i++) {
-            const entry = this.todButtons[i];
-            entry.node.classList.toggle('is-active', entry.id === chosen);
+    /** Оба ряда окружения: подсветка выбранного и предложение карты. */
+    _syncEnvironment() {
+        this._syncEnvRow(this.todButtons, this.todHint, this.draft.time_of_day,
+            this._trackTimeOfDay(this.draft.track), ROOM_TOD_LABELS);
+        this._syncEnvRow(this.weatherButtons, this.weatherHint, this.draft.weather,
+            this._trackWeather(this.draft.track), ROOM_WEATHER_LABELS);
+    }
+
+    _syncEnvRow(buttons, hint, chosen, proposed, labels) {
+        if (!buttons) return;
+        for (let i = 0; i < buttons.length; i++) {
+            buttons[i].node.classList.toggle('is-active', buttons[i].id === chosen);
         }
         // Выбор руками не перетирается сменой карты, поэтому расхождение
         // с предложением карты показываем прямо здесь, а не молчим о нём.
-        const proposed = this._trackTimeOfDay(this.draft.track);
-        this.todHint.textContent = proposed === chosen
-            ? '' : 'Карта предлагает: ' + ROOM_TOD_LABELS[proposed];
+        hint.textContent = proposed === chosen
+            ? '' : 'Карта предлагает: ' + (labels[proposed] || proposed);
     }
 
     _syncTrackCards() {
@@ -1048,6 +1153,7 @@ export class MenuScreen {
         }
         // Форма открывается с умолчанием выбранной карты — как и в лобби.
         this.draft.time_of_day = this._trackTimeOfDay(this.draft.track);
+        this.draft.weather = this._trackWeather(this.draft.track);
         this.roomNameInput.value = 'Комната: ' + this.getName();
         this.lapsStepper.set(this.draft.laps);
         this.maxStepper.set(this.draft.max_players);
@@ -1057,7 +1163,7 @@ export class MenuScreen {
         this.handicapInput.checked = this.draft.handicap;
         this.replayInput.checked = this.draft.replay;
         this._syncTrackCards();
-        this._syncTimeOfDay();
+        this._syncEnvironment();
         this._syncItemChecks();
         this._syncMode();
         this._syncExtraHints();
@@ -1076,6 +1182,7 @@ export class MenuScreen {
         const settings = {
             track: this.draft.track,
             time_of_day: this.draft.time_of_day,
+            weather: this.draft.weather,
             laps: this.draft.laps,
             max_players: this.draft.max_players,
             items_enabled: this.draft.items_enabled,

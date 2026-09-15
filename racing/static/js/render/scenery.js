@@ -43,10 +43,11 @@
  * --------------------------------------------------------------------------
  * ОКРУЖЕНИЕ ПРИХОДИТ ПАРАМЕТРОМ
  * --------------------------------------------------------------------------
- * Время суток (и дальше — погода) НЕ зашито в трассу: это настройка комнаты.
+ * Время суток и погода НЕ зашиты в трассу: это настройки комнаты.
  * buildScenery принимает объект окружения `opts.env` вида
  *
- *     { timeOfDay: 'day' | 'dusk' | 'night', weather: 'clear' }
+ *     { timeOfDay: 'day' | 'dusk' | 'night',
+ *       weather: 'clear' | 'wet' | 'snow' | 'fog' }
  *
  * Принимаются и змеиные имена полей (`time_of_day`), потому что объект
  * приходит из JSON настроек комнаты как есть. Неизвестные значения молча
@@ -55,9 +56,10 @@
  * умолчанию, которое лобби предлагает при выборе карты.
  *
  * Сумерки не заданы отдельной таблицей: они считаются интерполяцией между
- * днём и ночью с тёплой подмешанной полосой у горизонта. Тот же приём
- * готов принять погоду: она меняет те же поля (туман, свет, небо) и
- * накладывается поверх времени суток.
+ * днём и ночью с тёплой подмешанной полосой у горизонта. Погода легла на
+ * тот же приём: она меняет те же поля (туман, свет, небо) и накладывается
+ * поверх времени суток. Сверх таблицы дождь и снег добавляют осадки — один
+ * меш, один вызов отрисовки, движение целиком в вершинном шейдере.
  */
 
 import * as THREE from 'three';
@@ -124,8 +126,14 @@ export const TIMES_OF_DAY = ['day', 'dusk', 'night'];
  * Погода. Приходит тем же каналом, что и время суток, и ложится ПОВЕРХ него:
  * меняются те же поля (небо, туман, свет, облака и звёзды), а полотно
  * дополнительно темнеет и получает френелевский блик — это уже trackmesh.js.
+ * Сверх таблицы дождь и снег добавляют осадки: один меш, один вызов
+ * отрисовки, движение целиком в вершинном шейдере (см. buildPrecipitation).
+ *
+ * Зеркало server/config.WEATHERS, порядок тот же: первое — умолчание.
+ * Значение, которого здесь нет, молча становится `clear`: сцена обязана
+ * собраться на любом входе.
  */
-export const WEATHERS = ['clear', 'wet'];
+export const WEATHERS = ['clear', 'wet', 'snow', 'fog'];
 
 export const ENV_DEFAULT = { timeOfDay: 'day', weather: 'clear' };
 
@@ -262,21 +270,62 @@ function makeDusk(day, night) {
 }
 
 /**
+ * Затянуть цвет тучами: убрать цветность и притушить.
+ *
+ * Именно так, а НЕ подмешиванием фиксированного серого. Серый средней
+ * яркости осветлил бы ночное небо, и дождливая ночь вышла бы СВЕТЛЕЕ ясной —
+ * ровно наоборот тому, что нужно, и с потерей главного ночного вида
+ * (отражения огней в мокром асфальте, §12.16). Обесцвечивание с потемнением
+ * работает одинаково на любой исходной яркости: днём даёт свинец, ночью
+ * оставляет ночь.
+ */
+function overcast(hex, desat, dark) {
+    const c = toColor(hex);
+    const lum = c.r * 0.299 + c.g * 0.587 + c.b * 0.114;
+    c.r += (lum - c.r) * desat;
+    c.g += (lum - c.g) * desat;
+    c.b += (lum - c.b) * desat;
+    c.multiplyScalar(dark);
+    return '#' + c.getHexString();
+}
+
+/**
  * Погода поверх времени суток. Небо затягивает, солнце слабеет, туман
  * подступает и сереет, звёзды пропадают. Стоит это ноль: меняются числа
  * в таблице, из которой и так собирается сцена.
+ *
+ *   sky, fogc, cloud — пара [обесцветить, притушить] для overcast()
+ *   ambc, dirc       — обесцвечивание цвета света (яркость правит *K)
+ *   ambK, dirK       — множители яркости рассеянного и направленного света
+ *   fogK             — во столько раз ближе туман (он же правит отсечение)
+ *   cloudK, starK    — доля облаков и звёзд
  */
 const WEATHER_ENV = {
     clear: null,
+    // Дождь: свинцовое небо, солнце за облаками, туман ближе и серее.
     wet: {
-        gray: '#67707c',
-        skyK: 0.42,      // насколько небо уходит в серое
-        fogMix: 0.40,
-        fogK: 0.82,      // во столько раз ближе туман
-        ambK: 0.92,
-        dirK: 0.55,      // солнце за облаками
-        cloudK: 1.5,
-        starK: 0.0
+        sky: [0.62, 0.78], fogc: [0.55, 0.84], cloud: [0.50, 0.80],
+        ambc: 0.45, ambK: 0.88,
+        dirc: 0.55, dirK: 0.50,
+        fogK: 0.82, cloudK: 1.5, starK: 0.0
+    },
+    // Снегопад светлее дождя, а не темнее: тучи те же, но снизу всё
+    // отражает. Поэтому цвета не тушатся вовсе, а рассеянный свет даже
+    // чуть сильнее — тени на снегу мягкие.
+    snow: {
+        sky: [0.74, 1.02], fogc: [0.66, 1.04], cloud: [0.35, 1.0],
+        ambc: 0.40, ambK: 1.04,
+        dirc: 0.55, dirK: 0.46,
+        fogK: 0.70, cloudK: 1.6, starK: 0.0
+    },
+    // Туман — единственная погода без осадков: полотно сухое, меняется
+    // только дальность. Она же правит отсечение (renderer.applyViewDistance
+    // считает предел от sc.fog.far), поэтому туман ещё и дешевле ясного дня.
+    fog: {
+        sky: [0.82, 0.90], fogc: [0.76, 0.98], cloud: [0.6, 0.92],
+        ambc: 0.55, ambK: 0.95,
+        dirc: 0.62, dirK: 0.32,
+        fogK: 0.44, cloudK: 1.2, starK: 0.0
     }
 };
 
@@ -285,20 +334,278 @@ function applyWeather(env, weather) {
     const W = WEATHER_ENV[weather];
     if (!W) return env;
     return {
-        zenith: mixHex(env.zenith, W.gray, W.skyK),
-        horizon: mixHex(env.horizon, W.gray, W.skyK),
-        fog: mixHex(env.fog, W.gray, W.fogMix),
+        zenith: overcast(env.zenith, W.sky[0], W.sky[1]),
+        horizon: overcast(env.horizon, W.sky[0], W.sky[1]),
+        fog: overcast(env.fog, W.fogc[0], W.fogc[1]),
         ambient: {
-            color: mixHex(env.ambient.color, W.gray, 0.3),
+            color: overcast(env.ambient.color, W.ambc, 1),
             intensity: env.ambient.intensity * W.ambK
         },
         dir: {
-            color: mixHex(env.dir.color, W.gray, 0.35),
+            color: overcast(env.dir.color, W.dirc, 1),
             intensity: env.dir.intensity * W.dirK,
             dir: env.dir.dir.slice()
         },
-        cloud: mixHex(env.cloud, W.gray, 0.45)
+        cloud: overcast(env.cloud, W.cloud[0], W.cloud[1])
     };
+}
+
+// ---------------------------------------------------------------------------
+// Осадки
+// ---------------------------------------------------------------------------
+//
+// Дождь и снег — ОДИН обычный меш на всю сцену: один вызов отрисовки, ноль
+// аллокаций в кадре и ноль работы для процессора. Частицы не двигаются
+// на процессоре вовсе: падение, заворот по высоте, снос ветром и покачивание
+// снежинок считает вершинный шейдер от общего uniform времени — того самого,
+// который updateAnim() и так обновляет каждый кадр для качания декора.
+//
+// Коробка осадков ездит за камерой (это делает updateSky, который рендер
+// и так зовёт каждый кадр). Частицы разложены по ней равномерно, поэтому
+// переезд коробки не виден: в любой момент вокруг камеры одна и та же
+// плотность. Ради этого же вокруг камеры оставлена пустая сфера — капля
+// в сантиметре от объектива читалась бы как грязь на экране.
+//
+// Каждая частица — ДВА скрещённых прямоугольника, а не один: меш не
+// поворачивается за камерой, и одиночный прямоугольник исчезал бы, если
+// смотреть на него с ребра. Скрещённая пара видна с любого направления
+// и стоит вдвое дешевле настоящего билборда в шейдере.
+
+/**
+ * Осадки по погоде. `count` — потолок при высоком пресете; ниже он
+ * умножается на долю пресета и на выбранную плотность декора.
+ *
+ *   fall   — скорость падения, м/с
+ *   len    — длина штриха (снежинки — почти квадрат), м
+ *   wide   — половина ширины штриха, м
+ *   slant  — насколько ветер кладёт штрих набок
+ *   wobble — горизонтальное покачивание (только снег), м
+ *   box    — сторона коробки вокруг камеры, м; height — её высота
+ *   eye    — где в коробке по высоте сидит камера, доля
+ *   hole   — радиус пустоты вокруг камеры, м
+ */
+const PRECIP = {
+    wet: {
+        count: 820, fall: 26.0, len: 1.15, wide: 0.027,
+        color: '#cfdced', alpha: 0.34, slant: 0.55, wobble: 0.0,
+        box: 58, height: 26, eye: 0.42, hole: 2.4
+    },
+    snow: {
+        count: 900, fall: 3.4, len: 0.085, wide: 0.072,
+        color: '#ffffff', alpha: 0.82, slant: 0.35, wobble: 0.5,
+        box: 46, height: 24, eye: 0.42, hole: 1.8
+    }
+};
+
+/** Доля частиц от пресета качества. Низкий пресет осадки не отменяет. */
+const PRECIP_QUALITY = { low: 0.34, medium: 0.7, high: 1.0 };
+
+/**
+ * Плотность декора правит и осадки: это одна и та же жалоба игрока
+ * («слишком много всего») и один и тот же переключатель в меню.
+ * Разброс тут мягче, чем у декора: осадки в полтора раза гуще уже мешают
+ * видеть трассу, а это запрещено.
+ */
+const PRECIP_DECOR_K = { sparse: 0.62, normal: 1.0, dense: 1.3 };
+
+/**
+ * Снос ветром: ровный фон плюс встречный поток от скорости машины.
+ *
+ * Скорость берётся из смещения камеры, ПОДЕЛЕННОГО НА ШАГ ВРЕМЕНИ, а не из
+ * смещения за кадр: иначе на просевшем кадре струи ложились бы плашмя, и
+ * дождь застил бы обзор ровно тогда, когда видеть трассу важнее всего.
+ */
+const WIND_BASE_X = 0.40;
+const WIND_BASE_Z = 0.22;
+const WIND_FROM_SPEED = 0.055;   // метров сноса на каждый м/с скорости
+const WIND_MAX = 1.9;            // потолок сноса, м: дальше струи ложатся плашмя
+const WIND_SMOOTH = 0.12;        // доля нового замера в сглаженном сносе
+const WIND_DT_MAX = 0.2;         // шаг длиннее считаем разрывом, а не кадром
+
+function clamp(v, lo, hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/**
+ * Построить осадки выбранной погоды или вернуть null, если их нет.
+ *
+ * @param {string} weather ключ PRECIP
+ * @param {string} qName   пресет качества
+ * @param {string} decor   выбранная плотность декора или null
+ * @param {object} timeUniform общий {value} времени (его двигает updateAnim)
+ * @param {Rng} rng детерминированная расстановка
+ */
+function buildPrecipitation(weather, qName, decor, timeUniform, rng) {
+    const P = PRECIP[weather];
+    if (!P) return null;
+    const qk = PRECIP_QUALITY[qName] === undefined ? 1 : PRECIP_QUALITY[qName];
+    const dk = PRECIP_DECOR_K[decor] === undefined ? 1 : PRECIP_DECOR_K[decor];
+    const count = Math.max(40, Math.round(P.count * qk * dk));
+
+    const half = P.box * 0.5;
+    const hole2 = P.hole * P.hole;
+    // 2 прямоугольника * 2 треугольника * 3 вершины
+    const verts = count * 12;
+    const pos = new Float32Array(verts * 3);
+    const corner = new Float32Array(verts * 3);
+    const col = new Float32Array(verts * 3);
+    const base = toColor(P.color);
+    const tint = new THREE.Color();
+
+    // Углы прямоугольника в порядке обхода: два треугольника (0,1,2) и (0,2,3).
+    const ORDER = [0, 1, 2, 0, 2, 3];
+    const halfLen = P.len * 0.5;
+    const w = P.wide;
+    // плоскость A развёрнута по X, плоскость B — по Z
+    const planes = [
+        [[-w, -halfLen, 0], [w, -halfLen, 0], [w, halfLen, 0], [-w, halfLen, 0]],
+        [[0, -halfLen, -w], [0, -halfLen, w], [0, halfLen, w], [0, halfLen, -w]]
+    ];
+
+    let v = 0;
+    for (let i = 0; i < count; i++) {
+        let hx = 0, hz = 0;
+        // Пустая сфера вокруг камеры: капля вплотную к объективу выглядит
+        // грязью на стекле, а не дождём. Отбор, а не сдвиг — сдвиг сбил бы
+        // равномерность и дал бы кольцо.
+        for (let tries = 0; tries < 8; tries++) {
+            hx = rng.range(-half, half);
+            hz = rng.range(-half, half);
+            if (hx * hx + hz * hz > hole2) break;
+        }
+        const hy = rng.range(0, P.height);
+        // Яркость вразнобой: ровная стена одинаковых штрихов читается сеткой.
+        tint.copy(base).multiplyScalar(rng.range(0.72, 1.0));
+        for (let p = 0; p < 2; p++) {
+            const quad = planes[p];
+            for (let k = 0; k < 6; k++) {
+                const c = quad[ORDER[k]];
+                const o = v * 3;
+                pos[o] = hx; pos[o + 1] = hy; pos[o + 2] = hz;
+                corner[o] = c[0]; corner[o + 1] = c[1]; corner[o + 2] = c[2];
+                col[o] = tint.r; col[o + 1] = tint.g; col[o + 2] = tint.b;
+                v++;
+            }
+        }
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geom.setAttribute('aCorner', new THREE.BufferAttribute(corner, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    // Меш всегда вокруг камеры целиком: считать по нему сферу нечего,
+    // а автоматический расчёт отсёк бы его на краю кадра.
+    geom.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, P.height * 0.5, 0),
+        P.box * 1.5);
+
+    const windUniform = { value: new THREE.Vector3(WIND_BASE_X, 0, WIND_BASE_Z) };
+    const mat = makePrecipMaterial(weather, P, timeUniform, windUniform);
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.name = 'precipitation';
+    mesh.frustumCulled = false;
+    // Осадки рисуются последними: они полупрозрачны и не пишут глубину.
+    mesh.renderOrder = 6;
+
+    const group = new THREE.Group();
+    group.name = 'precip';
+    group.add(mesh);
+
+    let hasLast = false;
+    let lastX = 0, lastZ = 0, lastT = 0;
+    const wind = windUniform.value;
+
+    return {
+        group: group,
+        mesh: mesh,
+        material: mat,
+        weather: weather,
+        count: count,
+
+        /**
+         * Держать коробку осадков вокруг камеры. Зовётся из updateSky, то есть
+         * раз в кадр и без единой аллокации.
+         */
+        follow: function (camera) {
+            // Кубическая камера съёмки отражений — не камера (у неё нет
+            // isCamera), и осадки в отражении всё равно замерли бы: прячем.
+            const main = camera.isCamera === true;
+            mesh.visible = main;
+            if (!main) return;
+            const px = camera.position.x;
+            const pz = camera.position.z;
+            group.position.set(px, camera.position.y - P.height * P.eye, pz);
+            // Снос: струи не должны падать отвесно, когда машина едет 50 м/с.
+            // Шаг времени берётся из того же общего uniform, который обновляет
+            // updateAnim: отдельного часового механизма заводить не пришлось.
+            // Он отстаёт на кадр (updateSky зовут раньше updateAnim) — для
+            // сглаженной оценки скорости это ровно ничего не значит.
+            const t = timeUniform.value;
+            const dt = t - lastT;
+            let tx = WIND_BASE_X;
+            let tz = WIND_BASE_Z;
+            if (hasLast && dt > 1e-4 && dt < WIND_DT_MAX) {
+                tx += clamp(-(px - lastX) / dt * WIND_FROM_SPEED, -WIND_MAX, WIND_MAX);
+                tz += clamp(-(pz - lastZ) / dt * WIND_FROM_SPEED, -WIND_MAX, WIND_MAX);
+            }
+            hasLast = true;
+            lastX = px;
+            lastZ = pz;
+            lastT = t;
+            wind.x += (tx - wind.x) * WIND_SMOOTH;
+            wind.z += (tz - wind.z) * WIND_SMOOTH;
+        }
+    };
+}
+
+/**
+ * Материал осадков: вся работа в вершинном шейдере.
+ *
+ * Числа вшиты в исходник (glslNum), а не приехали uniform'ами: погода одна
+ * на сцену, программа компилируется один раз, и константа в шейдере дешевле
+ * чтения uniform на каждую вершину. Ключ кэша программы свой на погоду —
+ * без него three.js переиспользовал бы программу дождя для снега (12.16).
+ */
+function makePrecipMaterial(weather, P, timeUniform, windUniform) {
+    const mat = new THREE.MeshBasicMaterial({
+        vertexColors: true,
+        transparent: true,
+        opacity: P.alpha,
+        depthWrite: false,
+        fog: true,
+        side: THREE.DoubleSide,
+        forceSinglePass: true
+    });
+    mat.name = 'precip_' + weather;
+
+    const body = [
+        'vec3 precipHome = vec3( position );',
+        // фазовый разброс из самой позиции: лишнего атрибута не нужно
+        'float precipPhase = precipHome.x * 0.41 + precipHome.z * 0.73;',
+        'float precipY = mod( precipHome.y - uTime * ' + glslNum(P.fall)
+            + ' + precipPhase, ' + glslNum(P.height) + ' );',
+        'vec3 transformed = vec3( precipHome.x, precipY, precipHome.z );',
+        P.wobble > 0
+            ? 'transformed.x += sin( uTime * 1.3 + precipPhase * 3.1 ) * '
+                + glslNum(P.wobble) + ';\n'
+              + 'transformed.z += cos( uTime * 1.1 + precipPhase * 2.3 ) * '
+                + glslNum(P.wobble) + ';'
+            : '',
+        // сама частица плюс наклон штриха по ветру
+        'transformed += aCorner;',
+        'transformed.xz += uWind.xz * aCorner.y * ' + glslNum(P.slant) + ';'
+    ].join('\n');
+
+    mat.onBeforeCompile = function (shader) {
+        shader.uniforms.uTime = timeUniform;
+        shader.uniforms.uWind = windUniform;
+        shader.vertexShader = 'uniform float uTime;\nuniform vec3 uWind;\n'
+            + 'attribute vec3 aCorner;\n'
+            + shader.vertexShader.replace('#include <begin_vertex>', body);
+    };
+    mat.customProgramCacheKey = function () {
+        return 'precip:' + weather;
+    };
+    return mat;
 }
 
 /**
@@ -484,6 +791,16 @@ export function buildScenery(track, theme, seed, quality, opts) {
     }
     group.add(skyGroup);
 
+    // Осадки: один меш, один вызов отрисовки, движение в вершинном шейдере.
+    // Плотность — от пресета качества и от той же настройки «плотность
+    // декора», которой игрок и так убавляет всё лишнее в кадре.
+    const precip = buildPrecipitation(weatherName, qName, decorLevel,
+        timeUniform, new Rng(baseSeed ^ 0x9a1f));
+    if (precip) {
+        group.add(precip.group);
+        ctx.materials.push(precip.material);
+    }
+
     const fogColor = toColor(env.fog);
     const fogFar = Q.fogFar * tod.fogK * (wx ? wx.fogK : 1);
     const sets = ctx.sets;
@@ -502,6 +819,8 @@ export function buildScenery(track, theme, seed, quality, opts) {
         timeOfDay: todName,
         weather: weatherName,
         environment: environment,
+        // осадки: null, если у этой погоды их нет (ясно, туман)
+        precip: precip,
 
         // параметры, которые применяет renderer.js
         fog: { color: fogColor, near: fogFar * 0.35, far: fogFar },
@@ -523,6 +842,9 @@ export function buildScenery(track, theme, seed, quality, opts) {
         updateSky: function (camera) {
             skyGroup.position.x = camera.position.x;
             skyGroup.position.z = camera.position.z;
+            // Коробка осадков ездит за камерой тем же вызовом: отдельного
+            // обхода кадра под неё заводить не пришлось.
+            if (precip) precip.follow(camera);
         },
 
         /**

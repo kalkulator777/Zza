@@ -14,8 +14,18 @@
  *
  *   shadowMesh   1   круглые тени всех восьми машин (никаких shadow map)
  *   boxMesh      1   все боксы с бонусами трассы
- *   effects      0-5 см. шапку effects.js
+ *   trafficMesh  0-2 ВЕСЬ траффик: по одному InstancedMesh на силуэт
+ *   effects      0-7 см. шапку effects.js
  *   cockpit      0-2 панель и руль, только в виде из кокпита
+ *
+ * Траффик отдельно. Гонщик стоит четыре вызова (кузов, колёса, фары, стопы),
+ * то есть двенадцать болванок наивным способом стоили бы 48 вызовов — весь
+ * бюджет кадра. Поэтому болванке собирается ОДНА слитая геометрия (кузов,
+ * четыре колеса на своих местах, фары и стопы одним материалом) и все
+ * болванки одного силуэта рисуются одним InstancedMesh с инстансным цветом.
+ * Силуэтов два, значит потолок — два вызова на весь поток. Колёса у болванки
+ * не крутятся: это единственное, чем платим, и на скорости потока это
+ * не видно.
  *
  * Кадровый цикл не аллоцирует: все векторы, кватернионы и матрицы — модульные
  * константы ниже, матрицы инстансов пишутся числами прямо в буфер.
@@ -48,6 +58,7 @@ import { Track } from '../track.js';
 import { getCatalog } from '../cars.js';
 import {
     MAX_CARS,
+    MAX_TRAFFIC,
     FLAG_OFFTRACK,
     FLAG_DRIFTING,
     FLAG_BOOST,
@@ -348,6 +359,36 @@ const ENV_CUBE_SIZE = 128; // грань кубкарты: 0,38 МБ на всю
 // --- следы шин ---------------------------------------------------------------
 const MARK_MIN_SPEED = 3.0; // м/с, ниже неё след не пишется (стоящая машина)
 
+// ---------------------------------------------------------------------------
+// Внешность траффика
+// ---------------------------------------------------------------------------
+//
+// Двенадцать видов: силуэт плюс цвет. Силуэтов два — фургон и маслкар: оба
+// читаются как «гражданская машина», а не как гоночная. Палитра намеренно
+// приглушённая и намеренно НЕ пересекается с восемью яркими цветами игроков
+// (config.COLORS): болванку нельзя спутать с соперником даже боковым зрением.
+//
+// Номер вида едет в снапшоте в старшей половине байта ident, поэтому видов
+// не больше шестнадцати (protocol.TRAFFIC_LOOKS = 12).
+
+const TRAFFIC_STYLES = ['van', 'muscle'];
+
+// [индекс силуэта, цвет]
+const TRAFFIC_LOOKS_TABLE = [
+    [0, 0xd7dae0],   // белый фургон
+    [0, 0x8d949c],   // серый фургон
+    [0, 0x6f7a86],   // графитовый фургон
+    [0, 0xb9ac8e],   // бежевый фургон
+    [0, 0x5d6b62],   // оливковый фургон
+    [0, 0x9ca7b4],   // серо-голубой фургон
+    [1, 0xc9cdd3],   // серебристый седан
+    [1, 0x7a8391],   // мышиный седан
+    [1, 0x8c5f52],   // кирпичный седан
+    [1, 0x4f5a6b],   // тёмно-синий седан
+    [1, 0xa39a6f],   // песочный седан
+    [1, 0x66707a]    // асфальтовый седан
+];
+
 const CAM_GROUND_CLEARANCE = 0.75; // м, ниже рельефа камера не опускается
 const NEAR_PLANE = 0.12;
 
@@ -516,6 +557,17 @@ export class RaceRenderer {
         this.beamTex = null;
         this.boxMesh = null;
         this.boxCount = 0;
+
+        // Траффик: по одному InstancedMesh на силуэт, оба с инстансным цветом.
+        this.trafficMeshes = null;
+        this.trafficGeoms = null;
+        this.trafficMats = null;
+        this.trafficCount = 0;      // болванок в последнем снапшоте
+        this.trafficLook = new Uint8Array(MAX_TRAFFIC);
+        this.trafficX = new Float32Array(MAX_TRAFFIC);
+        this.trafficY = new Float32Array(MAX_TRAFFIC);
+        this.trafficZ = new Float32Array(MAX_TRAFFIC);
+        this.trafficYaw = new Float32Array(MAX_TRAFFIC);
 
         this.cockpit = null;
         this.cockpitWheel = null;
@@ -815,6 +867,7 @@ export class RaceRenderer {
         this.buildShadows();
         this.buildBeams(nightLights);
         this.buildBoxes();
+        this.buildTraffic();
 
         // --- эффекты ---------------------------------------------------------
         this.effects = new Effects({
@@ -1079,6 +1132,65 @@ export class RaceRenderer {
     }
 
     /**
+     * Траффик: на каждый силуэт ОДИН InstancedMesh со слитой геометрией.
+     *
+     * Модель берётся та же, что у гонщиков (``buildCarMesh`` из carmesh.js),
+     * и тут же разбирается на атрибуты: кузов, четыре колеса на своих местах,
+     * фары и стопы сливаются в одну геометрию с вершинными цветами, а сам
+     * временный меш выбрасывается. Личный цвет болванки задаётся инстансным
+     * цветом — он умножается на вершинный (12.11: для этого у материала
+     * обязан быть vertexColors, а у геометрии атрибут color; оба есть).
+     *
+     * Кузов строится БЕЛЫМ. Тогда в атрибуте color у красящихся вершин лежит
+     * чистый коэффициент затенения панели, и умножение на инстансный цвет
+     * даёт ровно то же, что даёт перекраска гонщика, — только бесплатно.
+     *
+     * Палитра намеренно другая: приглушённые «гражданские» цвета против
+     * восьми ярких из config.COLORS. Спутать болванку с гонщиком нельзя ни
+     * по цвету, ни по силуэту, ни по скорости.
+     *
+     * Качество модели всегда ``low`` независимо от пресета: болванок до
+     * двенадцати, и тратить на фон высокую детализацию колёс и зеркала
+     * незачем — это прямая экономия треугольников.
+     */
+    buildTraffic() {
+        const catalog = getCatalog();
+        if (!catalog) return;
+        const meshes = [];
+        const geoms = [];
+        const mats = [];
+        for (let s = 0; s < TRAFFIC_STYLES.length; s++) {
+            const spec = catalog.resolve(TRAFFIC_STYLES[s]);
+            const shape = spec ? spec.shape : null;
+            if (!shape) continue;
+            const geom = buildTrafficGeometry(shape, this.gfx.ao);
+            if (!geom) continue;
+            const mat = new THREE.MeshLambertMaterial({
+                vertexColors: true,
+                flatShading: true
+            });
+            mat.name = 'trafficBody' + s;
+            const mesh = new THREE.InstancedMesh(geom, mat, MAX_TRAFFIC);
+            mesh.name = 'traffic' + s;
+            mesh.frustumCulled = false;
+            mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            mesh.instanceColor = new THREE.InstancedBufferAttribute(
+                new Float32Array(MAX_TRAFFIC * 3).fill(1), 3);
+            mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+            mesh.count = 0;
+            mesh.visible = false;
+            this.scene.add(mesh);
+            meshes.push(mesh);
+            geoms.push(geom);
+            mats.push(mat);
+        }
+        if (!meshes.length) return;
+        this.trafficMeshes = meshes;
+        this.trafficGeoms = geoms;
+        this.trafficMats = mats;
+    }
+
+    /**
      * Кокпит: панель и руль перед глазами. Два меша, и оба рисуются только
      * в виде из кабины. Узлы висят на камере, поэтому едут вместе с ней без
      * единого пересчёта в кадре.
@@ -1153,7 +1265,28 @@ export class RaceRenderer {
         if (!this.effects) return;
         this.effects.setProjectiles(snap);
         this.effects.setBoxMask(snap);
+        this.takeTraffic(snap);
+        this.effects.setRoadEvents(snap);
     }
+
+    /**
+     * Болванки из буфера снапшота. Значения там уже мировые и уже на момент
+     * показа: интерполяцию по дуге сделал net.js (см. его _trafficPair).
+     */
+    takeTraffic(snap) {
+        let n = snap.trafViewCount || 0;
+        if (n > MAX_TRAFFIC) n = MAX_TRAFFIC;
+        for (let i = 0; i < n; i++) {
+            this.trafficLook[i] = snap.trafViewLook[i];
+            this.trafficX[i] = snap.trafViewX[i];
+            this.trafficY[i] = snap.trafViewY[i];
+            this.trafficZ[i] = snap.trafViewZ[i];
+            this.trafficYaw[i] = snap.trafViewYaw[i];
+        }
+        this.trafficCount = n;
+    }
+
+
 
     /**
      * Запасной путь: взять машины прямо из снапшота без интерполяции.
@@ -1279,6 +1412,11 @@ export class RaceRenderer {
             marks.upload(this.renderer);
         }
 
+        // --- траффик и перевёрнутые машины ----------------------------------
+        // Всё это идёт в те же один-два InstancedMesh, поэтому цена
+        // постоянная: два вызова отрисовки на любое число болванок.
+        shadowN = this.writeTraffic(shadowArr, shadowN);
+
         this.shadowMesh.count = shadowN;
         this.shadowMesh.visible = shadowN > 0;
         if (shadowN > 0) this.shadowMesh.instanceMatrix.needsUpdate = true;
@@ -1307,6 +1445,79 @@ export class RaceRenderer {
         this.scenery.cull(this.culler);
 
         this.effects.update(step, this.camera, target ? target.speed : 0);
+    }
+
+    /**
+     * Матрицы болванок и перевёрнутых машин в инстансные меши траффика.
+     *
+     * Возвращает новое число теней: болванка отбрасывает такую же тень,
+     * как гонщик, и идёт в тот же InstancedMesh — лишних вызовов ноль.
+     */
+    writeTraffic(shadowArr, shadowN) {
+        const meshes = this.trafficMeshes;
+        if (!meshes) return shadowN;
+        const counts = _trafficCounts;
+        for (let m = 0; m < meshes.length; m++) counts[m] = 0;
+
+        const n = this.trafficCount;
+        for (let i = 0; i < n; i++) {
+            const look = TRAFFIC_LOOKS_TABLE[this.trafficLook[i] % TRAFFIC_LOOKS_TABLE.length];
+            const which = look[0] < meshes.length ? look[0] : 0;
+            const mesh = meshes[which];
+            const slot = counts[which];
+            if (slot >= MAX_TRAFFIC) continue;
+            const x = this.trafficX[i];
+            const y = this.trafficY[i];
+            const z = this.trafficZ[i];
+            const yaw = this.trafficYaw[i];
+            writeScaleYaw(mesh.instanceMatrix.array, slot * 16, x, y, z, yaw, 1, 1, 1);
+            writeInstanceColor(mesh.instanceColor.array, slot * 3, look[1]);
+            counts[which] = slot + 1;
+            if (shadowN < MAX_CARS + MAX_TRAFFIC) {
+                writeScaleYaw(shadowArr, shadowN * 16, x, y + 0.045, z, yaw,
+                    TRAFFIC_SHADOW_W, 1, TRAFFIC_SHADOW_L);
+                shadowN++;
+            }
+            // Янтарный проблесковый ореол на крыше: он и есть главный знак
+            // «это не гонщик». Идёт в общий меш свечения — ноль вызовов.
+            if (this.effects) {
+                this.effects.lamp(x, y + TRAFFIC_BEACON_Y, z, TRAFFIC_BEACON_SIZE,
+                    1.0, 0.62, 0.16);
+            }
+        }
+
+        // Перевёрнутая машина как происшествие: та же геометрия болванки,
+        // поставленная на крышу. Отдельной модели под это заводить незачем —
+        // и вызовов отрисовки она бы стоила отдельных.
+        const wrecks = this.effects ? this.effects.wreckCount : 0;
+        for (let w = 0; w < wrecks; w++) {
+            const mesh = meshes[0];
+            const slot = counts[0];
+            if (slot >= MAX_TRAFFIC) break;
+            const x = this.effects.wreckX[w];
+            const y = this.effects.wreckY[w];
+            const z = this.effects.wreckZ[w];
+            const yaw = this.effects.wreckYaw[w];
+            writeUpsideDown(mesh.instanceMatrix.array, slot * 16, x, y, z, yaw);
+            writeInstanceColor(mesh.instanceColor.array, slot * 3, WRECK_COLOR);
+            counts[0] = slot + 1;
+            if (shadowN < MAX_CARS + MAX_TRAFFIC) {
+                writeScaleYaw(shadowArr, shadowN * 16, x, y + 0.04, z, yaw,
+                    TRAFFIC_SHADOW_W, 1, TRAFFIC_SHADOW_L);
+                shadowN++;
+            }
+        }
+
+        for (let m = 0; m < meshes.length; m++) {
+            const mesh = meshes[m];
+            mesh.count = counts[m];
+            mesh.visible = counts[m] > 0;
+            if (counts[m] > 0) {
+                mesh.instanceMatrix.needsUpdate = true;
+                mesh.instanceColor.needsUpdate = true;
+            }
+        }
+        return shadowN;
     }
 
     /**
@@ -1927,6 +2138,46 @@ function buildSteeringWheelGeometry(detail) {
 
     const merged = mergeGeometries(geoms, mats);
     for (let i = 0; i < geoms.length; i++) geoms[i].dispose();
+    return merged;
+}
+
+/**
+ * Слитая геометрия одной болванки: кузов + четыре колеса + фары + стопы.
+ *
+ * Собирается через тот же ``buildCarMesh``, что и машина гонщика, — иначе
+ * это была бы вторая модель машины, которую пришлось бы сопровождать. Меш
+ * тут же разбирается на геометрии, сливается в одну и выбрасывается.
+ *
+ * Колёса лежат в InstancedMesh со своими матрицами: их достаём и передаём
+ * в mergeGeometries как матрицы частей, поэтому колесо оказывается там же,
+ * где оно у гонщика, — под аркой, а не в начале координат.
+ */
+function buildTrafficGeometry(shape, ao) {
+    const built = buildCarMesh(shape, '#ffffff', 'low', { ao: ao !== false });
+    const geoms = [];
+    const mats = [];
+    let wheelMesh = null;
+    built.root.traverse(function (node) {
+        if (!node.isMesh && !node.isInstancedMesh) return;
+        if (node.isInstancedMesh) { wheelMesh = node; return; }
+        geoms.push(node.geometry);
+        mats.push(null);
+    });
+    if (wheelMesh) {
+        for (let i = 0; i < wheelMesh.count; i++) {
+            const m = new THREE.Matrix4();
+            wheelMesh.getMatrixAt(i, m);
+            geoms.push(wheelMesh.geometry);
+            mats.push(m);
+        }
+    }
+    let merged = null;
+    try {
+        merged = mergeGeometries(geoms, mats);
+    } catch (err) {
+        merged = null;
+    }
+    if (built.dispose) built.dispose();
     return merged;
 }
 

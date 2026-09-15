@@ -52,17 +52,43 @@
 //   u8 box_mask_len
 //   box_mask_len байт маски активных боксов:
 //     бокс i -> байт i >> 3, бит i & 7 (младший бит — первый бокс)
+//   u8 traffic_count
+//   далее traffic_count записей по 6 байт (машины-болванки):
+//     u8 ident   младшие 4 бита — id в пуле, старшие 4 — вид (силуэт и цвет)
+//     u16 s_q    положение вдоль дуги трассы, s * 65535 / length
+//     i8 lat_q   смещение от оси, 0.1 м на единицу (+-12.7 м)
+//     i8 dyaw_q  курс МИНУС курс касательной трассы, pi/127 на единицу
+//     u8 spd_q   модуль скорости, 0.25 м/с на единицу (0..63.75)
+//   u8 event_count
+//   далее event_count записей по 8 байт (происшествия на дороге):
+//     u8 id, u8 kind, u8 phase,
+//     u16 s_q    центр вдоль дуги, как у траффика
+//     i8 lat_q   центр поперёк, 0.1 м
+//     u8 hl_q    полудлина вдоль трассы, 0.25 м на единицу
+//     u8 hw_q    полуширина поперёк трассы, 0.1 м на единицу
 //
 // buttons:   0 газ, 1 тормоз/задний ход, 2 влево, 3 вправо,
 //            4 дрифт (ручник), 5 применить бонус, 6 взгляд назад, 7 резерв
 // car flags: 0 вне трассы, 1 дрифтует, 2 ускорение, 3 крутит (урон),
 //            4 щит, 5 финишировал, 6 призрак (отключился), 7 тормозит
 //
-// Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len.
-// Для 8 машин, 4 снарядов и маски в 2 байта это 282 байта (5,6 КБ/с на клиента
-// при 20 Гц). В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
+// Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len
+//                      + 1 + 6*traffic_count + 1 + 8*event_count.
+// Для 8 машин, 4 снарядов и маски в 2 байта это 284 байта (5,7 КБ/с на клиента
+// при 20 Гц): два байта против прежних 282 — это счётчики пустых траффика
+// и событий. Плотный траффик (12 машин) добавляет 72 байта, шесть
+// происшествий — ещё 48. Потолок наполнения: 404 байта, 8,1 КБ/с.
+// В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
 // с собственным списком полей: в ней снаряд посчитан как 11 байт (потерян f32 yaw)
 // и не учтён байт box_mask_len. Здесь реализован список полей, он первичен.
+//
+// ПОЧЕМУ ТРАФФИК НЕ ЕДЕТ ОБЫЧНОЙ ЗАПИСЬЮ МАШИНЫ (26 байт). Запись гонщика
+// несёт то, чего у болванки нет и не будет: круг, место, заряд заноса, угол
+// руля, вектор скорости в мировых координатах. Болванка же по построению
+// держится трассы, поэтому её положение описывается дугой и смещением от оси
+// точнее и вчетверо дешевле: 6 байт против 26. Двенадцать болванок стоят
+// 72 байта — столько же, сколько ТРИ записи гонщиков. Потолок MAX_CARS = 8
+// при этом не тронут: гонщики и траффик — разные массивы.
 // ---------------------------------------------------------------------------
 
 // --- коды сообщений --------------------------------------------------------
@@ -98,14 +124,36 @@ export const INPUT_SIZE = 7;
 export const SNAPSHOT_HEADER_SIZE = 10;
 export const SNAPSHOT_CAR_SIZE = 26;
 export const SNAPSHOT_PROJ_SIZE = 15;
+export const SNAPSHOT_TRAFFIC_SIZE = 6;
+export const SNAPSHOT_EVENT_SIZE = 8;
 export const ACK_OFFSET = 5;
 
 export const MAX_CARS = 8;            // мест в гонке
 export const MAX_PROJECTILES = 32;    // потолок буфера снарядов
 export const MAX_BOX_MASK_LEN = 32;   // 32 байта маски = до 256 боксов
+export const MAX_TRAFFIC = 12;        // машин-болванок в снапшоте
+export const TRAFFIC_LOOKS = 12;      // видов болванки (силуэт + цвет)
+export const MAX_ROAD_EVENTS = 6;     // одновременных происшествий
+
+// Виды происшествий и их фазы — зеркало game/events.py.
+export const ROAD_EXPLOSION = 1;
+export const ROAD_OIL = 2;
+export const ROAD_WRECK = 3;
+export const ROAD_BLOCKADE = 4;
+
+export const ROAD_PHASE_WARN = 0;      // маяки стоят, физики нет
+export const ROAD_PHASE_ACTIVE = 1;    // действует
+export const ROAD_PHASE_CLEARING = 2;  // убирается, физики уже нет
+export const ROAD_PHASE_DEBRIS = 3;    // обломки после взрыва
 
 const STEER_SCALE = 1 / 127;          // -127..127 -> -1..1
 const DRIFT_CHARGE_SCALE = 1 / 100;   // байт -> секунды заряда дрифта
+const LATERAL_SCALE = 1 / 10;         // i8 -> метры смещения от оси
+const ANGLE_SCALE = Math.PI / 127;    // i8 -> радианы
+const SPEED_SCALE = 1 / 4;            // u8 -> м/с
+const HALF_LENGTH_SCALE = 1 / 4;      // u8 -> метры полудлины
+const HALF_WIDTH_SCALE = 1 / 10;      // u8 -> метры полуширины
+export const ARC_SCALE = 1 / 65535;   // u16 -> доля круга (умножить на length)
 
 // --- ввод: клиент -> сервер ------------------------------------------------
 
@@ -158,11 +206,14 @@ export function isBoxActive(out, boxId) {
 }
 
 /** Размер снапшота в байтах при заданном наполнении. */
-export function snapshotSize(carCount, projCount, boxMaskLen) {
+export function snapshotSize(carCount, projCount, boxMaskLen,
+                             trafficCount, eventCount) {
     return SNAPSHOT_HEADER_SIZE
         + carCount * SNAPSHOT_CAR_SIZE
         + 1 + projCount * SNAPSHOT_PROJ_SIZE
-        + 1 + boxMaskLen;
+        + 1 + boxMaskLen
+        + 1 + (trafficCount || 0) * SNAPSHOT_TRAFFIC_SIZE
+        + 1 + (eventCount || 0) * SNAPSHOT_EVENT_SIZE;
 }
 
 // --- снапшот: сервер -> клиент ---------------------------------------------
@@ -189,6 +240,27 @@ export function snapshotSize(carCount, projCount, boxMaskLen) {
  *   projX/projZ/projYaw     позиция и курс снаряда
  *   boxMaskLen, boxMask     маска активных боксов, читать через isBoxActive
  *   valid                   успешен ли последний разбор
+ *
+ * Траффик (машины-болванки). Положение приходит в координатах ТРАССЫ, а не
+ * мира: дуга в долях круга (умножить на track.length), смещение от оси в
+ * метрах и разница курса с касательной. Мировую точку восстанавливает net.js
+ * по той же осевой линии, по которой её считал сервер.
+ *   trafCount, trafId[i], trafLook[i], trafArc[i] (доля круга 0..1),
+ *   trafLat[i], trafDyaw[i], trafSpeed[i]
+ *
+ * Происшествия на дороге — так же в координатах трассы:
+ *   evtCount, evtId[i], evtKind[i], evtPhase[i], evtArc[i] (доля круга),
+ *   evtLat[i], evtHalfLen[i], evtHalfWidth[i]
+ *
+ * ГОТОВЫЕ К ОТРИСОВКЕ значения траффика и происшествий. Их заполняет net.js
+ * в interpolate() — уже в мировых координатах и уже на момент показа, — а
+ * читает renderer.applySnapshot(). Буфер снапшота и так единственный объект,
+ * который main.js передаёт из сети в рендер; заводить ради болванок вторую
+ * такую дорогу значило бы править main.js, который принадлежит другому
+ * исполнителю. Массивы выделены здесь же, поэтому аллокаций в кадре нет.
+ *   trafViewCount, trafViewLook[i], trafViewX/Y/Z/Yaw[i]
+ *   evtViewCount, evtViewId/Kind/Phase[i], evtViewX/Y/Z/Yaw[i],
+ *   evtViewHalfLen/HalfWidth[i]
  */
 export function createSnapshotBuffer() {
     return {
@@ -219,6 +291,42 @@ export function createSnapshotBuffer() {
 
         boxMaskLen: 0,
         boxMask: new Uint8Array(MAX_BOX_MASK_LEN),
+
+        trafCount: 0,
+        trafId: new Uint8Array(MAX_TRAFFIC),
+        trafLook: new Uint8Array(MAX_TRAFFIC),
+        trafArc: new Float32Array(MAX_TRAFFIC),
+        trafLat: new Float32Array(MAX_TRAFFIC),
+        trafDyaw: new Float32Array(MAX_TRAFFIC),
+        trafSpeed: new Float32Array(MAX_TRAFFIC),
+
+        evtCount: 0,
+        evtId: new Uint8Array(MAX_ROAD_EVENTS),
+        evtKind: new Uint8Array(MAX_ROAD_EVENTS),
+        evtPhase: new Uint8Array(MAX_ROAD_EVENTS),
+        evtArc: new Float32Array(MAX_ROAD_EVENTS),
+        evtLat: new Float32Array(MAX_ROAD_EVENTS),
+        evtHalfLen: new Float32Array(MAX_ROAD_EVENTS),
+        evtHalfWidth: new Float32Array(MAX_ROAD_EVENTS),
+
+        // --- готовое к отрисовке, заполняет net.js -------------------------
+        trafViewCount: 0,
+        trafViewLook: new Uint8Array(MAX_TRAFFIC),
+        trafViewX: new Float32Array(MAX_TRAFFIC),
+        trafViewY: new Float32Array(MAX_TRAFFIC),
+        trafViewZ: new Float32Array(MAX_TRAFFIC),
+        trafViewYaw: new Float32Array(MAX_TRAFFIC),
+
+        evtViewCount: 0,
+        evtViewId: new Uint8Array(MAX_ROAD_EVENTS),
+        evtViewKind: new Uint8Array(MAX_ROAD_EVENTS),
+        evtViewPhase: new Uint8Array(MAX_ROAD_EVENTS),
+        evtViewX: new Float32Array(MAX_ROAD_EVENTS),
+        evtViewY: new Float32Array(MAX_ROAD_EVENTS),
+        evtViewZ: new Float32Array(MAX_ROAD_EVENTS),
+        evtViewYaw: new Float32Array(MAX_ROAD_EVENTS),
+        evtViewHalfLen: new Float32Array(MAX_ROAD_EVENTS),
+        evtViewHalfWidth: new Float32Array(MAX_ROAD_EVENTS),
 
         // Кэш DataView на последний разобранный буфер, см. комментарий вверху.
         _src: null,
@@ -268,7 +376,19 @@ export function decodeSnapshot(data, out) {
     const maskLen = view.getUint8(need - 1);
     if (maskLen > MAX_BOX_MASK_LEN) { out.valid = false; return false; }
 
-    need += maskLen;
+    need += maskLen + 1;
+    if (total < need) { out.valid = false; return false; }
+
+    const trafCount = view.getUint8(need - 1);
+    if (trafCount > MAX_TRAFFIC) { out.valid = false; return false; }
+
+    need += trafCount * SNAPSHOT_TRAFFIC_SIZE + 1;
+    if (total < need) { out.valid = false; return false; }
+
+    const evtCount = view.getUint8(need - 1);
+    if (evtCount > MAX_ROAD_EVENTS) { out.valid = false; return false; }
+
+    need += evtCount * SNAPSHOT_EVENT_SIZE;
     if (total < need) { out.valid = false; return false; }
 
     out.tick = view.getUint32(1, true);
@@ -276,6 +396,8 @@ export function decodeSnapshot(data, out) {
     out.carCount = carCount;
     out.projCount = projCount;
     out.boxMaskLen = maskLen;
+    out.trafCount = trafCount;
+    out.evtCount = evtCount;
 
     const indexBySlot = out.indexBySlot;
     for (let i = 0; i < MAX_CARS; i++) indexBySlot[i] = -1;
@@ -312,6 +434,31 @@ export function decodeSnapshot(data, out) {
     const boxMask = out.boxMask;
     for (let i = 0; i < maskLen; i++) boxMask[i] = view.getUint8(offset + i);
     for (let i = maskLen; i < MAX_BOX_MASK_LEN; i++) boxMask[i] = 0;
+    offset += maskLen;
+
+    offset += 1; // байт traffic_count уже прочитан
+    for (let i = 0; i < trafCount; i++) {
+        const ident = view.getUint8(offset);
+        out.trafId[i] = ident & 0x0F;
+        out.trafLook[i] = ident >> 4;
+        out.trafArc[i] = view.getUint16(offset + 1, true) * ARC_SCALE;
+        out.trafLat[i] = view.getInt8(offset + 3) * LATERAL_SCALE;
+        out.trafDyaw[i] = view.getInt8(offset + 4) * ANGLE_SCALE;
+        out.trafSpeed[i] = view.getUint8(offset + 5) * SPEED_SCALE;
+        offset += SNAPSHOT_TRAFFIC_SIZE;
+    }
+
+    offset += 1; // байт event_count уже прочитан
+    for (let i = 0; i < evtCount; i++) {
+        out.evtId[i] = view.getUint8(offset);
+        out.evtKind[i] = view.getUint8(offset + 1);
+        out.evtPhase[i] = view.getUint8(offset + 2);
+        out.evtArc[i] = view.getUint16(offset + 3, true) * ARC_SCALE;
+        out.evtLat[i] = view.getInt8(offset + 5) * LATERAL_SCALE;
+        out.evtHalfLen[i] = view.getUint8(offset + 6) * HALF_LENGTH_SCALE;
+        out.evtHalfWidth[i] = view.getUint8(offset + 7) * HALF_WIDTH_SCALE;
+        offset += SNAPSHOT_EVENT_SIZE;
+    }
 
     out.valid = true;
     return true;
