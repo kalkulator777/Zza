@@ -119,6 +119,7 @@ const FEED_ICONS = {
     use: feedIcon('#ff9b3d', '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>'),
     drift: feedIcon('#b06bff', '<path d="M4 17c6 0 6-10 12-10"/><path d="M14 4h3v3"/>'),
     kill: feedIcon('#3ddc84', '<path d="m5 13 4 4 10-10"/>'),
+    record: feedIcon('#ffc93c', '<path d="M12 3l2.6 5.5 6 .9-4.3 4.3 1 6.1L12 17l-5.3 2.8 1-6.1L3.4 9.4l6-.9z"/>'),
 };
 
 function el(tag, cls, text) {
@@ -346,6 +347,19 @@ export class Hud {
         const kmh = maxSpeedMs * MS_TO_KMH;
         this.speedMaxKmh = kmh > 20 ? kmh : SPEED_MAX_KMH;
         this.cSpeedKmh = -1;              // пересчитать дугу и стрелку на следующем кадре
+    }
+
+    /**
+     * Гандикап своей машины: множитель из race_init.players[].handicap
+     * (0 — гандикапа нет). Плашка живёт вне кадрового цикла.
+     */
+    setHandicap(factor) {
+        const on = factor > 0 && factor < 1;
+        this.handicapNode.hidden = !on;
+        if (on) {
+            this.handicapNode.textContent =
+                'Гандикап −' + Math.round((1 - factor) * 100) + ' % · победа в прошлой гонке';
+        }
     }
 
     /** Сбросить кэш и показания между заездами. */
@@ -642,6 +656,16 @@ export class Hud {
             text = 'Дрифт-буст ×' + ev.level;
             icon = FEED_ICONS.drift;
             tone = 'good';
+        } else if (kind === 'record') {
+            // Рекорд круга, который переживёт эту сессию (server/records.py).
+            // Название трассы в ленте не нужно: гонка идёт именно на ней.
+            const who = mine ? '' : (ev.name || 'Гонщик') + ': ';
+            const time = formatSeconds(ev.time);
+            text = who + (ev.scope === 'track'
+                ? 'рекорд трассы — ' + time
+                : 'рекорд на этой машине — ' + time);
+            icon = FEED_ICONS.record;
+            tone = mine ? 'good' : '';
         } else {
             return;
         }
@@ -1068,6 +1092,12 @@ export class Hud {
             + 'box-shadow:0 4px 0 rgba(8,10,18,.8)';
         this.pauseButton.addEventListener('click', () => this.togglePause());
         wrap.appendChild(this.pauseButton);
+
+        // Плашка гандикапа: победитель прошлой гонки обязан ВИДЕТЬ, что
+        // его замедлили, иначе просевшее время круга выглядит поломкой.
+        this.handicapNode = el('div', 'hud-handicap', '');
+        this.handicapNode.hidden = true;
+        wrap.appendChild(this.handicapNode);
 
         // Таблица позиций
         this.standingsNode = el('div', 'hud-standings');

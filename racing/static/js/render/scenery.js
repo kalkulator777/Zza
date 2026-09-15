@@ -120,7 +120,12 @@ const INSTANCE_MARGIN = 0.5;
 // ---------------------------------------------------------------------------
 
 export const TIMES_OF_DAY = ['day', 'dusk', 'night'];
-export const WEATHERS = ['clear'];
+/**
+ * Погода. Приходит тем же каналом, что и время суток, и ложится ПОВЕРХ него:
+ * меняются те же поля (небо, туман, свет, облака и звёзды), а полотно
+ * дополнительно темнеет и получает френелевский блик — это уже trackmesh.js.
+ */
+export const WEATHERS = ['clear', 'wet'];
 
 export const ENV_DEFAULT = { timeOfDay: 'day', weather: 'clear' };
 
@@ -257,6 +262,46 @@ function makeDusk(day, night) {
 }
 
 /**
+ * Погода поверх времени суток. Небо затягивает, солнце слабеет, туман
+ * подступает и сереет, звёзды пропадают. Стоит это ноль: меняются числа
+ * в таблице, из которой и так собирается сцена.
+ */
+const WEATHER_ENV = {
+    clear: null,
+    wet: {
+        gray: '#67707c',
+        skyK: 0.42,      // насколько небо уходит в серое
+        fogMix: 0.40,
+        fogK: 0.82,      // во столько раз ближе туман
+        ambK: 0.92,
+        dirK: 0.55,      // солнце за облаками
+        cloudK: 1.5,
+        starK: 0.0
+    }
+};
+
+/** Наложить погоду на таблицу времени суток. Возвращает НОВЫЙ объект. */
+function applyWeather(env, weather) {
+    const W = WEATHER_ENV[weather];
+    if (!W) return env;
+    return {
+        zenith: mixHex(env.zenith, W.gray, W.skyK),
+        horizon: mixHex(env.horizon, W.gray, W.skyK),
+        fog: mixHex(env.fog, W.gray, W.fogMix),
+        ambient: {
+            color: mixHex(env.ambient.color, W.gray, 0.3),
+            intensity: env.ambient.intensity * W.ambK
+        },
+        dir: {
+            color: mixHex(env.dir.color, W.gray, 0.35),
+            intensity: env.dir.intensity * W.dirK,
+            dir: env.dir.dir.slice()
+        },
+        cloud: mixHex(env.cloud, W.gray, 0.45)
+    };
+}
+
+/**
  * Параметры, зависящие от времени суток, но не от темы:
  *  fogK     — во столько раз ближе туман (ночью воздух «плотнее»)
  *  lights   — строить ли ночные огни (фонари, окна, щиты)
@@ -350,7 +395,9 @@ export function buildScenery(track, theme, seed, quality, opts) {
     const nightK = o.nightLights === undefined ? 1 : Math.max(0, o.nightLights);
     const lampK = tod.lampK * nightK;
     const lights = tod.lights && lampK > 0.01;
-    const env = themeEnv[todName] || themeEnv.day;
+    const weatherName = environment.weather;
+    const wx = WEATHER_ENV[weatherName] || null;
+    const env = applyWeather(themeEnv[todName] || themeEnv.day, weatherName);
 
     const decorLevel = DECOR_DENSITY[o.decor] !== undefined ? o.decor : null;
     // Нормировка плотности по длине круга снята: отсечение по пирамиде
@@ -422,13 +469,15 @@ export function buildScenery(track, theme, seed, quality, opts) {
     skyGroup.add(sky);
     ctx.materials.push(sky.material);
     let clouds = null;
-    if (tod.clouds > 0.01) {
-        clouds = buildClouds(env, Q, new Rng(baseSeed ^ 0x0c10ad), tod.clouds);
+    const cloudShare = tod.clouds * (wx ? wx.cloudK : 1);
+    if (cloudShare > 0.01) {
+        clouds = buildClouds(env, Q, new Rng(baseSeed ^ 0x0c10ad), cloudShare);
         skyGroup.add(clouds);
         ctx.materials.push(clouds.material);
     }
     let stars = null;
-    if (tod.stars > 0.01) {
+    // под тучами звёзд не видно
+    if (tod.stars * (wx ? wx.starK : 1) > 0.01) {
         stars = buildStars(Q, new Rng(baseSeed ^ 0x57a25), tod);
         skyGroup.add(stars);
         ctx.materials.push(stars.material);
@@ -436,7 +485,7 @@ export function buildScenery(track, theme, seed, quality, opts) {
     group.add(skyGroup);
 
     const fogColor = toColor(env.fog);
-    const fogFar = Q.fogFar * tod.fogK;
+    const fogFar = Q.fogFar * tod.fogK * (wx ? wx.fogK : 1);
     const sets = ctx.sets;
     const api = {
         group: group,
@@ -451,6 +500,7 @@ export function buildScenery(track, theme, seed, quality, opts) {
         theme: themeName,
         quality: qName,
         timeOfDay: todName,
+        weather: weatherName,
         environment: environment,
 
         // параметры, которые применяет renderer.js

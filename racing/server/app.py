@@ -131,6 +131,26 @@ class ServersHandler(tornado.web.RequestHandler):
         })
 
 
+class RecordsHandler(tornado.web.RequestHandler):
+    """GET /api/records — рекорды кругов человекочитаемым JSON.
+
+    Для игры не нужен: в клиент рекорды едут событием `rooms`. Но иметь
+    возможность посмотреть таблицу из браузера или curl, не заходя в игру,
+    дёшево и удобно.
+    """
+
+    def initialize(self, ctx):
+        self.ctx = ctx
+
+    def get(self):
+        store = self.ctx.manager.records
+        self.set_header('Cache-Control', 'no-store')
+        self.write({
+            'enabled': bool(store is not None and store.enabled),
+            'tracks': store.table() if store is not None else [],
+        })
+
+
 # --- WebSocket ---------------------------------------------------------------
 
 class GameSocket(tornado.websocket.WebSocketHandler):
@@ -394,6 +414,7 @@ def make_app(ctx):
         (r'/', IndexHandler, {'ctx': ctx}),
         (r'/ws', GameSocket, {'ctx': ctx}),
         (r'/api/servers', ServersHandler, {'ctx': ctx}),
+        (r'/api/records', RecordsHandler, {'ctx': ctx}),
         (r'/static/(.*)', StaticHandler, static),
         (r'/((?:%s)/.*)' % _ASSET_DIRS, StaticHandler, static),
         (r'/([^/]+\.(?:%s))' % _ASSET_EXT, StaticHandler, static),

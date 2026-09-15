@@ -138,6 +138,16 @@ export function mixColor(out, a, b, t) {
  * Плюс необязательный «флаг» на вершину (this.flag) — им carmesh.js помечает
  * перекрашиваемые панели кузова, чтобы потом менять цвет игрока, не
  * пересобирая геометрию.
+ *
+ * ЧЕТВЁРТЫЙ КАНАЛ — uv. Включается enableUV() и нужен только полотну трассы:
+ * это параметризация ленты (путь по кругу и смещение поперёк), по которой
+ * читается карта следов шин. Канал необязательный: без enableUV() построитель
+ * работает ровно как раньше и лишней памяти не тратит.
+ *
+ * Хранится uv в Uint16 с нормировкой: 0,4 МБ вместо 0,8 на office и точность
+ * 1/65535 — на порядки мельче тексела карты. Значения вне [0, 1] при этом
+ * зажимаются, и это ровно то, что нужно: за краем ленты выборка попадает
+ * в заведомо пустой крайний ряд карты (ClampToEdge), а не мажет следами траву.
  */
 export class MeshBuilder {
     constructor() {
@@ -146,6 +156,9 @@ export class MeshBuilder {
         this.col = [];
         this.flags = [];
         this.flag = 0;
+        this.uvs = null;
+        this._u = 0;
+        this._v = 0;
     }
 
     get vertexCount() {
@@ -155,15 +168,38 @@ export class MeshBuilder {
         return this.pos.length / 9;
     }
 
+    /** Включить накопление uv. Зовётся до первого треугольника. */
+    enableUV() {
+        if (!this.uvs) this.uvs = [];
+        return this;
+    }
+
+    /** Текущая пара uv: её получат все следующие вершины. */
+    setUV(u, v) {
+        this._u = u;
+        this._v = v;
+    }
+
+    _setUV(p) {
+        if (p) {
+            this._u = p[0];
+            this._v = p[1];
+        }
+    }
+
     _push(x, y, z, nx, ny, nz, r, g, b) {
         this.pos.push(x, y, z);
         this.nrm.push(nx, ny, nz);
         this.col.push(r, g, b);
         this.flags.push(this.flag);
+        if (this.uvs) this.uvs.push(this._u, this._v);
     }
 
-    /** Треугольник по числам, нормаль считается по обходу (против часовой — лицевая). */
-    triRaw(ax, ay, az, bx, by, bz, cx, cy, cz, r, g, b) {
+    /**
+     * Треугольник по числам, нормаль считается по обходу (против часовой — лицевая).
+     * ua/ub/uc — необязательные пары [u, v] на вершину.
+     */
+    triRaw(ax, ay, az, bx, by, bz, cx, cy, cz, r, g, b, ua, ub, uc) {
         const ux = bx - ax,
             uy = by - ay,
             uz = bz - az;
@@ -177,8 +213,11 @@ export class MeshBuilder {
         nx /= l;
         ny /= l;
         nz /= l;
+        this._setUV(ua);
         this._push(ax, ay, az, nx, ny, nz, r, g, b);
+        this._setUV(ub);
         this._push(bx, by, bz, nx, ny, nz, r, g, b);
+        this._setUV(uc);
         this._push(cx, cy, cz, nx, ny, nz, r, g, b);
     }
 
@@ -194,9 +233,9 @@ export class MeshBuilder {
     }
 
     /** Тот же квад, но числами — для горячих мест построения полос. */
-    quadRaw(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, r, g, b) {
-        this.triRaw(ax, ay, az, bx, by, bz, cx, cy, cz, r, g, b);
-        this.triRaw(ax, ay, az, cx, cy, cz, dx, dy, dz, r, g, b);
+    quadRaw(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, r, g, b, ua, ub, uc, ud) {
+        this.triRaw(ax, ay, az, bx, by, bz, cx, cy, cz, r, g, b, ua, ub, uc);
+        this.triRaw(ax, ay, az, cx, cy, cz, dx, dy, dz, r, g, b, ua, uc, ud);
     }
 
     /**
@@ -207,7 +246,7 @@ export class MeshBuilder {
      * затенения — плавный тёмный контакт получается без единого лишнего
      * треугольника.
      */
-    triVC(a, b, c, ca, cb, cc) {
+    triVC(a, b, c, ca, cb, cc, ua, ub, uc) {
         const ux = b[0] - a[0],
             uy = b[1] - a[1],
             uz = b[2] - a[2];
@@ -221,15 +260,18 @@ export class MeshBuilder {
         nx /= l;
         ny /= l;
         nz /= l;
+        this._setUV(ua);
         this._push(a[0], a[1], a[2], nx, ny, nz, ca.r, ca.g, ca.b);
+        this._setUV(ub);
         this._push(b[0], b[1], b[2], nx, ny, nz, cb.r, cb.g, cb.b);
+        this._setUV(uc);
         this._push(c[0], c[1], c[2], nx, ny, nz, cc.r, cc.g, cc.b);
     }
 
-    /** Четырёхугольник с отдельным цветом на каждую вершину. */
-    quadVC(a, b, c, d, ca, cb, cc, cd) {
-        this.triVC(a, b, c, ca, cb, cc);
-        this.triVC(a, c, d, ca, cc, cd);
+    /** Четырёхугольник с отдельным цветом (и uv) на каждую вершину. */
+    quadVC(a, b, c, d, ca, cb, cc, cd, ua, ub, uc, ud) {
+        this.triVC(a, b, c, ca, cb, cc, ua, ub, uc);
+        this.triVC(a, c, d, ca, cc, cd, ua, uc, ud);
     }
 
     /** Выпуклый многоугольник веером. reverse — обойти в обратную сторону. */
@@ -274,6 +316,19 @@ export class MeshBuilder {
         g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(this.pos), 3));
         g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(this.nrm), 3));
         g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(this.col), 3));
+        if (this.uvs) {
+            const src = this.uvs;
+            const packed = new Uint16Array(src.length);
+            for (let i = 0; i < src.length; i++) {
+                let v = src[i];
+                if (v < 0) v = 0;
+                else if (v > 1) v = 1;
+                packed[i] = (v * 65535 + 0.5) | 0;
+            }
+            // имя ровно `uv`: three объявляет этот атрибут в префиксе всегда,
+            // и своё объявление в onBeforeCompile дало бы ошибку линковки
+            g.setAttribute('uv', new THREE.BufferAttribute(packed, 2, true));
+        }
         g.computeBoundingSphere();
         g.computeBoundingBox();
         return g;
@@ -478,6 +533,8 @@ export function primPoly(radius, detail, color, x, y, z) {
  * Сетка поверхности: rows точек вдоль пути на cols точек поперёк.
  * point(i, j, out3) заполняет out3 координатами узла,
  * color(i, j, outColor) задаёт цвет квада [i..i+1] x [j..j+1].
+ * uv(i, j, out2) — необязательная параметризация УЗЛА (i, j); работает только
+ * если построитель принимает uv (MeshBuilder.enableUV).
  * vertexColor(i, j, outColor) — цвет УЗЛА (i, j); если задан, он главнее
  * color и даёт плавный градиент поперёк и вдоль полосы: именно так в полотно
  * и в рельеф запекается затенение у кромок.
@@ -505,6 +562,12 @@ export function surfaceGrid(builder, opts) {
         pb = [0, 0, 0],
         pc = [0, 0, 0],
         pd = [0, 0, 0];
+    // uv узлов квада, если построитель их принимает
+    const uvFn = builder.uvs ? opts.uv : null;
+    const ua = [0, 0],
+        ub = [0, 0],
+        uc = [0, 0],
+        ud = [0, 0];
 
     let cur = new Float32Array(cols * 3);
     let nxt = new Float32Array(cols * 3);
@@ -528,6 +591,13 @@ export function surfaceGrid(builder, opts) {
         for (let j = 0; j < cols - 1; j++) {
             const a = j * 3,
                 b = a + 3;
+            if (uvFn) {
+                // порядок углов тот же, что у цветов: (i,j) (i+1,j) (i+1,j+1) (i,j+1)
+                uvFn(i, j, ua);
+                uvFn(i2, j, ub);
+                uvFn(i2, j + 1, uc);
+                uvFn(i, j + 1, ud);
+            }
             if (vertexColor) {
                 // (i, j) -> vc00, (i+1, j) -> vc10, (i+1, j+1) -> vc11, (i, j+1) -> vc01
                 vertexColor(i, j, vc00);
@@ -538,8 +608,8 @@ export function surfaceGrid(builder, opts) {
                 pb[0] = nxt[a]; pb[1] = nxt[a + 1]; pb[2] = nxt[a + 2];
                 pc[0] = nxt[b]; pc[1] = nxt[b + 1]; pc[2] = nxt[b + 2];
                 pd[0] = cur[b]; pd[1] = cur[b + 1]; pd[2] = cur[b + 2];
-                if (flip) builder.quadVC(pa, pd, pc, pb, vc00, vc01, vc11, vc10);
-                else builder.quadVC(pa, pb, pc, pd, vc00, vc10, vc11, vc01);
+                if (flip) builder.quadVC(pa, pd, pc, pb, vc00, vc01, vc11, vc10, ua, ud, uc, ub);
+                else builder.quadVC(pa, pb, pc, pd, vc00, vc10, vc11, vc01, ua, ub, uc, ud);
                 continue;
             }
             color(i, j, tmp);
@@ -549,7 +619,8 @@ export function surfaceGrid(builder, opts) {
                     cur[b], cur[b + 1], cur[b + 2],
                     nxt[b], nxt[b + 1], nxt[b + 2],
                     nxt[a], nxt[a + 1], nxt[a + 2],
-                    tmp.r, tmp.g, tmp.b
+                    tmp.r, tmp.g, tmp.b,
+                    ua, ud, uc, ub
                 );
             } else {
                 builder.quadRaw(
@@ -557,7 +628,8 @@ export function surfaceGrid(builder, opts) {
                     nxt[a], nxt[a + 1], nxt[a + 2],
                     nxt[b], nxt[b + 1], nxt[b + 2],
                     cur[b], cur[b + 1], cur[b + 2],
-                    tmp.r, tmp.g, tmp.b
+                    tmp.r, tmp.g, tmp.b,
+                    ua, ub, uc, ud
                 );
             }
         }
@@ -609,7 +681,8 @@ export function ribbonStrip(builder, left, right, opts) {
             }
         },
         color: o.color,
-        vertexColor: o.vertexColor
+        vertexColor: o.vertexColor,
+        uv: o.uv
     });
 }
 
@@ -639,7 +712,8 @@ export function extrudeProfile(builder, opts) {
             out[2] = f[2] + f[5] * u + f[8] * v;
         },
         color: opts.color,
-        vertexColor: opts.vertexColor
+        vertexColor: opts.vertexColor,
+        uv: opts.uv
     });
 }
 
@@ -852,6 +926,88 @@ export function bakeProximityAO(geometry, points, strength) {
         ca[i3 + 2] *= k;
     }
     col.needsUpdate = true;
+    return geometry;
+}
+
+// ============================================================================
+// Запечённый направленный свет
+// ============================================================================
+
+/**
+ * Запекает в вершинные цвета то, что иначе каждый кадр считал бы Ламберт:
+ * полусферический вклад окружающего света плюс направленный от солнца.
+ * После этого материал меняется на MeshBasicMaterial, атрибут `normal`
+ * выбрасывается, и в кадре освещение стоит РОВНО НОЛЬ.
+ *
+ * Почему это не приближение, а точное равенство. Вся наша статика —
+ * неиндексированная геометрия с гранными нормалями (так требует flatShading),
+ * поэтому «на вершину» и «на грань» — одно и то же. Ламберт с плоским
+ * затенением считает
+ *
+ *     outgoing = diffuse * (ambient + max(N·L, 0) * sun) / PI + emissive
+ *
+ * — ровно то, что пишется здесь. Расхождение по кадру — единицы пикселей
+ * на краях, где интерполяция цвета и интерполяция нормали дают разное
+ * округление.
+ *
+ * МНОЖИТЕЛЬ 1/PI ОБЯЗАТЕЛЕН: BRDF_Lambert в three делит на PI. Без него
+ * сцена втрое ярче (проверено исследованием: расходятся 73 % пикселей).
+ *
+ * ЧЕГО ДЕЛАТЬ НЕЛЬЗЯ: запекать инстансный декор. Поворот экземпляра вокруг Y
+ * в нормаль геометрии не входит, и все деревья осветятся так, будто стоят
+ * неповёрнутыми — 14 % пикселей мимо. Инстансы остаются Ламбертом.
+ *
+ * @param {THREE.BufferGeometry} geometry неиндексированная, с position,
+ *                                        normal и color
+ * @param {object} light  { ambient: {color, intensity},
+ *                          directional: {color, intensity, direction:[x,y,z]} }
+ * @param {object} [opts] emissive — THREE.Color, который надо сложить сверху
+ *                        (ночная разметка: иначе она погаснет);
+ *                        keepNormal — не выбрасывать атрибут normal
+ */
+export function bakeVertexLight(geometry, light, opts) {
+    const o = opts || {};
+    const pos = geometry.attributes.position;
+    const nrm = geometry.attributes.normal;
+    if (!pos || !nrm) return geometry;
+    let col = geometry.attributes.color;
+    if (!col) {
+        col = new THREE.BufferAttribute(new Float32Array(pos.count * 3).fill(1), 3);
+        geometry.setAttribute('color', col);
+    }
+
+    const amb = light.ambient;
+    const dir = light.directional;
+    const INV_PI = 1 / Math.PI;
+    const ar = amb.color.r * amb.intensity * INV_PI;
+    const ag = amb.color.g * amb.intensity * INV_PI;
+    const ab = amb.color.b * amb.intensity * INV_PI;
+    const dr = dir.color.r * dir.intensity * INV_PI;
+    const dg = dir.color.g * dir.intensity * INV_PI;
+    const db = dir.color.b * dir.intensity * INV_PI;
+
+    const d = dir.direction;
+    const dl = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) || 1;
+    const lx = d[0] / dl,
+        ly = d[1] / dl,
+        lz = d[2] / dl;
+
+    const er = o.emissive ? o.emissive.r : 0;
+    const eg = o.emissive ? o.emissive.g : 0;
+    const eb = o.emissive ? o.emissive.b : 0;
+
+    const na = nrm.array;
+    const ca = col.array;
+    for (let i = 0, n = pos.count; i < n; i++) {
+        const i3 = i * 3;
+        let ndl = na[i3] * lx + na[i3 + 1] * ly + na[i3 + 2] * lz;
+        if (ndl < 0) ndl = 0;
+        ca[i3] = ca[i3] * (ar + dr * ndl) + er;
+        ca[i3 + 1] = ca[i3 + 1] * (ag + dg * ndl) + eg;
+        ca[i3 + 2] = ca[i3 + 2] * (ab + db * ndl) + eb;
+    }
+    col.needsUpdate = true;
+    if (!o.keepNormal) geometry.deleteAttribute('normal');
     return geometry;
 }
 

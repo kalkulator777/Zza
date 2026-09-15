@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rapier: площадка для катания</title>
+<!--
+  Самостоятельная страница для проверки ОЩУЩЕНИЯ от управления.
+  С игрой не связана никак: свой каталог, свой three.js через import map,
+  свой .wasm. Ничего из static/ не трогает и не ломает.
+
+  Как открыть:
+    python3 native/testbed/serve.py     ->  http://127.0.0.1:8777/
+  Как получить один файл, который открывается двойным щелчком:
+    python3 native/testbed/build_standalone.py
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #10141b; overflow: hidden;
+    font: 13px/1.45 ui-monospace, "DejaVu Sans Mono", Menlo, monospace; color: #dfe6f0; }
+  #view { position: fixed; inset: 0; display: block; }
+  .panel { position: fixed; background: rgba(12,16,22,.82); border: 1px solid #2b3340;
+    border-radius: 8px; padding: 10px 12px; backdrop-filter: blur(2px); }
+  #hud { top: 12px; left: 12px; min-width: 260px; }
+  #help { bottom: 12px; left: 12px; color: #8e9bad; }
+  #mode { top: 12px; right: 12px; text-align: right; }
+  h2 { margin: 0 0 6px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    color: #7f8fa6; font-weight: 600; }
+  .big { font-size: 30px; line-height: 1.05; font-weight: 700; color: #fff; }
+  .big span { font-size: 12px; color: #7f8fa6; font-weight: 400; }
+  table { border-collapse: collapse; width: 100%; }
+  td { padding: 1px 0; white-space: nowrap; }
+  td.k { color: #7f8fa6; padding-right: 10px; }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; }
+  .bar { position: relative; height: 8px; width: 92px; background: #232a35;
+    border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: #4d9bff; }
+  .bar i.load { background: #f0a23c; }
+  .air { color: #ff6b6b; }
+  button { font: inherit; background: #1b2230; color: #dfe6f0; border: 1px solid #38424f;
+    border-radius: 6px; padding: 5px 11px; cursor: pointer; }
+  button.on { background: #2f6fd0; border-color: #4d8de8; color: #fff; }
+  #err { position: fixed; inset: 0; display: none; place-items: center; padding: 24px;
+    background: #10141b; color: #ff8a8a; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="hud" class="panel">
+  <h2>Телеметрия</h2>
+  <div class="big"><b id="kmh">0</b> <span>км/ч</span></div>
+  <table>
+    <tr><td class="k">угол скольжения</td><td class="v" id="slip">0,0°</td></tr>
+    <tr><td class="k">обороты</td><td class="v" id="rpm">800</td></tr>
+    <tr><td class="k">заряд заноса</td><td class="v" id="charge">0,00 с</td></tr>
+    <tr><td class="k">колёс на земле</td><td class="v" id="ground">4</td></tr>
+    <tr><td class="k">руль</td><td class="v" id="steer">0,00</td></tr>
+  </table>
+  <h2 style="margin-top:10px">Подвеска — ход и нагрузка</h2>
+  <table id="wheels"></table>
+  <h2 style="margin-top:10px">Шаг физики</h2>
+  <table>
+    <tr><td class="k">wasm, мкс на тик</td><td class="v" id="cost">—</td></tr>
+    <tr><td class="k">кадр, мс</td><td class="v" id="frame">—</td></tr>
+  </table>
+</div>
+
+<div id="mode" class="panel">
+  <h2>Настройка</h2>
+  <button id="bArcade" class="on">Аркада</button>
+  <button id="bSim">Симулятор</button>
+  <div style="margin-top:8px;color:#7f8fa6" id="modeNote">жёстко, цепко, помощь в руле</div>
+</div>
+
+<div id="help" class="panel">
+  W / S — газ и тормоз · A / D — руль · ПРОБЕЛ — ручник<br>
+  R — вернуть на старт · C — камера · 1 / 2 — аркада / симулятор
+</div>
+
+<div id="err"></div>
+
+<script type="importmap">
+{"imports": {"three": "./vendor/three.module.min.js"}}
+</script>
+<script type="module" src="./app.js"></script>
+<script>
+window.addEventListener('error', e => {
+  const d = document.getElementById('err');
+  d.style.display = 'grid';
+  d.textContent = 'Страница не поднялась:\n\n' + (e.message || e) +
+    '\n\nСкорее всего она открыта как файл, а не через сервер.\n' +
+    'Запусти:  python3 native/testbed/serve.py\n' +
+    'или собери один файл:  python3 native/testbed/build_standalone.py';
+});
+</script>
+</body>
+</html>

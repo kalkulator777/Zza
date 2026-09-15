@@ -123,6 +123,7 @@ const DRIFT_L2 = 1.4;
 const DRIFT_L3 = 2.4;
 
 const SPEED_LINE_MIN = 26.0; // м/с, с которой появляются полосы скорости
+const WET_SPRAY_SPEED = 9.0; // м/с, с которой из-под колёс летят брызги
 
 // ---------------------------------------------------------------------------
 // Модульные временные величины: всё, что нужно кадру, выделено один раз
@@ -456,6 +457,10 @@ export class Effects {
         // читаются издалека. Вспышки взрывов, наоборот, слегка придерживаем:
         // аддитив по тёмному фону иначе выбивает белое пятно.
         this.setNight(o.night);
+        // Мокрая погода: из-под колёс летят брызги. Это ТОТ ЖЕ пул дыма
+        // с другим цветом, другой начальной скоростью и другим условием
+        // рождения — ноль дополнительных вызовов отрисовки и ноль новых мешей.
+        this.wet = !!o.wet;
 
         this.time = 0;
         this.heightAt = o.heightAt || null;
@@ -631,6 +636,7 @@ export class Effects {
         this.accSpark = new Float32Array(MAX_CARS);
         this.accBoost = new Float32Array(MAX_CARS);
         this.accDust = new Float32Array(MAX_CARS);
+        this.accSpray = new Float32Array(MAX_CARS);
         this.shieldFlash = new Float32Array(MAX_CARS);
         this.shieldCount = 0;
 
@@ -698,6 +704,11 @@ export class Effects {
         this.tailGain = 1.0 + n * 0.5;
         this.boostGain = 1.0 + n * 0.35;
         this.flashGain = 1.0 - n * 0.18;  // чтобы взрыв не пересвечивал
+    }
+
+    /** Мокрая погода: включает брызги из-под колёс. */
+    setWet(on) {
+        this.wet = !!on;
     }
 
     /**
@@ -981,6 +992,43 @@ export class Effects {
             }
         } else {
             this.accDust[slot] = 0;
+        }
+
+        // --- брызги из-под колёс на мокрой дороге ----------------------------
+        // Условие рождения — скорость, а не FLAG_OFFTRACK: на мокром асфальте
+        // брызги летят как раз на трассе. Пул общий с дымом, частота скромная:
+        // это фон, а не главный эффект.
+        if (this.wet && speed > WET_SPRAY_SPEED && (flags & FLAG_OFFTRACK) === 0) {
+            const sprayK = clamp((speed - WET_SPRAY_SPEED) / 18, 0.15, 1.0);
+            // Пул общий с дымом дрифта, и дым эмитится раньше: при восьми
+            // машинах на полном ходу брызги первыми уступят ему место, а не
+            // наоборот. Отсюда сдержанная частота — 1,6 от пыли.
+            this.accSpray[slot] += this.Q.dustRate * 1.6 * sprayK * dt;
+            while (this.accSpray[slot] >= 1) {
+                this.accSpray[slot] -= 1;
+                const side = Math.random() < 0.5 ? 1 : -1;
+                SP.x = view.x + fx * rearZ + lx * halfTrack * side;
+                SP.y = view.y + 0.08;
+                SP.z = view.z + fz * rearZ + lz * halfTrack * side;
+                // веер назад и вбок: вода уходит из-под протектора
+                SP.vx = -fx * speed * 0.3 + lx * side * (1.0 + Math.random() * 2.2);
+                SP.vy = 1.9 + Math.random() * 2.2;
+                SP.vz = -fz * speed * 0.3 + lz * side * (1.0 + Math.random() * 2.2);
+                SP.life = 0.34 + Math.random() * 0.26;
+                SP.s0 = 0.18;
+                SP.s1 = 1.15;
+                SP.r0 = 0.86; SP.g0 = 0.91; SP.b0 = 0.98;
+                SP.r1 = this.fogR; SP.g1 = this.fogG; SP.b1 = this.fogB;
+                SP.damp = 2.2;
+                SP.grav = -3.4;   // капли падают обратно
+                SP.rot = Math.random() * 6.283;
+                SP.rotV = (Math.random() - 0.5) * 2.0;
+                SP.mode = 0;
+                SP.stretch = 1;
+                this.smoke.spawn();
+            }
+        } else {
+            this.accSpray[slot] = 0;
         }
 
         // --- раскрутка после попадания --------------------------------------
@@ -1581,6 +1629,7 @@ export class Effects {
         this.accSpark.fill(0);
         this.accBoost.fill(0);
         this.accDust.fill(0);
+        this.accSpray.fill(0);
         this.shieldFlash.fill(0);
         this.glowMesh.visible = false;
         this.smokeMesh.visible = false;

@@ -133,6 +133,69 @@ const PAINT_FLAG = 1;
 const _cacheBlueprints = new Map();
 
 // ---------------------------------------------------------------------------
+// Отражение окружения на кузове
+// ---------------------------------------------------------------------------
+//
+// Кубическая карта 128² снимается один раз при сборке гонки (renderer.js)
+// и стоит в кадре РОВНО НОЛЬ вызовов, ноль треугольников и ноль лишних
+// фрагментов: это одна кубическая выборка в тех же пикселях, которые кузов
+// и так рисует. На восемь машин от третьего лица это 0,12 экрана, то есть
+// около 0,4 МБ чтения за кадр.
+//
+// ВСТРОЕННЫЙ envMap ЛАМБЕРТА НЕ ГОДИТСЯ. В чанке envmap_fragment нет
+// зависимости от угла обзора: MixOperation и AddOperation кладут отражение
+// на весь кузов равномерно и вымывают краску — красная машина становится
+// розово-голубой. Нужен свой френелевский вес, он здесь.
+//
+// Плоское затенение работает в нашу пользу: геометрия кузова неиндексированная
+// с гранными нормалями, поэтому мировая нормаль из вершинного шейдера
+// постоянна на грани, и отражение получается фасеточным — ровно в мультяшной
+// стилистике.
+//
+// Подводные камни: вставка, которой нужны `transformed` и `objectNormal`,
+// вешается на `#include <fog_vertex>` (он идёт последним, а `<color_vertex>` —
+// до `<begin_vertex>`); customProgramCacheKey обязателен, иначе восемь
+// материалов кузовов дали бы восемь программ вместо одной.
+
+const CAR_ENV_VERT = [
+    '#include <fog_vertex>',
+    'vCarNormal = normalize( mat3( modelMatrix ) * objectNormal );',
+    'vCarWorld = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;'
+].join('\n');
+
+const CAR_ENV_FRAG = [
+    'vec3 carN = normalize( vCarNormal );',
+    'vec3 carV = normalize( cameraPosition - vCarWorld );',
+    'float carFr = uCarRefl * ( 0.04 + 0.96 * pow( 1.0 - clamp( dot( carN, carV ), 0.0, 1.0 ), 5.0 ) );',
+    // кубкарта снята рендер-таргетом, поэтому оси НЕ переворачиваются
+    // (three делает flipEnvMap = 1 ровно для такого случая)
+    'vec3 carEnv = textureCube( uCarEnv, reflect( -carV, carN ) ).rgb;',
+    'outgoingLight = mix( outgoingLight, carEnv, carFr );',
+    '#include <opaque_fragment>'
+].join('\n');
+
+/**
+ * Навесить френелевское отражение на материал кузова.
+ * @param {THREE.Material} mat
+ * @param {THREE.CubeTexture} envMap
+ * @param {object} uniforms общий {uCarEnv, uCarRefl} — один на все машины
+ */
+function applyBodyReflection(mat, uniforms) {
+    mat.onBeforeCompile = function (shader) {
+        shader.uniforms.uCarEnv = uniforms.uCarEnv;
+        shader.uniforms.uCarRefl = uniforms.uCarRefl;
+        shader.vertexShader = 'varying vec3 vCarNormal;\nvarying vec3 vCarWorld;\n'
+            + shader.vertexShader.replace('#include <fog_vertex>', CAR_ENV_VERT);
+        shader.fragmentShader = 'uniform samplerCube uCarEnv;\nuniform float uCarRefl;\n'
+            + 'varying vec3 vCarNormal;\nvarying vec3 vCarWorld;\n'
+            + shader.fragmentShader.replace('#include <opaque_fragment>', CAR_ENV_FRAG);
+    };
+    mat.customProgramCacheKey = function () {
+        return 'carBodyEnv';
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Публичная функция
 // ---------------------------------------------------------------------------
 
@@ -141,6 +204,9 @@ const _cacheBlueprints = new Map();
  * @param {object} shape     поле shape из cars.json (12.2)
  * @param {string|number} bodyColor цвет кузова игрока
  * @param {string} quality   low | medium | high
+ * @param {object} [opts]    { ao, envMap, reflect } — ao запекает затенение,
+ *                           envMap включает френелевское отражение окружения
+ *                           (кубкарту снимает renderer.js), reflect — его сила
  * @returns объект с узлами, материалами и dispose()
  */
 export function buildCarMesh(shape, bodyColor, quality, opts) {
@@ -169,6 +235,12 @@ export function buildCarMesh(shape, bodyColor, quality, opts) {
 
     const bodyMat = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
     bodyMat.name = 'carBody';
+    // Отражение окружения: включается только когда renderer передал снятую
+    // кубкарту. Уникформы общие на все машины — значит и программа одна.
+    const envUniforms = opts && opts.envMap
+        ? { uCarEnv: { value: opts.envMap }, uCarRefl: { value: opts.reflect === undefined ? 0.4 : opts.reflect } }
+        : null;
+    if (envUniforms) applyBodyReflection(bodyMat, envUniforms);
     const body = new THREE.Mesh(bodyGeom, bodyMat);
     body.name = 'body';
     root.add(body);
@@ -291,6 +363,11 @@ export function buildCarMesh(shape, bodyColor, quality, opts) {
                 }
             }
             bodyColorAttr.needsUpdate = true;
+        },
+
+        /** Сила отражения окружения на кузове (0 — выключено). */
+        setReflection: function (k) {
+            if (envUniforms) envUniforms.uCarRefl.value = k;
         },
 
         /** Флаг торможения из снапшота (бит 7). Ноль аллокаций. */

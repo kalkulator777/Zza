@@ -71,6 +71,21 @@ const HIT_SNAP_DROP = 4.0;          // м/с за снапшот 50 мс (чуж
 const HIT_FORCE_REF = 14.0;         // м/с, при которой сила удара равна единице
 const HIT_COOLDOWN = 0.28;          // с, чтобы один удар не звучал дважды
 
+// --- повтор финиша ---------------------------------------------------------
+//
+// Последние секунды гонки проигрываются на экране итогов. Пишется КАДРОВОЕ
+// состояние машин, уже интерполированное: снапшоты идут 20 Гц, и повтор,
+// собранный из них, выглядел бы ступеньками — ровно тем, что 12.12 из игры
+// выгоняло. Буфер кольцевой и выделен один раз: в кадровом цикле не
+// появляется ни одного объекта (условие приёмки раздела 1).
+//
+// Цена памяти: 240 кадров * 8 машин * (7 float32 + 2 uint8) плюс метки
+// времени кадров — около 58 КБ на всю страницу, один раз.
+
+const REPLAY_SECONDS = 3.0;
+const REPLAY_FRAMES = 240;          // 4 с при 60 fps: запас на просадки кадра
+const REPLAY_MIN_FRAMES = 20;       // короче — показывать нечего
+
 /** performance.now(), если он есть. */
 const nowMs = (typeof performance !== 'undefined' && performance.now)
     ? function () { return performance.now(); }
@@ -123,6 +138,34 @@ const app = {
     hitCooldown: new Float32Array(MAX_CARS),
     prevCarSpeed: new Float32Array(MAX_CARS),
     prevCarSeen: new Uint8Array(MAX_CARS),
+
+    // повтор финиша
+    replayWanted: false,    // галочка комнаты settings.replay
+    handicap: 0,            // множитель характеристик своей машины, 0 — нет
+};
+
+// Кольцевой буфер повтора. Всё выделено один раз на страницу.
+const replay = {
+    head: 0,                // куда пишется следующий кадр
+    count: 0,               // сколько кадров в буфере (<= REPLAY_FRAMES)
+    time: new Float64Array(REPLAY_FRAMES),
+    present: new Uint8Array(REPLAY_FRAMES * MAX_CARS),
+    flags: new Uint8Array(REPLAY_FRAMES * MAX_CARS),
+    x: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+    z: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+    yaw: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+    vx: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+    vz: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+    steer: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+    drift: new Float32Array(REPLAY_FRAMES * MAX_CARS),
+
+    playing: false,
+    first: 0,               // индекс первого кадра повтора в кольце
+    steps: 0,               // сколько кадров от first надо проиграть
+    cursor: 0,              // сколько уже проиграно
+    startMs: 0,             // момент начала проигрывания (часы страницы)
+    baseMs: 0,              // время первого кадра повтора
+    camSlot: -1,            // за чьей машиной смотрит камера повтора
 };
 
 const settings = loadUiSettings();
@@ -187,7 +230,10 @@ const lobby = new LobbyScreen(rootLobby, rootCountdown, {
     onLeave: onLeaveRoom,
 });
 
-const results = new ResultsScreen(rootResults, { onReturn: onResultsReturn });
+const results = new ResultsScreen(rootResults, {
+    onReturn: onResultsReturn,
+    onSkipReplay: stopReplay,
+});
 
 // ---------------------------------------------------------------------------
 // Экраны
@@ -225,6 +271,10 @@ function setScreen(screen) {
 /** Разобрать сцену гонки и вернуть рендер в холостой режим. */
 function teardownRace() {
     if (!app.raceBuilt) return;
+    if (replay.playing) renderer.setLocalSlot(app.localSlot);
+    replay.playing = false;
+    replay.count = 0;
+    replay.head = 0;
     app.raceBuilt = false;
     app.racing = false;
     app.paused = false;
@@ -334,6 +384,10 @@ function onRaceInit(msg) {
     app.lapsTotal = msg.laps | 0;
     app.startSoundDone = false;
     app.prevLocalSpeed = 0;
+    app.replayWanted = !!(msg.settings && msg.settings.replay);
+    replay.playing = false;
+    replay.count = 0;
+    replay.head = 0;
     for (let i = 0; i < MAX_CARS; i++) {
         app.hitCooldown[i] = 0;
         app.prevCarSeen[i] = 0;
@@ -350,7 +404,11 @@ function onRaceInit(msg) {
 
     hud.setupRace(msg, app.localSlot);
     const spec = getCatalog().resolve(localCarId(players));
-    if (spec && spec.stats) hud.setSpeedScale(spec.stats.boost_speed);
+    const handicap = applyHandicap(players);
+    if (spec && spec.stats) {
+        hud.setSpeedScale(spec.stats.boost_speed * (handicap || 1));
+    }
+    hud.setHandicap(handicap);
 
     audio.setLocalSlot(app.localSlot);
     audio.startRace();
@@ -365,6 +423,38 @@ function localCarId(players) {
         if (players[i].slot === app.localSlot) return players[i].car;
     }
     return null;
+}
+
+/**
+ * Гандикап победителя прошлой гонки: race_init.players[].handicap.
+ *
+ * Сервер уже замедлил машину у себя, наложив множитель на характеристики.
+ * Предсказание обязано считать ТЕМИ ЖЕ числами, иначе своя машина каждый
+ * снапшот будет оттягиваться назад реконсиляцией — ровно тот эффект резины,
+ * ради отсутствия которого предсказание и существует. net.js собирает
+ * localStats из каталога машин в _onRaceInit и зовёт нас уже после этого,
+ * поэтому множитель накладывается прямо на готовый объект.
+ *
+ * Возвращает множитель (0 — гандикапа нет).
+ */
+function applyHandicap(players) {
+    app.handicap = 0;
+    let factor = 0;
+    for (let i = 0; i < players.length; i++) {
+        if (players[i].slot !== app.localSlot) continue;
+        const value = +players[i].handicap;
+        if (value > 0.5 && value < 1) factor = value;
+        break;
+    }
+    const stats = net.localStats;
+    if (!factor || !stats) return 0;
+    // Замедляются только скоростные характеристики — тот же список, что
+    // в server/config.HANDICAP_STATS.
+    stats.engineForce *= factor;
+    stats.maxSpeed *= factor;
+    stats.boostSpeed *= factor;
+    app.handicap = factor;
+    return factor;
 }
 
 function onCountdown(msg) {
@@ -382,6 +472,11 @@ function onRaceEvent(msg) {
     hud.pushRaceEvent(msg);
     audio.raceEvent(msg);
 
+    // Рекорд круга: новость для всей комнаты, а не только для ленты HUD.
+    if (msg.kind === 'record') {
+        showToast(recordText(msg), msg.slot === app.localSlot ? 'ok' : 'info');
+    }
+
     // 12.11: событие hit не несёт координат, взрыв рисуется по позиции
     // пострадавшей машины — её знает рендер.
     if (msg.kind === 'hit' && app.raceBuilt) {
@@ -394,11 +489,146 @@ function onRaceEvent(msg) {
     }
 }
 
+/**
+ * «Вася побил рекорд трассы «Серпантин»: 39.58» (race_event kind=record).
+ *
+ * Название трассы берётся в кавычки именительным падежом, а не склоняется:
+ * «Серпантина» получилось бы, а «Офисный круга» — нет, и склонять русские
+ * названия из content/tracks ради одной строки не стоит.
+ */
+function recordText(msg) {
+    const name = msg.name || 'Гонщик';
+    const track = msg.track_name || msg.track || '';
+    const where = track ? ' трассы «' + track + '»' : ' трассы';
+    const time = (+msg.time).toFixed(2);
+    if (msg.scope === 'track') {
+        return name + (msg.first ? ' открыл рекорд' : ' побил рекорд')
+            + where + ': ' + time;
+    }
+    return name + ' — рекорд на этой машине: ' + time;
+}
+
 function onResults(msg) {
     results.applyResults(msg, app.localSlot);
     app.racing = false;
     audioState.engineOn = false;
     setScreen(SCREEN_RESULTS);
+    startReplay();
+}
+
+// ---------------------------------------------------------------------------
+// Повтор финиша
+// ---------------------------------------------------------------------------
+
+/**
+ * Запись одного кадра в кольцевой буфер. Зовётся из кадрового цикла, поэтому
+ * не создаёт ничего: только записи в заранее выделенные типизированные
+ * массивы.
+ */
+function recordReplayFrame(t, localX, localZ, localYaw) {
+    const head = replay.head;
+    const base = head * MAX_CARS;
+    replay.time[head] = t;
+    const local = app.localSlot;
+    const state = net.state;
+    for (let s = 0; s < MAX_CARS; s++) {
+        const i = base + s;
+        if (!net.viewPresent[s]) { replay.present[i] = 0; continue; }
+        const isLocal = s === local;
+        replay.present[i] = 1;
+        replay.x[i] = isLocal ? localX : net.viewX[s];
+        replay.z[i] = isLocal ? localZ : net.viewZ[s];
+        replay.yaw[i] = isLocal ? localYaw : net.viewYaw[s];
+        replay.vx[i] = isLocal ? state.vx : net.viewVx[s];
+        replay.vz[i] = isLocal ? state.vz : net.viewVz[s];
+        replay.steer[i] = isLocal ? state.steer : net.viewSteer[s];
+        replay.flags[i] = net.viewFlags[s];
+        replay.drift[i] = net.viewDrift[s];
+    }
+    replay.head = head + 1 >= REPLAY_FRAMES ? 0 : head + 1;
+    if (replay.count < REPLAY_FRAMES) replay.count++;
+}
+
+/** Начать проигрывание последних REPLAY_SECONDS секунд гонки. */
+function startReplay() {
+    replay.playing = false;
+    if (!app.replayWanted || !app.raceBuilt || replay.count < REPLAY_MIN_FRAMES) {
+        results.endReplay();
+        return;
+    }
+    const last = (replay.head - 1 + REPLAY_FRAMES) % REPLAY_FRAMES;
+    const until = replay.time[last] - REPLAY_SECONDS * 1000;
+    // Ищем от свежего к старому: сколько кадров укладывается в окно.
+    let steps = 1;
+    while (steps < replay.count) {
+        const idx = (last - steps + REPLAY_FRAMES) % REPLAY_FRAMES;
+        if (replay.time[idx] < until) break;
+        steps++;
+    }
+    if (steps < REPLAY_MIN_FRAMES) {
+        results.endReplay();
+        return;
+    }
+    // За кем смотреть. Своя машина — первый выбор, но к концу гонки её
+    // в кадре может уже не быть: финишировавший превращается в призрака
+    // и через три секунды исчезает. Тогда камера идёт за тем, кто в эти
+    // секунды ещё ехал, — обычно за тем, кто и закрывал гонку.
+    const base = last * MAX_CARS;
+    let camSlot = -1;
+    if (app.localSlot >= 0 && replay.present[base + app.localSlot]) {
+        camSlot = app.localSlot;
+    } else {
+        for (let s = 0; s < MAX_CARS; s++) {
+            if (replay.present[base + s]) { camSlot = s; break; }
+        }
+    }
+    if (camSlot < 0) {
+        results.endReplay();
+        return;
+    }
+
+    replay.first = (last - steps + 1 + REPLAY_FRAMES) % REPLAY_FRAMES;
+    replay.steps = steps;
+    replay.cursor = 0;
+    replay.baseMs = replay.time[replay.first];
+    replay.startMs = nowMs();
+    replay.camSlot = camSlot;
+    replay.playing = true;
+    renderer.setLocalSlot(camSlot);
+    results.beginReplay(Math.round((replay.time[last] - replay.baseMs) / 100) / 10);
+}
+
+/** Досрочно оборвать повтор (кнопка «Пропустить» или уход с экрана). */
+function stopReplay() {
+    if (!replay.playing) return;
+    replay.playing = false;
+    renderer.setLocalSlot(app.localSlot);
+    results.endReplay();
+}
+
+/** Кадр повтора: машины берутся из кольцевого буфера, а не из сети. */
+function drawReplay(dt) {
+    const elapsed = nowMs() - replay.startMs;
+    let cursor = replay.cursor;
+    while (cursor + 1 < replay.steps) {
+        const next = (replay.first + cursor + 1) % REPLAY_FRAMES;
+        if (replay.time[next] - replay.baseMs > elapsed) break;
+        cursor++;
+    }
+    replay.cursor = cursor;
+
+    const base = ((replay.first + cursor) % REPLAY_FRAMES) * MAX_CARS;
+    renderer.beginFrame();
+    for (let s = 0; s < MAX_CARS; s++) {
+        const i = base + s;
+        if (!replay.present[i]) continue;
+        renderer.setCarState(s, replay.x[i], replay.z[i], replay.yaw[i],
+            replay.vx[i], replay.vz[i], replay.steer[i],
+            replay.flags[i], replay.drift[i]);
+    }
+    renderer.frame(dt);
+
+    if (cursor + 1 >= replay.steps) stopReplay();
 }
 
 /**
@@ -543,6 +773,7 @@ function onLeaveRoom() {
  * владельцем комнаты — вместе с ним уезжало и владение.
  */
 function onResultsReturn() {
+    stopReplay();
     if (!app.inRoom) {
         setScreen(SCREEN_MENU);
         return;
@@ -612,7 +843,9 @@ function frame(timestamp) {
     app.steps = steps;
 
     // --- отрисовка ---------------------------------------------------------
-    if (app.raceBuilt) {
+    if (replay.playing && app.raceBuilt) {
+        drawReplay(dt);
+    } else if (app.raceBuilt) {
         const alpha = app.accumulator / DT;
         drawRace(t0, alpha, dt);
     }
@@ -676,6 +909,13 @@ function drawRace(t, alpha, dt) {
 
     renderer.applySnapshot(net.snap);
     renderer.frame(dt);
+
+    // Кольцевой буфер повтора финиша пишется только в идущей гонке и только
+    // когда галочка комнаты включена: иначе это чистые лишние 48 КБ записи.
+    if (app.replayWanted && app.racing && !app.paused) {
+        recordReplayFrame(t, localX, localZ, localYaw);
+    }
+
 
     fillHud(t, localX, localZ);
     fillAudio(local, localX, localZ);
@@ -875,6 +1115,10 @@ function boot() {
         hudState: hudState,
         audioState: audioState,
         perfStats: perfStats,
+        replay: replay,
+        results: results,
+        lobby: lobby,
+        menu: menu,
     };
 }
 

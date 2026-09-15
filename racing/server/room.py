@@ -471,7 +471,6 @@ class Championship(object):
         self.finished = False
         self.standings = {}              # ключ -> строка зачёта
         self.order = []                  # ключи в порядке появления
-        self.winner_key = None           # победитель последнего этапа
 
     # --- календарь ----------------------------------------------------------
 
@@ -517,6 +516,9 @@ class Championship(object):
     def ensure(self, name):
         """Строка зачёта участника. Новый входит с нулём со следующего этапа."""
         key = champ_key(name)
+        # Показываем имя как его написал человек, но без лишних пробелов:
+        # ключ их и так схлопывает, а в таблице «Вася  » выглядит опечаткой.
+        name = ' '.join((name or '').split())
         row = self.standings.get(key)
         if row is None:
             row = {
@@ -554,7 +556,6 @@ class Championship(object):
             row['stage_points'] = 0
             row['last_place'] = 0
 
-        self.winner_key = None
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -570,7 +571,6 @@ class Championship(object):
             entry['last_place'] = place
             if place == 1 and not row.get('dnf'):
                 entry['wins'] += 1
-                self.winner_key = entry['key']
 
         self.stage_done += 1
         for pos, key in enumerate(self.ranking(), 1):
@@ -680,6 +680,11 @@ class Room(object):
             'players': len(self.players),
             'max_players': self.settings['max_players'],
             'state': self.state,
+            # Чемпионат виден уже в списке комнат: «этап 2 из 5» — главный
+            # повод зайти именно сюда, а не в соседнюю комнату.
+            'mode': self.settings.get('mode', config.ROOM_MODES[0]),
+            'stage': self.champ.stage_number() if self.champ is not None else 0,
+            'stages': self.champ.stages if self.champ is not None else 0,
         }
 
     def state_payload(self, you=-1):
@@ -944,6 +949,14 @@ class Room(object):
         if self.state != config.STATE_LOBBY:
             player.send_error('busy', 'настройки меняют в лобби')
             return
+        if self.champ is not None and isinstance(raw, dict):
+            # Идёт серия: трассу задаёт календарь, а длину серии и режим
+            # менять посреди чемпионата нельзя — очки уже начислены.
+            for locked in ('track', 'mode', 'stages'):
+                if locked in raw and raw[locked] != self.settings.get(locked):
+                    player.send_error('busy', 'идёт чемпионат: трассу и длину '
+                                              'серии менять поздно')
+                    return
         try:
             settings = validate_settings(raw, self.manager.content,
                                          base=self.settings,
@@ -1090,12 +1103,27 @@ class Room(object):
         self.tick_samples = 0
         self.skipped_ticks = 0
         self.state = config.STATE_COUNTDOWN
+        # Кто на каком слоте поехал: рекордам это нужно и после того, как
+        # игрок отвалился и слот опустел.
+        self._race_cars = {p.slot: p.car for p in racers}
+        self._race_names = {p.slot: p.name for p in racers}
+
+        self._apply_handicap(sim, racers)
 
         grid = getattr(track, 'start_grid', None) or []
         players_payload = []
         for index, racer in enumerate(racers):
             place = grid[index] if index < len(grid) else {'x': 0.0, 'z': 0.0, 'yaw': 0.0}
-            players_payload.append(racer.race_info(place))
+            info = racer.race_info(place)
+            if racer.slot == self._handicap_slot and self._handicap_factor:
+                # Клиент обязан предсказывать ТЕМИ ЖЕ характеристиками,
+                # иначе реконсиляция будет вечно тянуть машину назад.
+                info['handicap'] = round(self._handicap_factor, 4)
+            players_payload.append(info)
+        if champ is not None:
+            self._system_chat('Этап %d из %d: %s'
+                              % (champ.stage_number(), champ.stages,
+                                 content.track_name(self.settings['track'])))
         self.broadcast({
             't': 'race_init',
             'track': track.to_client(),
@@ -1121,6 +1149,55 @@ class Room(object):
         self._pause_name = ''
         self._countdown_value = config.COUNTDOWN_SECONDS
         self._countdown_step()
+        return True
+
+    # --- гандикап -----------------------------------------------------------
+    #
+    # Победитель прошлой гонки едет следующую чуть медленнее. Множитель
+    # накладывается на ХАРАКТЕРИСТИКИ машины, а не на физику: физический шаг
+    # читает stats по атрибутам (§6.5), поэтому достаточно подменить объект
+    # характеристик у одной машины — ни game/physics.py, ни game/sim.py при
+    # этом не трогаются. Симуляция даёт для этого штатный доступ sim.car(slot).
+
+    def _apply_handicap(self, sim, racers):
+        """Наложить гандикап на победителя прошлой гонки, если он поехал."""
+        self._handicap_slot = -1
+        self._handicap_factor = 0.0
+        if not self.settings.get('handicap') or not self._last_winner_key:
+            return
+        target = None
+        for racer in racers:
+            if champ_key(racer.name) == self._last_winner_key:
+                target = racer
+                break
+        if target is None:
+            return                       # победитель не едет — некого тормозить
+        getter = getattr(sim, 'car', None)
+        if getter is None:
+            return                       # заглушка симуляции: молча мимо
+        factor = config.HANDICAP_FACTOR
+        try:
+            from game import physics
+            car = getter(target.slot)
+            if car is None:
+                return
+            base = car.stats
+            values = {}
+            for name in physics.CarStats.__slots__:
+                value = float(getattr(base, name))
+                if name in config.HANDICAP_STATS:
+                    value *= factor
+                values[name] = value
+            car.stats = physics.CarStats(**values)
+        except Exception as exc:
+            self._log('комната %s: гандикап не применился: %s' % (self.id, exc))
+            return
+        self._handicap_slot = target.slot
+        self._handicap_factor = factor
+        self._system_chat('Гандикап: %s едет на %d %% медленнее — победа '
+                          'в прошлой гонке'
+                          % (target.name or 'победитель',
+                             int(round((1.0 - factor) * 100))))
 
     def _countdown_step(self):
         """Шаги отсчёта 3, 2, 1, 0 — по секунде (§9)."""
@@ -1195,16 +1272,55 @@ class Room(object):
         return self._check_race_end()
 
     def _emit_events(self, events):
-        """Рассылка race_event от симуляции и отметка финиша лидера."""
+        """Рассылка race_event от симуляции, отметка финиша лидера, рекорды."""
         for event in events:
             if not isinstance(event, dict):
                 continue
             if event.get('t') is None:
                 event['t'] = 'race_event'
-            if event.get('kind') == 'finish' and not self._grace_deadline:
+            kind = event.get('kind')
+            if kind == 'finish' and not self._grace_deadline:
                 # После финиша лидера остальным даётся FINISH_GRACE (§9).
                 self._grace_deadline = self._ticks + int(config.FINISH_GRACE / config.TICK_DT)
             self.broadcast(event)
+            if kind == 'lap':
+                self._check_record(event)
+
+    def _check_record(self, event):
+        """Круг закрыт: не рекорд ли это. Внутри тика — только память.
+
+        Хранилище правит словарь и взводит отложенную запись, на диск отсюда
+        не уходит ни байта (см. server/records.py). Рассылка обновлённого
+        списка комнат откладывается на следующий проход цикла, чтобы её
+        сериализация не попала в замер стоимости тика.
+        """
+        store = self.manager.records
+        if store is None or not store.enabled:
+            return
+        slot = event.get('slot')
+        record = store.submit(self.settings['track'], self.settings['mirror'],
+                              self._race_cars.get(slot),
+                              self._race_names.get(slot, ''),
+                              event.get('time'))
+        if record is None:
+            return
+        content = self.manager.content
+        self.broadcast({
+            't': 'race_event',
+            'kind': 'record',
+            'slot': slot,
+            'name': record['name'],
+            'track': record['track'],
+            'track_name': content.track_name(record['track']),
+            'mirror': record['mirror'],
+            'car': record['car'],
+            'time': record['time'],
+            'scope': record['scope'],
+            'prev': record['prev'],
+            'prev_name': record['prev_name'],
+            'first': record['first'],
+        })
+        IOLoop.current().add_callback(self.manager.rooms_changed)
 
     def _check_race_end(self):
         """Условия окончания гонки. True — продолжаем."""
@@ -1413,12 +1529,32 @@ class Room(object):
                 self._log('комната %s: results() упал: %s' % (self.id, exc))
                 rows = []
         self.state = config.STATE_RESULTS
-        self.broadcast({'t': 'results', 'rows': rows})
+
+        # Победитель запоминается всегда, даже когда гандикап выключен:
+        # галочку могут включить между гонками, и тогда она обязана
+        # сработать на ближайшем же заезде, а не через один.
+        self._last_winner_key = None
+        for row in rows:
+            if isinstance(row, dict) and row.get('place') == 1 and not row.get('dnf'):
+                self._last_winner_key = champ_key(row.get('name'))
+                break
+
+        results_event = {'t': 'results', 'rows': rows}
+        champ = self.champ
+        if champ is not None:
+            champ.apply_results(rows)
+            # Таблица чемпионата приезжает тем же событием, что и итоги
+            # гонки: клиент рисует её поверх итогов одним экраном.
+            results_event['championship'] = self.championship_payload()
+        self.broadcast(results_event)
         self.broadcast_state()
         self.manager.rooms_changed()
         self.log_tick_stats(reason)
-        self._timer = IOLoop.current().call_later(config.RESULTS_SECONDS,
-                                                  self._back_to_lobby)
+        seconds = config.RESULTS_SECONDS
+        if champ is not None and champ.finished:
+            # Финальная таблица с чемпионом держится дольше обычной.
+            seconds = config.CHAMPIONSHIP_FINAL_SECONDS
+        self._timer = IOLoop.current().call_later(seconds, self._back_to_lobby)
 
     def log_tick_stats(self, reason):
         """Напечатать измеренную стоимость тика: это условие приёмки (§1)."""
@@ -1445,6 +1581,19 @@ class Room(object):
         self.state = config.STATE_LOBBY
         for player in self.order:
             player.reset_for_lobby()
+        champ = self.champ
+        if champ is not None:
+            if champ.finished:
+                best = champ.champion()
+                if best is not None:
+                    self._system_chat('Чемпион серии: %s — %d очк.'
+                                      % (best['name'], best['points']))
+                # Серия доиграна: комната возвращается к обычному лобби,
+                # а кнопка «Старт» заводит следующую с нуля.
+                self.champ = None
+                self._cancel_champ_timer()
+            else:
+                self._start_champ_break()
         self.broadcast_state()
         self.manager.rooms_changed()
 
@@ -1467,6 +1616,8 @@ class Room(object):
     def close(self):
         """Погасить все таймеры комнаты (выход последнего игрока, остановка сервера)."""
         self._stop_loop()
+        self._cancel_champ_timer()
+        self.champ = None
         self.log_tick_stats('комната закрыта')
         self._sim = None
         self.state = config.STATE_LOBBY
@@ -1482,7 +1633,7 @@ class Room(object):
 class RoomManager(object):
     """Все комнаты сервера и все подключённые игроки."""
 
-    def __init__(self, content, servers_provider=None, log=None):
+    def __init__(self, content, servers_provider=None, log=None, records=None):
         self.content = content
         self.rooms = {}
         self.players = []                    # все игроки, прошедшие hello
@@ -1492,6 +1643,12 @@ class RoomManager(object):
         self._ping_timer = None
         self._lobby_timer = None
         self._rng = random.SystemRandom()
+        # Хранилище рекордов кругов; None или выключенное — игра работает
+        # ровно так же, просто без рекордов (server/records.py).
+        self.records = records
+        # Календарь чемпионата тасуется обычным Random: он не про секреты,
+        # а SystemRandom на каждый этап — лишний поход в ядро.
+        self.rng = random.Random()
 
     # --- жизненный цикл ------------------------------------------------------
 
@@ -1623,10 +1780,17 @@ class RoomManager(object):
             servers = self._servers()
         except Exception:
             servers = []
+        # Таблица рекордов едет в том же событии, что и список комнат:
+        # оба нужны ровно одному экрану — главному меню, — и оба обновляются
+        # кнопкой «Обновить». Отдельный тип события пришлось бы заводить
+        # в чужом net.js, а лишних байт здесь пара килобайт на пять трасс.
+        records = self.records
         return {
             't': 'rooms',
             'rooms': [room.summary() for room in self.rooms.values()],
             'servers': servers,
+            'records_enabled': bool(records is not None and records.enabled),
+            'records': records.table() if records is not None else [],
         }
 
     def rooms_changed(self):

@@ -36,12 +36,7 @@ import {
     loadGfxSettings,
     saveGfxSettings,
     applyGfxPreset,
-    DECOR_LEVELS,
-    PARTICLE_LEVELS,
-    RENDER_SCALES,
-    VIEW_DISTANCES,
-    NIGHT_LIGHT_LEVELS,
-    TIME_OF_DAY_MODES
+    GFX_OPTIONS
 } from '../render/renderer.js';
 
 const LS_NAME = 'racing.name';
@@ -54,12 +49,20 @@ const QUALITY_LABELS = { low: 'Низкое', medium: 'Среднее', high: '�
 
 // Подписи отдельных настроек графики. Пресет выше — быстрая заготовка,
 // которая выставляет их скопом; дальше каждую можно крутить руками.
-const DECOR_LABELS = { sparse: 'Реже', normal: 'Обычно', dense: 'Гуще' };
-const PARTICLE_LABELS = { off: 'Выкл', few: 'Мало', normal: 'Норма', many: 'Много' };
-const SCALE_LABELS = { 0.5: '50 %', 0.75: '75 %', 1: '100 %' };
-const VIEW_DISTANCE_LABELS = { near: 'Ближе', normal: 'Обычно', far: 'Дальше' };
-const NIGHT_LIGHT_LABELS = { off: 'Выкл', normal: 'Норма', bright: 'Ярче' };
-const TIME_OF_DAY_LABELS = { auto: 'Авто', day: 'День', dusk: 'Закат', night: 'Ночь' };
+// Подписи ЗНАЧЕНИЙ настроек-переключателей, по ключу настройки. Сами
+// настройки (какие есть, какие у них значения и подписи) перечислены один
+// раз в renderer.js — таблицей GFX_OPTIONS, по которой блок и строится.
+// Здесь остаётся только то, чего в той таблице нет: как назвать по-русски
+// каждое значение. Ключа тут может не быть — тогда покажем само значение.
+const GFX_VALUE_LABELS = {
+    decor:        { sparse: 'Реже', normal: 'Обычно', dense: 'Гуще' },
+    particles:    { off: 'Выкл', few: 'Мало', normal: 'Норма', many: 'Много' },
+    renderScale:  { 0.5: '50 %', 0.75: '75 %', 1: '100 %' },
+    viewDistance: { near: 'Ближе', normal: 'Обычно', far: 'Дальше' },
+    nightLights:  { off: 'Выкл', normal: 'Норма', bright: 'Ярче' },
+    timeOfDay:    { auto: 'Авто', day: 'День', dusk: 'Закат', night: 'Ночь' },
+    weather:      { auto: 'Авто', clear: 'Ясно', wet: 'Дождь' },
+};
 
 /** Безопасное чтение localStorage: в приватном окне доступ может бросать. */
 function lsGet(key) {
@@ -159,6 +162,28 @@ export function itemIconSvg(itemId, size, fill) {
 // Список и подписи держатся здесь одним местом: их берёт и форма создания
 // комнаты, и панель настроек лобби. Погода, когда приедет, ляжет рядом
 // такой же тройкой (значения, подписи, иконка).
+
+// --- режим комнаты: одиночная гонка или чемпионат ---------------------------
+//
+// Зеркало server/config.ROOM_MODES и STAGES_MIN/STAGES_MAX. Сервер всё равно
+// проверяет каждое поле сам (коды ошибок bad_mode и bad_stages), здесь это
+// только для формы и подписей.
+
+export const ROOM_MODES = ['single', 'championship'];
+export const ROOM_MODE_LABELS = { single: 'Одна гонка', championship: 'Чемпионат' };
+export const STAGES_MIN = 3;
+export const STAGES_MAX = 7;
+export const STAGES_DEFAULT = 3;
+
+// Короткие: подпись стоит в шапке панели рядом с заголовком, длинная
+// строка там переносится на три строки и давит заголовок.
+export const CHAMP_PHASE_LABELS = {
+    lobby: 'ждём старта',
+    break: 'пауза',
+    racing: 'этап идёт',
+    results: 'итоги этапа',
+    final: 'сыграна',
+};
 
 export const ROOM_TIMES_OF_DAY = ['day', 'dusk', 'night'];
 
@@ -267,6 +292,11 @@ function defaultRoomSettings() {
         items: ['boost', 'rocket', 'mine', 'shield', 'storm'],
         collisions: true,
         mirror: false,
+        mode: ROOM_MODES[0],
+        stages: STAGES_DEFAULT,
+        // Обе доработки — за галочками и по умолчанию выключены.
+        handicap: false,
+        replay: false,
     };
 }
 
@@ -290,6 +320,8 @@ export class MenuScreen {
         this.serverName = '';
         this.rooms = [];
         this.servers = [];
+        this.records = [];
+        this.recordsEnabled = true;
 
         this.settings = loadUiSettings();
         this.draft = defaultRoomSettings();
@@ -330,12 +362,15 @@ export class MenuScreen {
         this._buildTrackCards();
     }
 
-    /** Событие `rooms`: комнаты этого сервера и другие серверы в сети. */
+    /** Событие `rooms`: комнаты, соседи по сети и рекорды кругов. */
     applyRooms(msg) {
         this.rooms = msg.rooms || [];
         this.servers = msg.servers || [];
+        this.records = msg.records || [];
+        this.recordsEnabled = msg.records_enabled !== false;
         this._renderRooms();
         this._renderServers();
+        this._renderRecords();
     }
 
     /** Событие `error`: показать текст рядом со списком комнат. */
@@ -517,7 +552,8 @@ export class MenuScreen {
             const buttons = [];
             for (let i = 0; i < values.length; i++) {
                 const v = values[i];
-                const btn = el('button', 'seg', labels[v]);
+                const btn = el('button', 'seg',
+                    (labels && labels[v] !== undefined) ? labels[v] : String(v));
                 btn.type = 'button';
                 btn.addEventListener('click', function () {
                     const patch = {};
@@ -534,18 +570,21 @@ export class MenuScreen {
         }
 
         this.gfxSegments = {};
-        addToggle('ao', 'Запечённое затенение', 'Тени в стыках и у оснований. В кадре бесплатно.');
-        addToggle('glow', 'Свечение огней', 'Фары, стоп-сигналы, турбо, маяки мин.');
-        addToggle('decorAnim', 'Анимация декора', 'Качание деревьев и флагов, движение толпы.');
-        addSegmented('decor', 'Плотность декора', DECOR_LEVELS, DECOR_LABELS);
-        addSegmented('particles', 'Частицы', PARTICLE_LEVELS, PARTICLE_LABELS);
-        addSegmented('renderScale', 'Чёткость картинки', RENDER_SCALES, SCALE_LABELS);
-        addSegmented('viewDistance', 'Дальность отрисовки', VIEW_DISTANCES, VIEW_DISTANCE_LABELS,
-            'Докуда тянется туман и что попадает в кадр.');
-        addSegmented('nightLights', 'Яркость ночных огней', NIGHT_LIGHT_LEVELS, NIGHT_LIGHT_LABELS,
-            'Фонари, окна, подсветка щитов и пятна фар.');
-        addSegmented('timeOfDay', 'Время суток', TIME_OF_DAY_MODES, TIME_OF_DAY_LABELS,
-            'Обычно берётся из настроек комнаты. Здесь можно перебить для себя.');
+        // Строки берутся из GFX_OPTIONS — таблицы, которую ведёт владелец
+        // рендера. Раньше список жил в двух местах, и новая настройка в
+        // renderer.js просто не появлялась в меню, пока про меню не вспомнят.
+        for (let i = 0; i < GFX_OPTIONS.length; i++) {
+            const opt = GFX_OPTIONS[i];
+            if (opt.kind === 'toggle') {
+                addToggle(opt.key, opt.label, opt.hint);
+            } else if (opt.kind === 'enum') {
+                addSegmented(opt.key, opt.label, opt.values,
+                    GFX_VALUE_LABELS[opt.key] || null, opt.hint);
+            } else {
+                console.warn('menu.js: настройка графики %s неизвестного вида %s',
+                             opt.key, opt.kind);
+            }
+        }
 
         box.appendChild(body);
         return box;
@@ -578,6 +617,21 @@ export class MenuScreen {
         this.roomsList = el('div', 'rooms-list scroll');
         roomsPanel.appendChild(this.roomsList);
         right.appendChild(roomsPanel);
+
+        // Рекорды кругов: живут между сессиями сервера (server/records.py)
+        // и приезжают вместе со списком комнат — тем же событием `rooms`.
+        const recPanel = el('div', 'panel records-panel');
+        const rHead = el('div', 'panel-head');
+        rHead.appendChild(el('h2', null, 'Рекорды кругов'));
+        const rSpacer = el('div');
+        rSpacer.style.flex = '1';
+        rHead.appendChild(rSpacer);
+        this.recordsNote = el('div', 'label', '');
+        rHead.appendChild(this.recordsNote);
+        recPanel.appendChild(rHead);
+        this.recordsList = el('div', 'records-list scroll');
+        recPanel.appendChild(this.recordsList);
+        right.appendChild(recPanel);
 
         // Серверы сети
         const serversPanel = el('div', 'panel servers-panel');
@@ -618,6 +672,34 @@ export class MenuScreen {
         this.roomNameInput.placeholder = 'Заезд в обед';
         grid.appendChild(nameField);
         nameField.appendChild(this.roomNameInput);
+
+        // Режим: одна гонка или чемпионат из нескольких этапов.
+        const modeField = el('div', 'field form-wide');
+        modeField.appendChild(el('div', 'label', 'Режим'));
+        const modeRow = el('div', 'row');
+        modeRow.style.gap = '10px';
+        const modeSeg = el('div', 'segmented');
+        this.modeButtons = [];
+        for (let i = 0; i < ROOM_MODES.length; i++) {
+            const mode = ROOM_MODES[i];
+            const btn = el('button', 'seg', ROOM_MODE_LABELS[mode]);
+            btn.type = 'button';
+            btn.addEventListener('click', () => this._selectMode(mode));
+            modeSeg.appendChild(btn);
+            this.modeButtons.push({ id: mode, node: btn });
+        }
+        modeRow.appendChild(modeSeg);
+        this.stagesWrap = el('div', 'row');
+        this.stagesWrap.style.gap = '9px';
+        this.stagesWrap.appendChild(el('div', 'label', 'этапов'));
+        this.stagesStepper = this._buildStepper(STAGES_MIN, STAGES_MAX,
+            (v) => { this.draft.stages = v; });
+        this.stagesWrap.appendChild(this.stagesStepper.node);
+        modeRow.appendChild(this.stagesWrap);
+        modeField.appendChild(modeRow);
+        this.modeHint = el('div', 'gfx-hint', '');
+        modeField.appendChild(this.modeHint);
+        grid.appendChild(modeField);
 
         // Трасса
         const trackField = el('div', 'field form-wide');
@@ -729,6 +811,40 @@ export class MenuScreen {
 
         flagsField.appendChild(flagsRow);
         grid.appendChild(flagsField);
+
+        // Гандикап и повтор финиша: отдельным блоком, обе выключены.
+        const extraField = el('div', 'field form-wide');
+        const extraRow = el('div', 'row');
+        extraRow.style.gap = '26px';
+
+        const handicapLabel = el('label', 'toggle');
+        this.handicapInput = el('input');
+        this.handicapInput.type = 'checkbox';
+        this.handicapInput.addEventListener('change', () => {
+            this.draft.handicap = this.handicapInput.checked;
+            this._syncExtraHints();
+        });
+        handicapLabel.appendChild(this.handicapInput);
+        handicapLabel.appendChild(el('span', 'toggle-track'));
+        handicapLabel.appendChild(el('span', null, 'Гандикап победителю'));
+        extraRow.appendChild(handicapLabel);
+
+        const replayLabel = el('label', 'toggle');
+        this.replayInput = el('input');
+        this.replayInput.type = 'checkbox';
+        this.replayInput.addEventListener('change', () => {
+            this.draft.replay = this.replayInput.checked;
+            this._syncExtraHints();
+        });
+        replayLabel.appendChild(this.replayInput);
+        replayLabel.appendChild(el('span', 'toggle-track'));
+        replayLabel.appendChild(el('span', null, 'Повтор финиша'));
+        extraRow.appendChild(replayLabel);
+
+        extraField.appendChild(extraRow);
+        this.extraHint = el('div', 'gfx-hint', '');
+        extraField.appendChild(this.extraHint);
+        grid.appendChild(extraField);
 
         body.appendChild(grid);
         modal.appendChild(body);
@@ -848,6 +964,36 @@ export class MenuScreen {
         this._syncTimeOfDay();
     }
 
+    _selectMode(mode) {
+        this.draft.mode = mode;
+        this._syncMode();
+    }
+
+    _syncMode() {
+        const mode = this.draft.mode;
+        for (let i = 0; i < this.modeButtons.length; i++) {
+            this.modeButtons[i].node.classList.toggle('is-active',
+                this.modeButtons[i].id === mode);
+        }
+        const series = mode === 'championship';
+        this.stagesWrap.hidden = !series;
+        this.modeHint.textContent = series
+            ? 'Трасса выше — первый этап. Остальные сервер выберет случайно '
+              + 'без повторов и покажет календарь целиком.'
+            : '';
+    }
+
+    _syncExtraHints() {
+        const parts = [];
+        if (this.draft.handicap) {
+            parts.push('Гандикап: победитель прошлой гонки едет на 3 % медленнее.');
+        }
+        if (this.draft.replay) {
+            parts.push('Повтор: последние 3 секунды гонки на экране итогов.');
+        }
+        this.extraHint.textContent = parts.join(' ');
+    }
+
     _syncTimeOfDay() {
         if (!this.todButtons) return;
         const chosen = this.draft.time_of_day;
@@ -902,11 +1048,16 @@ export class MenuScreen {
         this.roomNameInput.value = 'Комната: ' + this.getName();
         this.lapsStepper.set(this.draft.laps);
         this.maxStepper.set(this.draft.max_players);
+        this.stagesStepper.set(this.draft.stages);
         this.collisionsInput.checked = this.draft.collisions;
         this.mirrorInput.checked = this.draft.mirror;
+        this.handicapInput.checked = this.draft.handicap;
+        this.replayInput.checked = this.draft.replay;
         this._syncTrackCards();
         this._syncTimeOfDay();
         this._syncItemChecks();
+        this._syncMode();
+        this._syncExtraHints();
         this.modalBack.hidden = false;
         this.roomNameInput.focus();
         this.roomNameInput.select();
@@ -928,6 +1079,10 @@ export class MenuScreen {
             items: this.draft.items.slice(),
             collisions: this.draft.collisions,
             mirror: this.draft.mirror,
+            mode: this.draft.mode,
+            stages: this.draft.stages,
+            handicap: this.draft.handicap,
+            replay: this.draft.replay,
         };
         this._closeModal();
         if (this.handlers.onCreateRoom) this.handlers.onCreateRoom(name, settings);
@@ -966,7 +1121,14 @@ export class MenuScreen {
             trackCell.appendChild(el('span', null, track.name || track.id));
             row.appendChild(trackCell);
 
-            row.appendChild(el('div', 'room-laps num', room.laps + ' круг' + lapSuffix(room.laps)));
+            const laps = el('div', 'room-laps num');
+            laps.appendChild(el('span', null, room.laps + ' круг' + lapSuffix(room.laps)));
+            // Идущая серия — главный повод зайти именно в эту комнату.
+            if (room.mode === 'championship') {
+                laps.appendChild(el('span', 'room-champ',
+                    room.stages ? 'этап ' + room.stage + '/' + room.stages : 'чемпионат'));
+            }
+            row.appendChild(laps);
 
             const players = el('div', 'room-players num');
             const full = room.players >= room.max_players;
@@ -989,6 +1151,75 @@ export class MenuScreen {
             });
             row.appendChild(join);
 
+            list.appendChild(row);
+        }
+    }
+
+    /** Название машины по id (welcome.content.cars). */
+    _carName(carId) {
+        const cars = (this.content && this.content.cars) || [];
+        for (let i = 0; i < cars.length; i++) {
+            if (cars[i].id === carId) return cars[i].name || carId;
+        }
+        return carId || '—';
+    }
+
+    /**
+     * Таблица рекордов. Строка на трассу: абсолютный рекорд крупно, под ним
+     * рекорды по машинам мелко — именно эти две вещи и просят посмотреть
+     * («а кто быстрее всех на фургоне?»).
+     */
+    _renderRecords() {
+        const list = this.recordsList;
+        list.innerHTML = '';
+        if (!this.recordsEnabled) {
+            this.recordsNote.textContent = 'выключены';
+            const note = el('div', 'empty-note');
+            note.textContent = 'Сервер запущен с ключом --no-records: '
+                + 'рекорды не сохраняются.';
+            list.appendChild(note);
+            return;
+        }
+        this.recordsNote.textContent = this.records.length
+            ? this.records.length + ' трасс' + trackSuffix(this.records.length) : '';
+        if (!this.records.length) {
+            const note = el('div', 'empty-note');
+            note.textContent = 'Рекордов пока нет. Первый круг на любой трассе — '
+                + 'уже рекорд, и он переживёт перезапуск сервера.';
+            list.appendChild(note);
+            return;
+        }
+
+        for (let i = 0; i < this.records.length; i++) {
+            const entry = this.records[i];
+            const track = this._trackLabel(entry.track);
+            const row = el('div', 'record-row');
+
+            const head = el('div', 'rec-head');
+            head.appendChild(el('span', 'theme-chip theme-' + (track.theme || 'city')));
+            const title = el('span', 'rec-track',
+                (track.name || entry.track) + (entry.mirror ? ' (зеркало)' : ''));
+            head.appendChild(title);
+            if (entry.best) {
+                head.appendChild(el('span', 'rec-best num', formatLap(entry.best.time)));
+                head.appendChild(el('span', 'rec-who', entry.best.name || 'Гонщик'));
+                head.appendChild(el('span', 'rec-date', entry.best.date || ''));
+            }
+            row.appendChild(head);
+
+            const cars = entry.cars || [];
+            if (cars.length) {
+                const carsRow = el('div', 'rec-cars');
+                for (let k = 0; k < cars.length; k++) {
+                    const car = cars[k];
+                    const chip = el('div', 'rec-car');
+                    chip.appendChild(el('span', 'rc-name', this._carName(car.car)));
+                    chip.appendChild(el('span', 'rc-time num', formatLap(car.time)));
+                    chip.appendChild(el('span', 'rc-who', car.name || ''));
+                    carsRow.appendChild(chip);
+                }
+                row.appendChild(carsRow);
+            }
             list.appendChild(row);
         }
     }
@@ -1096,6 +1327,29 @@ export class MenuScreen {
         this.settings = saveUiSettings({ name: name });
         if (this.handlers.onNameChange) this.handlers.onNameChange(name);
     }
+}
+
+/** «1:02.31» или «39.58» — время круга в таблице рекордов. */
+function formatLap(seconds) {
+    if (!(seconds > 0)) return '—';
+    const hundredths = Math.round(seconds * 100);
+    const cs = hundredths % 100;
+    const total = (hundredths - cs) / 100;
+    const s = total % 60;
+    const m = (total - s) / 60;
+    const csText = cs < 10 ? '0' + cs : String(cs);
+    if (m > 0) return m + ':' + (s < 10 ? '0' + s : s) + '.' + csText;
+    return s + '.' + csText;
+}
+
+/** «1 трасса», «3 трассы», «5 трасс» — окончание по числу. */
+function trackSuffix(n) {
+    const mod100 = n % 100;
+    if (mod100 >= 11 && mod100 <= 14) return '';
+    const mod10 = n % 10;
+    if (mod10 === 1) return 'а';
+    if (mod10 >= 2 && mod10 <= 4) return 'ы';
+    return '';
 }
 
 /** «1 круг», «3 круга», «5 кругов» — окончание по числу. */

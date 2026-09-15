@@ -37,6 +37,7 @@ import {
     mixColor,
     toColor,
     bakeContactAO,
+    bakeVertexLight,
     disposeObject,
     countTriangles,
     countDrawCalls,
@@ -165,8 +166,432 @@ function todShade(color, tod) {
     return color;
 }
 
+// ---------------------------------------------------------------------------
+// Погода на полотне
+// ---------------------------------------------------------------------------
+//
+// Погода приходит тем же каналом, что и время суток (`env.weather`, см.
+// scenery.js), и ложится ПОВЕРХ него: сначала палитра темы приглушается под
+// время суток, потом — под погоду. Сухая погода не меняет ничего вовсе,
+// это проверяется попиксельно.
+//
+// Мокрый асфальт складывается из двух половин:
+//  1. ЗАТЕМНЕНИЕ. Мокрая поверхность отражает больше и рассеивает меньше,
+//     поэтому диффузная составляющая падает, а цвет холоднеет. Это запекается
+//     в вершинные цвета полотна — в кадре ноль вызовов, ноль треугольников,
+//     ноль фрагментов.
+//  2. БЛИК. Френелевский подмес цвета неба плюс вытянутый зеркальный отблик
+//     солнца, посчитанные В ТЕХ ЖЕ пикселях, которые полотно и так рисует
+//     (см. surfaceShader ниже). Ни второго прохода, ни экранных целей.
+//
+// Плоского зеркала здесь нет намеренно: это второй полный обход сцены
+// (+52 вызова, +44 тыс. треугольников), и снижение его разрешения ни вызовов,
+// ни треугольников не убирает.
+
+const WEATHER_SURFACE = {
+    clear: { roadK: 1.0, roadTint: [1.0, 1.0, 1.0], kerbK: 1.0, grassK: 1.0, gloss: 0.0 },
+    // множители подобраны так, чтобы асфальт читался как мокрый, но не как
+    // ночной: полотно темнеет заметно, обочина — вдвое слабее (трава мокнет,
+    // но не блестит), бордюры почти не трогаются, иначе теряется шашка
+    wet: { roadK: 0.56, roadTint: [0.94, 0.98, 1.10], kerbK: 0.86, grassK: 0.82, gloss: 1.0 }
+};
+
 const KERB_WIDTH = 0.62; // ширина бордюра, м
 const MARK_LIFT = 0.015; // подъём разметки над полотном, м
+
+// ---------------------------------------------------------------------------
+// Карта следов в параметризации ленты
+// ---------------------------------------------------------------------------
+//
+// Следы шин, юз, пыль на обочине и копоть от взрывов — ОДНА текстура,
+// натянутая на полотно по его собственной параметризации: одна ось — путь
+// по кругу, вторая — смещение поперёк. В кадре это стоит ноль вызовов,
+// ноль треугольников и ноль фрагментов: выборка идёт в тех же пикселях,
+// которые полотно и так рисует.
+//
+// Почему не геометрия и не декали. За гонку набегает около 50 000 звеньев
+// следа; лентой квадов это 96 000 треугольников — весь бюджет кадра. Резать
+// кольцевым буфером до 8 000 нельзя: следы начнут пропадать через сорок
+// секунд, а требование ровно обратное — они копятся всю гонку.
+//
+// Почему не карта по мировым XZ. На габарит трассы 513 м даже 2048² даёт
+// 0,25 м на тексель при ширине следа 0,22 м — след уже тексела и не читается.
+// Нужное разрешение стоило бы 36 МБ.
+//
+// РАСКЛАДКА ОСЕЙ. Путь по кругу идёт по ВЫСОТЕ текстуры, смещение поперёк —
+// по ширине. Так участок трассы — это несколько подряд идущих СТРОК, то есть
+// непрерывный кусок массива: и дописывание отпечатков, и выцветание льются
+// в GPU прямоугольниками через copyTextureToTexture, без перекладывания
+// данных и без сырого WebGL.
+//
+// ПОПЕРЕЧНЫЙ ОХВАТ шире полотна (MARK_EXTENT полуширин в каждую сторону):
+// внутри него живут и дорога, и бордюры, и ближняя обочина, поэтому следы
+// на траве получаются той же картой и той же выборкой — даром. Дальше охвата
+// параметр зажимается в крайний столбец, который НИКОГДА не штампуется:
+// это и есть «заведомо пустая кайма» вместо проверки в шейдере.
+
+const MARK_EXTENT = 1.6;      // полуширин полотна в каждую сторону
+const MARK_METERS = 0.35;     // целевая длина тексела вдоль трассы, м
+const MARK_COLS = { low: 128, medium: 192, high: 256 };
+const MARK_ROWS_MIN = 2048;
+const MARK_ROWS_MAX = 8192;
+const MARK_EDGE = 2;          // столбцов пустой каймы с каждого края
+const MARK_CAP = 232;         // потолок насыщения: трасса не станет чёрной
+const MARK_HALFLIFE = 75.0;   // с, за сколько след бледнеет вдвое
+const MARK_SLICE = 96;        // строк выцветания за кадр
+const MARK_MAX_RECTS = 5;     // прямоугольников догрузки за кадр
+const MARK_BRUSHES = 24;      // кистей с памятью прошлой точки (8 машин x 2 + запас)
+
+/**
+ * Число строк карты под длину круга. Степень двойки не нужна: WebGL2 снял
+ * ограничение на размеры текстур, а округление вверх до степени двойки стоило
+ * бы лишний мегабайт на трёх трассах из пяти (serpentine 4423 строки округлились
+ * бы до 8192). Кратность 64 оставлена ради выравнивания строк при догрузке.
+ */
+function markRows(length) {
+    let rows = Math.ceil(length / MARK_METERS / 64) * 64;
+    if (rows < MARK_ROWS_MIN) rows = MARK_ROWS_MIN;
+    else if (rows > MARK_ROWS_MAX) rows = MARK_ROWS_MAX;
+    return rows;
+}
+
+/**
+ * Карта следов: пиксели в оперативной памяти плюс её двойник в видеопамяти.
+ *
+ * Две THREE.DataTexture делят ОДИН массив байт. Одна (`texture`) висит
+ * в материале полотна, вторая (`src`) не участвует в отрисовке и служит
+ * источником для частичной догрузки: three.js в этом случае уходит в ветку
+ * texSubImage2D и заливает ровно указанный прямоугольник, а не всю текстуру.
+ * Полная заливка мегабайта каждый кадр была бы и трафиком, и перевалидацией
+ * текстуры в драйвере — ровно тем, чего на Intel хочется избежать.
+ */
+class TrackMarkMap {
+    constructor(cols, rows, length) {
+        this.cols = cols;
+        this.rows = rows;
+        this.length = length > 1 ? length : 1;
+        this.data = new Uint8Array(cols * rows);
+
+        this.texture = new THREE.DataTexture(this.data, cols, rows, THREE.RedFormat, THREE.UnsignedByteType);
+        this.texture.name = 'trackMarks';
+        this.texture.wrapS = THREE.ClampToEdgeWrapping;
+        // вдоль круга карта замкнута: последний метр соседствует с первым
+        this.texture.wrapT = THREE.RepeatWrapping;
+        this.texture.minFilter = THREE.LinearFilter;
+        this.texture.magFilter = THREE.LinearFilter;
+        this.texture.generateMipmaps = false;
+        this.texture.unpackAlignment = 1;
+        this.texture.needsUpdate = true;
+
+        this.src = new THREE.DataTexture(this.data, cols, rows, THREE.RedFormat, THREE.UnsignedByteType);
+        this.src.unpackAlignment = 1;
+        this.src.generateMipmaps = false;
+
+        // память кистей: прошлая точка каждого колеса, чтобы след был линией,
+        // а не пунктиром из отдельных отпечатков
+        this.brushRow = new Int32Array(MARK_BRUSHES).fill(-1);
+        this.brushCol = new Int32Array(MARK_BRUSHES);
+
+        // грязные прямоугольники кадра: (row0, row1) — столбцы всегда все
+        this.rectN = 0;
+        this.rectA = new Int32Array(MARK_MAX_RECTS + 2);
+        this.rectB = new Int32Array(MARK_MAX_RECTS + 2);
+
+        this.fadeRow = 0;
+        this.fadeLut = new Uint8Array(256);
+        this.fadeK = -1;
+        this._rebuildFadeLut(1);
+
+        this._box = new THREE.Box2(new THREE.Vector2(), new THREE.Vector2());
+        this._dst = new THREE.Vector3();
+        this.uploads = 0;
+    }
+
+    /**
+     * Таблица выцветания на 256 значений: в кадре это выборка по индексу,
+     * а не Math.pow на каждый тексель. k — множитель за ОДИН заход полосы
+     * на данную строку.
+     */
+    _rebuildFadeLut(k) {
+        if (Math.abs(k - this.fadeK) < 1e-5) return;   // кадр в кадр дважды не считаем
+        this.fadeK = k;
+        const lut = this.fadeLut;
+        for (let i = 1; i < 256; i++) {
+            const v = i * k;
+            // хвост дотягиваем линейно, иначе умножение навсегда застревает
+            // на единицах и карта никогда не очищается до нуля
+            lut[i] = v > i - 1 ? i - 1 : v | 0;
+        }
+        lut[0] = 0;
+    }
+
+    /** Строка карты по пути вдоль круга (заворачивается). */
+    rowAt(s) {
+        let t = s / this.length;
+        t -= Math.floor(t);
+        let r = (t * this.rows) | 0;
+        if (r < 0) r = 0;
+        else if (r >= this.rows) r = this.rows - 1;
+        return r;
+    }
+
+    /** Столбец карты по смещению поперёк и полуширине полотна. */
+    colAt(lateral, halfWidth) {
+        const hw = halfWidth > 0.1 ? halfWidth : 0.1;
+        const u = 0.5 + (0.5 * lateral) / (hw * MARK_EXTENT);
+        let c = (u * this.cols) | 0;
+        if (c < MARK_EDGE) c = -1;
+        else if (c >= this.cols - MARK_EDGE) c = -1;
+        return c;
+    }
+
+    _mark(row, col, radius, strength) {
+        const cols = this.cols;
+        const rows = this.rows;
+        const data = this.data;
+        const r = radius < 1 ? 1 : radius | 0;
+        const inv = 1 / (r + 0.5);
+        for (let dy = -r; dy <= r; dy++) {
+            let y = row + dy;
+            y -= Math.floor(y / rows) * rows;
+            const base = y * cols;
+            for (let dx = -r; dx <= r; dx++) {
+                const x = col + dx;
+                if (x < MARK_EDGE || x >= cols - MARK_EDGE) continue;
+                const d = Math.sqrt(dx * dx + dy * dy) * inv;
+                if (d >= 1) continue;
+                const w = (1 - d) * (1 - d) * strength * 255;
+                const at = base + x;
+                let v = data[at] + w;
+                if (v > MARK_CAP) v = MARK_CAP;
+                data[at] = v;
+            }
+        }
+        this._dirty(row - r, row + r);
+    }
+
+    /**
+     * Мазок кистью brush: соединяется с прошлой точкой той же кисти, поэтому
+     * на скорости след остаётся сплошной линией, а не цепочкой пятен.
+     */
+    stroke(brush, s, lateral, halfWidth, strength, radius) {
+        const col = this.colAt(lateral, halfWidth);
+        if (col < 0) {
+            this.brushRow[brush] = -1;
+            return;
+        }
+        const row = this.rowAt(s);
+        const prevRow = this.brushRow[brush];
+        if (prevRow >= 0) {
+            let dr = row - prevRow;
+            // короткий путь по кольцу
+            if (dr > this.rows * 0.5) dr -= this.rows;
+            else if (dr < -this.rows * 0.5) dr += this.rows;
+            const dc = col - this.brushCol[brush];
+            let steps = Math.max(Math.abs(dr), Math.abs(dc));
+            if (steps > 16) steps = 16;   // телепорт (респаун) линией не тянем
+            for (let k = 1; k < steps; k++) {
+                const t = k / steps;
+                this._mark(prevRow + Math.round(dr * t), this.brushCol[brush] + Math.round(dc * t),
+                    radius, strength);
+            }
+        }
+        this._mark(row, col, radius, strength);
+        this.brushRow[brush] = row;
+        this.brushCol[brush] = col;
+    }
+
+    /** Разорвать линию кисти: машина перестала скользить. */
+    release(brush) {
+        this.brushRow[brush] = -1;
+    }
+
+    /** Круглое пятно: копоть от взрыва, резина на решётке. */
+    blob(s, lateral, halfWidth, strength, radiusM) {
+        const col = this.colAt(lateral, halfWidth);
+        if (col < 0) return;
+        const rr = Math.max(1, Math.round(radiusM / (this.length / this.rows)));
+        this._mark(this.rowAt(s), col, rr, strength);
+    }
+
+    /**
+     * Пометить строки к догрузке. Отпечаток у самого шва круга заворачивается
+     * (_mark пишет по модулю), а прямоугольник — нет: завернувшийся хвост
+     * приедет в видеопамять со следующим заходом полосы выцветания, то есть
+     * меньше чем через секунду. Это дешевле, чем второй прямоугольник.
+     */
+    _dirty(a, b) {
+        let lo = a < 0 ? 0 : a;
+        const hi = b >= this.rows ? this.rows - 1 : b;
+        if (hi < lo) return;
+        // слить с уже накопленными, если пересекаются или примыкают
+        for (let i = 0; i < this.rectN; i++) {
+            if (lo <= this.rectB[i] + 1 && hi >= this.rectA[i] - 1) {
+                if (lo < this.rectA[i]) this.rectA[i] = lo;
+                if (hi > this.rectB[i]) this.rectB[i] = hi;
+                return;
+            }
+        }
+        if (this.rectN < MARK_MAX_RECTS) {
+            this.rectA[this.rectN] = lo;
+            this.rectB[this.rectN] = hi;
+            this.rectN++;
+            return;
+        }
+        // мест нет: склеиваем с ближайшим — лишние строки дешевле лишнего вызова
+        let best = 0;
+        let bestGap = 0x7fffffff;
+        for (let i = 0; i < this.rectN; i++) {
+            const gap = lo > this.rectB[i] ? lo - this.rectB[i] : this.rectA[i] - hi;
+            if (gap < bestGap) {
+                bestGap = gap;
+                best = i;
+            }
+        }
+        if (lo < this.rectA[best]) this.rectA[best] = lo;
+        if (hi > this.rectB[best]) this.rectB[best] = hi;
+    }
+
+    /**
+     * Выцветание. Карта конечная, а гонка длинная: без этого за сессию всё
+     * полотно почернеет. Проходим её полосами, MARK_SLICE строк за кадр, —
+     * полный круг занимает пару секунд, а стоит несколько тысяч байт.
+     */
+    fade(dt) {
+        if (dt <= 0) return;
+        const rows = this.rows;
+        // строку навещают раз в rows / MARK_SLICE кадров, то есть раз
+        // в dt * rows / MARK_SLICE секунд — из этого и считается множитель
+        const visit = (dt * rows) / MARK_SLICE;
+        this._rebuildFadeLut(Math.pow(0.5, visit / MARK_HALFLIFE));
+        const cols = this.cols;
+        const data = this.data;
+        const lut = this.fadeLut;
+        const row0 = this.fadeRow;
+        let row1 = row0 + MARK_SLICE;
+        if (row1 > rows) row1 = rows;
+        const from = row0 * cols;
+        const to = row1 * cols;
+        let any = false;
+        for (let i = from; i < to; i++) {
+            const v = data[i];
+            if (v === 0) continue;
+            data[i] = lut[v];
+            any = true;
+        }
+        if (any) this._dirty(row0, row1 - 1);
+        this.fadeRow = row1 >= rows ? 0 : row1;
+    }
+
+    /**
+     * Догрузить накопленные прямоугольники в видеопамять.
+     * copyTextureToTexture с источником-DataTexture, которого нет в отрисовке,
+     * уходит в texSubImage2D: заливается ровно прямоугольник.
+     */
+    upload(renderer) {
+        if (!this.rectN) return;
+        const box = this._box;
+        const dst = this._dst;
+        for (let i = 0; i < this.rectN; i++) {
+            const a = this.rectA[i];
+            const b = this.rectB[i];
+            box.min.set(0, a);
+            box.max.set(this.cols, b + 1);
+            dst.set(0, a, 0);
+            renderer.copyTextureToTexture(this.src, this.texture, box, dst);
+            this.uploads++;
+        }
+        this.rectN = 0;
+    }
+
+    /** Стереть всё (новая гонка на той же карте). */
+    clear() {
+        this.data.fill(0);
+        this.brushRow.fill(-1);
+        this.texture.needsUpdate = true;
+        this.rectN = 0;
+    }
+
+    dispose() {
+        this.texture.dispose();
+        this.src.dispose();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Шейдер полотна: карта следов и мокрый блик
+// ---------------------------------------------------------------------------
+//
+// Обе добавки живут в ОДНОЙ вставке и в одной шейдерной программе: полотно
+// и разметка делят её (программа у three ключуется параметрами материала,
+// а polygonOffset в шейдер не входит). Это +1 программа на сцену, а не +2.
+//
+// Подводные камни, из-за которых код выглядит именно так:
+//  - `attribute vec2 uv` объявлять НЕЛЬЗЯ: three объявляет его в префиксе
+//    всегда, повторное объявление роняет линковку, и видно это только
+//    в консоли;
+//  - `#include <color_vertex>` идёт ДО `<begin_vertex>`, поэтому вставка,
+//    которой нужен `transformed`, вешается на `<fog_vertex>` — он последний;
+//  - onBeforeCompile получает исходник ДО раскрытия #include, подменять надо
+//    сам include;
+//  - без customProgramCacheKey three переиспользовал бы программу обычного
+//    материала и вставка просто не попала бы в сцену.
+
+function surfaceShader(material, opts) {
+    const marks = !!opts.marks;
+    const wet = !!opts.wet;
+    if (!marks && !wet) return;
+
+    const decl = [];
+    const vert = ['#include <fog_vertex>', 'vTrackUV = uv;'];
+    const frag = [];
+    decl.push('varying vec2 vTrackUV;');
+    if (wet) {
+        decl.push('varying vec3 vTrackPos;');
+        vert.push('vTrackPos = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;');
+    }
+
+    // Порядок важен: резина гасит и блик тоже. Если сначала затемнить
+    // полотно следом, а потом прибавить отражение неба, след смоется этим
+    // отражением — на мокрой дороге он пропадал почти целиком (проверено
+    // на скриншоте). Поэтому след умножает ИТОГ, включая блик.
+    if (marks) {
+        frag.push('float trackMark = 1.0 - uMarkDepth * texture2D( uMarkMap, vTrackUV ).r;');
+    }
+    if (wet) {
+        frag.push(
+            // нормаль полотна — вверх: поперёк дороги сечение строго
+            // горизонтальное, продольный уклон даёт единицы процентов,
+            // и ради них не стоит ни атрибута нормалей, ни производных
+            'vec3 wetV = normalize( cameraPosition - vTrackPos );',
+            'float wetLat = abs( vTrackUV.x - 0.5 ) * ' + (2 * MARK_EXTENT).toFixed(3) + ';',
+            'float wetMask = 1.0 - smoothstep( 0.90, 1.04, wetLat );',
+            'float wetFr = 0.04 + 0.96 * pow( 1.0 - clamp( wetV.y, 0.0, 1.0 ), 5.0 );',
+            'vec3 wetRefl = reflect( -wetV, vec3( 0.0, 1.0, 0.0 ) );',
+            'float wetSun = pow( max( dot( wetRefl, uWetSunDir ), 0.0 ), 68.0 );',
+            'outgoingLight += ( uWetSky * wetFr * uWetGloss',
+            '    + uWetSunColor * wetSun * uWetGloss * 1.6 ) * wetMask;'
+        );
+    }
+    if (marks) frag.push('outgoingLight *= trackMark;');
+
+    const uniforms = opts.uniforms;
+    material.onBeforeCompile = function (shader) {
+        for (const key in uniforms) shader.uniforms[key] = uniforms[key];
+        const head = [];
+        if (marks) head.push('uniform sampler2D uMarkMap;', 'uniform float uMarkDepth;');
+        if (wet) head.push('uniform vec3 uWetSky;', 'uniform vec3 uWetSunColor;',
+            'uniform vec3 uWetSunDir;', 'uniform float uWetGloss;');
+        shader.vertexShader = decl.join('\n') + '\n' + shader.vertexShader
+            .replace('#include <fog_vertex>', vert.join('\n'));
+        shader.fragmentShader = head.join('\n') + '\n' + decl.join('\n') + '\n'
+            + shader.fragmentShader.replace('#include <opaque_fragment>',
+                frag.join('\n') + '\n#include <opaque_fragment>');
+    };
+    material.customProgramCacheKey = function () {
+        return 'trackSurface:' + (marks ? 'm' : '') + (wet ? 'w' : '');
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Нарезка полотна и рельефа на сегменты вдоль дуги
@@ -439,45 +864,103 @@ export function readTrack(track) {
  * @param {object} track   данные формата 12.1
  * @param {string} theme   city | mountain | industrial (по умолчанию из track)
  * @param {string} quality low | medium | high
- * @param {object} [opts]  { ao, timeOfDay } — необязательные параметры,
- *                         добавленные после контракта:
- *                         ao — запекать ли затенение в вершинные цвета,
- *                         timeOfDay — day | dusk | night (приходит из
- *                         настроек комнаты, см. шапку scenery.js).
+ * @param {object} [opts]  необязательные параметры, добавленные после контракта:
+ *   ao         запекать ли затенение в вершинные цвета;
+ *   timeOfDay  day | dusk | night (приходит из настроек комнаты);
+ *   weather    clear | wet (тот же канал окружения, см. scenery.js);
+ *   wet        включён ли ВИЗУАЛ мокрого асфальта (отдельная галочка);
+ *   marks      строить ли карту следов шин (отдельная галочка);
+ *   light      {ambient, directional} из buildScenery — если задан, свет
+ *              запекается в вершины, материалы становятся MeshBasicMaterial,
+ *              а атрибут normal выбрасывается;
+ *   sky        THREE.Color неба у горизонта — для френелевского подмеса.
  */
 export function buildTrackMeshes(track, theme, quality, opts) {
     const T = readTrack(track);
     const P = QUALITY[quality] || QUALITY.medium;
-    const ao = !opts || opts.ao !== false;
-    const todName = opts && TOD_SURFACE[opts.timeOfDay] ? opts.timeOfDay : 'day';
+    const o = opts || {};
+    const ao = o.ao !== false;
+    const todName = TOD_SURFACE[o.timeOfDay] ? o.timeOfDay : 'day';
     const tod = TOD_SURFACE[todName];
+    const weatherName = WEATHER_SURFACE[o.weather] ? o.weather : 'clear';
+    // галочка выключает ВЕСЬ визуал мокрого, включая запечённое затемнение:
+    // при `clear` или снятой галочке картинка обязана совпадать с прежней
+    const wetOn = weatherName !== 'clear' && o.wet !== false;
+    const wx = wetOn ? WEATHER_SURFACE[weatherName] : WEATHER_SURFACE.clear;
     const themeName = theme || T.theme || 'city';
     const pal = THEMES[themeName] || THEMES.city;
+    const light = o.light || null;
 
     const group = new THREE.Group();
     group.name = 'track';
 
-    // общий материал статики: один объект — меньше переключений состояния
-    const surfaceMat = new THREE.MeshLambertMaterial({
-        vertexColors: true,
-        flatShading: true
-    });
-    surfaceMat.name = 'trackSurface';
+    // Карта следов шин. Вдоль круга — по высоте, поперёк ленты — по ширине
+    // (см. TrackMarkMap). Строится только по галочке: без неё нет ни текстуры,
+    // ни атрибута uv, ни своей шейдерной программы.
+    const marks = o.marks
+        ? new TrackMarkMap(MARK_COLS[quality] || MARK_COLS.medium, markRows(T.length), T.length)
+        : null;
 
-    // разметка: тот же материал плюс полигональное смещение к камере
-    const markMat = new THREE.MeshLambertMaterial({
+    // Запечённый свет убирает из шейдера полотна всё освещение: Ламберт
+    // становится Basic, атрибут нормалей исчезает (минус треть памяти
+    // геометрии и минус 12 байт выборки на вершину в каждом кадре).
+    const MatClass = light ? THREE.MeshBasicMaterial : THREE.MeshLambertMaterial;
+    // flatShading у MeshBasicMaterial нет и быть не может: это свойство про
+    // нормали, а нормалей после запекания нет вовсе. Даже сам КЛЮЧ туда
+    // передавать нельзя — three ругается в консоль на неизвестное свойство.
+    const surfaceParams = { vertexColors: true };
+    const markParams = {
         vertexColors: true,
-        flatShading: true,
         polygonOffset: true,
         polygonOffsetFactor: -2,
         polygonOffsetUnits: -4
-    });
+    };
+    if (!light) {
+        surfaceParams.flatShading = true;
+        markParams.flatShading = true;
+    }
+
+    // общий материал статики: один объект — меньше переключений состояния
+    const surfaceMat = new MatClass(surfaceParams);
+    surfaceMat.name = 'trackSurface';
+
+    // разметка: тот же материал плюс полигональное смещение к камере
+    const markMat = new MatClass(markParams);
     markMat.name = 'trackMarkings';
-    if (tod.lineEmissive) {
-        // световозвращающая краска: ночью линии видно и без прямого света
-        markMat.emissive = toColor(tod.lineEmissive);
+    // световозвращающая краска: ночью линии видно и без прямого света.
+    // При запечённом свете эмиссив складывается прямо в вершинный цвет —
+    // у MeshBasicMaterial его просто некуда положить, и разметка бы погасла.
+    const lineEmissive = tod.lineEmissive ? toColor(tod.lineEmissive) : null;
+    if (lineEmissive && !light) {
+        markMat.emissive = lineEmissive;
         markMat.emissiveIntensity = 1.0;
     }
+
+    // Уникформы вставки в шейдер полотна. Объекты общие для обоих материалов:
+    // и текстура следов, и параметры блика живут в одном экземпляре.
+    const shaderUniforms = {};
+    if (marks) {
+        shaderUniforms.uMarkMap = { value: marks.texture };
+        shaderUniforms.uMarkDepth = { value: 0.62 };
+    }
+    if (wetOn) {
+        const sky = o.sky ? toColor(o.sky) : toColor('#8fa6c0');
+        const sunCol = light ? light.directional.color : toColor('#fff4e2');
+        const sunDir = light ? light.directional.direction : [0.45, 0.82, 0.35];
+        const dl = Math.sqrt(sunDir[0] * sunDir[0] + sunDir[1] * sunDir[1] + sunDir[2] * sunDir[2]) || 1;
+        shaderUniforms.uWetSky = { value: new THREE.Vector3(sky.r, sky.g, sky.b) };
+        shaderUniforms.uWetSunColor = {
+            value: new THREE.Vector3(sunCol.r, sunCol.g, sunCol.b)
+                .multiplyScalar(light ? light.directional.intensity : 1)
+        };
+        shaderUniforms.uWetSunDir = {
+            value: new THREE.Vector3(sunDir[0] / dl, sunDir[1] / dl, sunDir[2] / dl)
+        };
+        shaderUniforms.uWetGloss = { value: 0.30 * wx.gloss };
+    }
+    const shaderOpts = { marks: !!marks, wet: wetOn, uniforms: shaderUniforms };
+    surfaceShader(surfaceMat, shaderOpts);
+    surfaceShader(markMat, shaderOpts);
 
     const colors = {
         asphalt: toColor(pal.asphalt),
@@ -517,14 +1000,24 @@ export function buildTrackMeshes(track, theme, quality, opts) {
     const groundY = minY - pal.terrainDrop - 2.0;
 
     const plan = planSegments(T);
+    const uvOn = !!marks || wetOn;   // параметризация ленты нужна обеим темам
     // Полотно, бордюры и лента рельефа делят ОДИН материал, поэтому и меш у
     // них один: иначе нарезка на сегменты утроила бы число вызовов там, где
     // раньше был один. Разметке нужен свой материал (polygonOffset), она
     // остаётся отдельным сегментным мешем.
-    const surface = buildSurface(T, P, colors, pal, groundY, surfaceMat, ao, plan);
-    const markings = buildMarkings(T, P, colors, markMat, ao, plan);
-    const ground = buildGround(T, colors, groundY, surfaceMat);
-    const arch = buildStartArch(T, P, colors, surfaceMat, ao);
+    const surface = buildSurface(T, P, colors, pal, groundY, surfaceMat, ao, plan, uvOn, wx);
+    const markings = buildMarkings(T, P, colors, markMat, ao, plan, uvOn);
+    const ground = buildGround(T, colors, groundY, surfaceMat, uvOn);
+    const arch = buildStartArch(T, P, colors, surfaceMat, ao, uvOn);
+
+    if (light) {
+        // Порядок важен: затенение уже лежит в цветах, свет домножается сверху,
+        // и только после этого нормали становятся не нужны.
+        bakeVertexLight(surface.mesh.geometry, light);
+        bakeVertexLight(markings.mesh.geometry, light, { emissive: lineEmissive });
+        bakeVertexLight(ground.geometry, light);
+        bakeVertexLight(arch.geometry, light);
+    }
 
     // Сегментные поверхности: отсекаются посегментно каждый кадр.
     const segmented = [surface, markings];
@@ -543,6 +1036,11 @@ export function buildTrackMeshes(track, theme, quality, opts) {
         materials: { surface: surfaceMat, markings: markMat },
         bounds: { minY: minY, maxY: maxY, groundY: groundY },
         timeOfDay: todName,
+        weather: weatherName,
+        wet: wetOn,
+        baked: !!light,
+        /** Карта следов (или null). Штампует в неё renderer.js. */
+        marks: marks,
 
         /**
          * Отсечение сегментов по пирамиде видимости. Зовётся раз в кадр из
@@ -564,6 +1062,9 @@ export function buildTrackMeshes(track, theme, quality, opts) {
         },
         dispose: function () {
             disposeObject(group);
+            // 12.11: текстуры обязаны возвращаться в ноль, а карту следов
+            // disposeObject не видит — она живёт в uniform, а не в material.map
+            if (marks) marks.dispose();
         }
     };
     return api;
@@ -580,11 +1081,12 @@ export function buildTrackMeshes(track, theme, quality, opts) {
  * сегмент — один непрерывный диапазон вершин, в котором лежит и асфальт, и
  * бордюры, и трава этого куска трассы.
  */
-function buildSurface(T, P, colors, pal, groundY, material, ao, plan) {
+function buildSurface(T, P, colors, pal, groundY, material, ao, plan, uvOn, wx) {
     const b = new MeshBuilder();
-    const road = roadWriter(T, P, colors, ao);
-    const kerbs = kerbWriter(T, P, colors, ao);
-    const terrain = terrainWriter(T, P, colors, pal, groundY, ao, plan);
+    if (uvOn) b.enableUV();
+    const road = roadWriter(T, P, colors, ao, uvOn, wx);
+    const kerbs = kerbWriter(T, P, colors, ao, uvOn, wx);
+    const terrain = terrainWriter(T, P, colors, pal, groundY, ao, plan, uvOn, wx);
 
     const starts = new Int32Array(plan.count);
     const counts = new Int32Array(plan.count);
@@ -606,7 +1108,7 @@ function buildSurface(T, P, colors, pal, groundY, material, ao, plan) {
 // ---------------------------------------------------------------------------
 
 /** Замыкание, пишущее ряды полотна [i0, i1] в переданный построитель. */
-function roadWriter(T, P, colors, ao) {
+function roadWriter(T, P, colors, ao, uvOn, wx) {
     const rng = new Rng(T.seed ^ 0x51ed2701);
     const cols = P.roadCols + 1;
     // заранее посчитанный шум на УЗЕЛ сетки: цвет полотна не должен «мигать»
@@ -637,7 +1139,24 @@ function roadWriter(T, P, colors, ao) {
             // запечённый контакт с бордюром и обочиной
             k *= roadEdgeAO(T.hw[i] * (1 - edge));
         }
-        shade(c, patch, k);
+        // мокрое полотно темнее и холоднее: диффузного рассеяния меньше,
+        // остальное уходит в зеркальный блик (его считает шейдер)
+        k *= wx.roadK;
+        const t = wx.roadTint;
+        c.setRGB(
+            Math.min(1, patch.r * k * t[0]),
+            Math.min(1, patch.g * k * t[1]),
+            Math.min(1, patch.b * k * t[2])
+        );
+    }
+
+    // Параметризация ленты: v — путь по кругу, u — смещение поперёк.
+    // v берётся из НЕЗАВЁРНУТОГО индекса, иначе замыкающий ряд последнего
+    // сегмента получил бы v = 0 и вся карта размазалась бы по одному квaду.
+    function uv(ii, j, out) {
+        const lateral = (-1 + (2 * j) / P.roadCols) * T.hw[(base + ii) % T.count];
+        out[0] = 0.5 + (0.5 * lateral) / (T.hw[(base + ii) % T.count] * MARK_EXTENT);
+        out[1] = (base + ii) / T.count;
     }
 
     return function (b, i0, i1) {
@@ -647,7 +1166,8 @@ function roadWriter(T, P, colors, ao) {
             cols: cols,
             closed: false,
             point: point,
-            vertexColor: vertexColor
+            vertexColor: vertexColor,
+            uv: uvOn ? uv : null
         });
     };
 }
@@ -666,7 +1186,7 @@ function segmentSpheres(geom, starts, counts) {
 // ---------------------------------------------------------------------------
 
 /** Замыкание, пишущее бордюры обеих кромок для рядов [i0, i1]. */
-function kerbWriter(T, P, colors, ao) {
+function kerbWriter(T, P, colors, ao, uvOn, wx) {
     const tmp = new THREE.Color();
 
     // профиль в ортах (u — наружу от кромки, v — вверх от полотна)
@@ -694,16 +1214,22 @@ function kerbWriter(T, P, colors, ao) {
         const i = (base + ii) % T.count;
         if (k === 1) {
             // наружная стенка смотрит вниз и в грунт — там темнее всего
-            if (ao) shade(c, colors.kerbSide, 0.52);
-            else c.copy(colors.kerbSide);
+            shade(c, colors.kerbSide, (ao ? 0.52 : 1) * wx.kerbK);
         } else {
             // чередование посегментно: шаг выборки 2 м, полоса = 2 м
             // Цвет на квад, а не на узел: иначе красно-белая шашка
             // расплылась бы в градиент и перестала читаться.
             tmp.copy((i & 1) === 0 ? colors.kerbA : colors.kerbB);
-            if (ao) shade(c, tmp, 0.88);
-            else c.copy(tmp);
+            shade(c, tmp, (ao ? 0.88 : 1) * wx.kerbK);
         }
+    }
+
+    // бордюр лежит сразу за кромкой полотна: u чуть больше единичной отметки
+    function uv(ii, j, out) {
+        const i = (base + ii) % T.count;
+        const lateral = (T.hw[i] + profileOut[j][0]) * sgn;
+        out[0] = 0.5 + (0.5 * lateral) / (T.hw[i] * MARK_EXTENT);
+        out[1] = (base + ii) / T.count;
     }
 
     return function (b, i0, i1) {
@@ -717,7 +1243,8 @@ function kerbWriter(T, P, colors, ao) {
                 flip: sgn < 0,
                 profile: profileOut,
                 frame: frame,
-                color: color
+                color: color,
+                uv: uvOn ? uv : null
             });
         }
     };
@@ -727,8 +1254,9 @@ function kerbWriter(T, P, colors, ao) {
 // Разметка
 // ---------------------------------------------------------------------------
 
-function buildMarkings(T, P, colors, material, ao, plan) {
+function buildMarkings(T, P, colors, material, ao, plan, uvOn) {
     const b = new MeshBuilder();
+    if (uvOn) b.enableUV();
     const lift = MARK_LIFT;
     const lineC = new THREE.Color();
     // кромочная линия лежит внутри тёмной полосы у бордюра: если оставить её
@@ -750,6 +1278,15 @@ function buildMarkings(T, P, colors, material, ao, plan) {
 
     function edgeColor(ii, j, c) {
         c.copy(lineC);
+    }
+
+    // разметка лежит на полотне и обязана пачкаться вместе с ним: та же
+    // параметризация, тот же материал по программе — значит и следы те же
+    function edgeUV(ii, j, out) {
+        const i = (base + ii) % T.count;
+        const lateral = (T.hw[i] - (j === 0 ? 0.55 : 0.18)) * sgn;
+        out[0] = 0.5 + (0.5 * lateral) / (T.hw[i] * MARK_EXTENT);
+        out[1] = (base + ii) / T.count;
     }
 
     // осевая прерывистая: три отрезка через три пропуска (6 м штрих / 6 м пусто)
@@ -775,7 +1312,8 @@ function buildMarkings(T, P, colors, material, ao, plan) {
                     closed: false,
                     flip: sgn < 0,
                     point: edgePoint,
-                    color: edgeColor
+                    color: edgeColor,
+                    uv: uvOn ? edgeUV : null
                 });
             }
         }
@@ -793,6 +1331,7 @@ function buildMarkings(T, P, colors, material, ao, plan) {
                 dz = T.z[i2] + T.nz[i2] * -half;
             const y0 = T.y[i] + lift,
                 y1 = T.y[i2] + lift;
+            if (uvOn) b.setUV(0.5, i / T.count);
             b.quadRaw(
                 ax, y0, az,
                 dx, y1, dz,
@@ -803,7 +1342,10 @@ function buildMarkings(T, P, colors, material, ao, plan) {
         }
 
         // стартовая клетка живёт в выборке 0, то есть в самом первом сегменте
-        if (k === 0) buildStartLine(b, T, colors, lift);
+        if (k === 0) {
+            if (uvOn) b.setUV(0.5, 0);
+            buildStartLine(b, T, colors, lift);
+        }
 
         counts[k] = b.vertexCount - starts[k];
     }
@@ -934,7 +1476,7 @@ export function createTerrainSampler(track, theme, quality) {
 }
 
 /** Замыкание, пишущее ленту рельефа сегмента k (обе стороны). */
-function terrainWriter(T, P, colors, pal, groundY, ao, plan) {
+function terrainWriter(T, P, colors, pal, groundY, ao, plan, uvOn, wx) {
     const tp = terrainParams(T, P, pal, groundY);
     const rings = P.terrainRings;
     // Прореживание по длине круга снято: лента отсекается посегментно,
@@ -989,6 +1531,8 @@ function terrainWriter(T, P, colors, pal, groundY, ao, plan) {
             const drop = T.y[i] - ringHeight(T, tp, i, j, side);
             if (drop > 0) k *= 1 - AO_DITCH * smooth01(drop / 6);
         }
+        // мокрая трава темнеет слабее асфальта и не блестит вовсе
+        k *= wx.grassK;
         if (j === 0) {
             shade(c, colors.shoulder, k);
             return;
@@ -996,6 +1540,18 @@ function terrainWriter(T, P, colors, pal, groundY, ao, plan) {
         const t = j / (rings - 1);
         mixColor(patch, colors.groundNear, colors.groundFar, t);
         shade(c, patch, k);
+    }
+
+    // Ближняя обочина попадает в ту же карту следов, что и полотно, — это
+    // и есть «следы на траве» из исследования: та же текстура, та же выборка,
+    // ноль дополнительной цены. Дальние кольца уходят за охват карты, их u
+    // зажимается в пустую кайму.
+    function uv(ii, j, out) {
+        const row = (base + ii) % rowsAll;
+        const i = (row * stride) % T.count;
+        const lateral = (T.hw[i] + tp.offs[j]) * sgn;
+        out[0] = 0.5 + (0.5 * lateral) / (T.hw[i] * MARK_EXTENT);
+        out[1] = ((base + ii) * stride) / T.count;
     }
 
     return function (b, k) {
@@ -1008,7 +1564,8 @@ function terrainWriter(T, P, colors, pal, groundY, ao, plan) {
                 closed: false,
                 flip: sgn < 0,
                 point: point,
-                vertexColor: vertexColor
+                vertexColor: vertexColor,
+                uv: uvOn ? uv : null
             });
         }
     };
@@ -1018,7 +1575,7 @@ function terrainWriter(T, P, colors, pal, groundY, ao, plan) {
 // Общий грунт до горизонта
 // ---------------------------------------------------------------------------
 
-function buildGround(T, colors, groundY, material) {
+function buildGround(T, colors, groundY, material, uvOn) {
     let cx = 0,
         cz = 0,
         r = 0;
@@ -1037,6 +1594,9 @@ function buildGround(T, colors, groundY, material) {
     const half = r + 900;
 
     const b = new MeshBuilder();
+    // uv (0, 0) — крайний столбец карты следов, он всегда пустой, и маска
+    // мокрого блика там тоже ноль: грунт и арка остаются как были
+    if (uvOn) b.enableUV();
     const c = colors.groundFar;
     b.quadRaw(
         cx - half, groundY, cz - half,
@@ -1057,7 +1617,7 @@ function buildGround(T, colors, groundY, material) {
 // Стартовая арка
 // ---------------------------------------------------------------------------
 
-function buildStartArch(T, P, colors, material, ao) {
+function buildStartArch(T, P, colors, material, ao, uvOn) {
     const i0 = 0;
     const hw = T.hw[i0];
     const px = T.x[i0],
@@ -1069,6 +1629,7 @@ function buildStartArch(T, P, colors, material, ao) {
         tz = T.tz[i0];
 
     const b = new MeshBuilder();
+    if (uvOn) b.enableUV();
     const pillarW = 0.55;
     const archH = 7.2;
     const span = hw + 1.6;

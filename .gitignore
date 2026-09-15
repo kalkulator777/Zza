@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 *.svg.tmp
 .DS_Store
+racing/records.json
+racing/records.json.corrupt

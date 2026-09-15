@@ -404,8 +404,21 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .gfx[open] > .gfx-summary::before { transform: rotate(90deg); }
 .gfx-summary:hover { color: var(--text); }
 
-.gfx-body { padding: 4px 12px 13px; }
-.gfx-body .field + .field { margin-top: 11px; }
+/* Настроек графики пятнадцать: раскрытый список сам по себе выше окна,
+   поэтому он прокручивается внутри себя, а не растягивает левый столбец. */
+.gfx-body {
+    padding: 4px 12px 13px;
+    max-height: 46vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--panel-3) transparent;
+}
+
+.gfx-body::-webkit-scrollbar { width: 10px; }
+.gfx-body::-webkit-scrollbar-track { background: transparent; }
+.gfx-body::-webkit-scrollbar-thumb { background: var(--panel-3); border-radius: 6px; border: 2px solid var(--panel-2); }
+
+.gfx-body .field + .field { margin-top: 9px; }
 
 .gfx-hint {
     font-size: 11px;
@@ -544,7 +557,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 .room-row {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 166px 84px 92px 104px 100px;
+    grid-template-columns: minmax(0, 1fr) 166px 108px 92px 104px 100px;
     align-items: center;
     gap: 10px;
     padding: 12px 14px;
@@ -566,7 +579,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 .theme-mountain   { background: var(--green); }
 .theme-industrial { background: var(--orange); }
 
-.room-laps { font-size: 14px; font-weight: 800; color: var(--text-dim); }
+.room-laps { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; font-size: 14px; font-weight: 800; color: var(--text-dim); }
 
 .room-players { display: flex; align-items: center; gap: 8px; font-size: 16px; font-weight: 900; }
 
@@ -791,8 +804,9 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Список игроков */
 
-.players-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
-.players-list { padding: 10px; display: flex; flex-direction: column; gap: 7px; min-height: 0; }
+.players-panel { flex: 1 1 0; min-height: 132px; display: flex; flex-direction: column; }
+.players-list { padding: 10px; display: flex; flex-direction: column; gap: 7px;
+                 min-height: 0; overflow-y: auto; }
 
 .player-row {
     display: grid;
@@ -944,7 +958,12 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Настройки комнаты (справа) */
 
-.settings-view { padding: 10px 12px; display: flex; flex-direction: column; gap: 9px; }
+/* Настроек в лобби стало больше (режим комнаты, число этапов, гандикап,
+   повтор финиша), и на 720p панель выдавливала чат за нижний край столбца.
+   Теперь прокручивается она, а чат держит свою высоту и виден всегда. */
+.settings-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+.settings-view { padding: 10px 12px; display: flex; flex-direction: column; gap: 9px;
+                 overflow-y: auto; min-height: 0; }
 
 .set-row {
     display: flex;
@@ -1010,7 +1029,7 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 
 /* Чат */
 
-.chat-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+.chat-panel { flex: 0 0 auto; height: 232px; min-height: 140px; display: flex; flex-direction: column; }
 .chat-log { flex: 1 1 auto; min-height: 0; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
 
 .chat-line { font-size: 13px; line-height: 1.35; word-break: break-word; }
@@ -1545,4 +1564,281 @@ h1, h2, h3 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 @media (max-width: 1150px) {
     .lobby-root { grid-template-columns: 292px 1fr 292px; gap: 12px; padding: 16px; }
     .menu-root { grid-template-columns: 312px 1fr; padding: 18px; }
+}
+
+/* ==========================================================================
+   ЧЕМПИОНАТ, РЕКОРДЫ, ГАНДИКАП И ПОВТОР ФИНИША
+   ========================================================================== */
+
+/* --- чемпионат: календарь этапов (лобби и итоги) ------------------------- */
+
+.champ-calendar { display: flex; flex-wrap: wrap; gap: 7px; }
+
+.champ-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 9px 3px 3px;
+    background: var(--panel-2);
+    border: 2px solid var(--ink);
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 800;
+    color: var(--text-dim);
+}
+
+.champ-chip .n {
+    display: grid;
+    place-items: center;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: var(--panel-3);
+    border: 2px solid var(--ink);
+    color: var(--text);
+    font-size: 11px;
+    font-weight: 900;
+}
+
+.champ-chip.done { opacity: .55; }
+.champ-chip.done .n { background: var(--green); color: var(--ink); }
+.champ-chip.current { background: var(--panel-3); color: var(--text); border-color: var(--accent); }
+.champ-chip.current .n { background: var(--accent); color: var(--ink); }
+
+/* --- чемпионат в лобби --------------------------------------------------- */
+
+/* Панель живёт в столбце игроков: зачёт — это тот же список людей, а справа
+   её было некуда поставить, не выдавив настройки и чат за край. */
+.champ-panel { flex: 0 0 auto; max-height: 66%; min-height: 0;
+               display: flex; flex-direction: column; }
+.champ-lobby { padding: 9px 12px; display: flex; flex-direction: column; gap: 8px;
+               overflow-y: auto; min-height: 0; }
+
+.champ-break {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 5px 10px;
+    background: var(--panel-2);
+    border: var(--bw) solid var(--ink);
+    border-radius: var(--r-md);
+    font-size: 12px;
+    font-weight: 800;
+    color: var(--text-dim);
+}
+
+.champ-break .n {
+    display: grid;
+    place-items: center;
+    min-width: 38px; height: 30px;
+    padding: 0 7px;
+    border-radius: 10px;
+    background: var(--accent);
+    color: var(--ink);
+    border: 2px solid var(--ink);
+    font-size: 18px;
+    font-weight: 900;
+    font-variant-numeric: tabular-nums;
+}
+
+.champ-lobby-rows { display: flex; flex-direction: column; gap: 5px; }
+
+.champ-lobby-row {
+    display: grid;
+    grid-template-columns: 26px minmax(0, 1fr) auto 44px;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 9px;
+    background: var(--panel-2);
+    border: 2px solid var(--ink);
+    border-radius: var(--r-sm);
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.champ-lobby-row.is-me { background: var(--panel-3); border-color: var(--accent); }
+.champ-lobby-row.offline { opacity: .55; }
+.clr-pos { color: var(--text-mute); font-weight: 900; font-variant-numeric: tabular-nums; }
+.clr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clr-note { font-size: 11px; color: var(--text-mute); font-weight: 700; }
+.clr-points { text-align: right; font-size: 15px; font-weight: 900; color: var(--accent); }
+
+/* --- чемпионат на экране итогов ------------------------------------------ */
+
+.champ-block { border-top: var(--bw) solid var(--ink); padding: 11px 14px; }
+
+.champ-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 9px;
+}
+
+.champ-h {
+    font-size: 11px;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+    font-weight: 900;
+    color: var(--text-mute);
+}
+
+.champ-rows { display: flex; flex-direction: column; gap: 5px; max-height: 232px; overflow-y: auto; }
+
+.champ-row {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr) 190px 66px 78px 74px;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 12px;
+    background: var(--panel-2);
+    border: 2px solid var(--ink);
+    border-radius: var(--r-sm);
+    font-weight: 800;
+}
+
+.champ-row.is-head { background: transparent; border: 0; padding: 0 12px; }
+.champ-row.is-me { background: var(--panel-3); border-color: var(--accent); }
+.champ-row.offline { opacity: .6; }
+.champ-row.is-champion { border-color: var(--accent); background: rgba(255, 201, 60, .14); }
+
+.champ-pos {
+    display: grid;
+    place-items: center;
+    width: 34px; height: 30px;
+    border-radius: 10px;
+    background: var(--panel-3);
+    border: 2px solid var(--ink);
+    color: var(--text);
+    font-size: 16px;
+    font-weight: 900;
+}
+
+.champ-pos.m1 { background: var(--accent); color: var(--ink); }
+.champ-pos.m2 { background: #cfd8ef; color: var(--ink); }
+.champ-pos.m3 { background: #d08a4f; color: var(--ink); }
+
+.champ-name { font-size: 15px; font-weight: 900; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.champ-note { font-size: 11px; font-weight: 700; color: var(--text-mute); }
+.champ-stage { text-align: right; font-size: 14px; color: var(--green); font-variant-numeric: tabular-nums; }
+.champ-points { text-align: right; font-size: 19px; font-weight: 900; color: var(--accent); font-variant-numeric: tabular-nums; }
+.champ-delta { text-align: right; font-size: 12px; font-weight: 900; color: var(--text-mute); }
+.champ-delta.up { color: var(--green); }
+.champ-delta.down { color: var(--red); }
+.champ-delta.fresh { color: var(--blue); font-size: 11px; }
+
+/* Чемпион серии: отдельная плашка, только после последнего этапа */
+
+.champ-champion {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    padding: 13px 18px;
+    margin-bottom: 11px;
+    background: linear-gradient(135deg, rgba(255, 201, 60, .22), rgba(255, 201, 60, .05));
+    border: var(--bw) solid var(--ink);
+    border-radius: var(--r-md);
+    box-shadow: 0 5px 0 var(--ink);
+}
+
+.cc-cup { flex: none; display: grid; place-items: center; }
+.cc-label { font-size: 11px; letter-spacing: 1.6px; text-transform: uppercase; font-weight: 900; color: var(--text-dim); }
+.cc-name { font-size: 27px; font-weight: 900; line-height: 1.1; color: var(--accent); }
+.cc-points { font-size: 13px; font-weight: 800; color: var(--text-dim); }
+
+/* --- повтор финиша -------------------------------------------------------- */
+
+/* Пока крутится повтор, панель итогов спрятана и фон не затемняется:
+   на экране должна быть сцена, а не таблица. Плашка уходит вниз: сверху
+   живёт тост, и он бы её перекрыл (проверено на скриншоте). */
+.results-root.is-replay { background: transparent; align-content: end; }
+
+.res-replay {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 9px 16px;
+    background: rgba(16, 20, 33, .84);
+    border: var(--bw) solid var(--ink);
+    border-radius: var(--r-md);
+    box-shadow: 0 4px 0 rgba(8, 10, 18, .8);
+    pointer-events: auto;
+}
+
+.rr-label {
+    font-size: 14px;
+    font-weight: 900;
+    letter-spacing: 1.4px;
+    text-transform: uppercase;
+    color: var(--accent);
+}
+
+/* --- гандикап в HUD ------------------------------------------------------- */
+
+/* Под блоком времён справа: сверху там ничего нет до самой мини-карты,
+   а место рядом с кнопкой паузы занято элементом отсчёта и слотом бонуса. */
+.hud-handicap {
+    position: absolute;
+    top: 128px;
+    right: 18px;
+    padding: 6px 12px;
+    border-radius: 12px;
+    background: rgba(176, 107, 255, .9);
+    border: 3px solid var(--ink);
+    box-shadow: 0 4px 0 rgba(8, 10, 18, .8);
+    font-size: 12px;
+    font-weight: 900;
+    color: var(--ink);
+    pointer-events: none;
+}
+
+/* --- рекорды кругов в меню ------------------------------------------------ */
+
+.records-panel { flex: 1 1 auto; max-height: 46%; display: flex; flex-direction: column; min-height: 0; }
+.records-list { flex: 1 1 auto; min-height: 0; padding: 11px 12px; display: flex; flex-direction: column; gap: 8px; overflow-y: auto; }
+
+.record-row {
+    padding: 8px 12px;
+    background: var(--panel-2);
+    border: var(--bw) solid var(--ink);
+    border-radius: var(--r-md);
+}
+
+.rec-head { display: flex; align-items: center; gap: 9px; }
+.rec-head .theme-chip { flex: none; width: 20px; height: 20px; border-radius: 7px; border: 2px solid var(--ink); }
+.rec-track { font-size: 15px; font-weight: 900; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rec-best { font-size: 18px; font-weight: 900; color: var(--accent); font-variant-numeric: tabular-nums; }
+.rec-who { font-size: 13px; font-weight: 800; color: var(--text); }
+.rec-date { font-size: 11px; font-weight: 700; color: var(--text-mute); }
+
+.rec-cars { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+
+.rec-car {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 3px 9px;
+    background: var(--panel);
+    border: 2px solid var(--ink);
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 800;
+}
+
+.rc-name { color: var(--text-dim); }
+.rc-time { color: var(--text); font-variant-numeric: tabular-nums; }
+.rc-who { color: var(--text-mute); }
+
+/* Метка идущей серии в списке комнат */
+
+.room-champ {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--purple);
+    border: 2px solid var(--ink);
+    color: var(--ink);
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: .6px;
+    text-transform: uppercase;
 }

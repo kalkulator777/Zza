@@ -43,6 +43,11 @@ import {
     timeOfDayIconSvg,
     ROOM_TIMES_OF_DAY,
     ROOM_TOD_LABELS,
+    ROOM_MODES,
+    ROOM_MODE_LABELS,
+    CHAMP_PHASE_LABELS,
+    STAGES_MIN,
+    STAGES_MAX,
     showToast
 } from './menu.js';
 
@@ -158,6 +163,9 @@ export class LobbyScreen {
         this.chatRendered = 0;
         this.chatKey = '';
         this.countdownTimer = 0;
+        this.champ = null;            // поле championship последнего room
+        this.breakTimer = 0;
+        this.breakLeft = 0;
 
         this._build();
         this._buildCountdown();
@@ -173,7 +181,11 @@ export class LobbyScreen {
         this.chatLog.scrollTop = this.chatLog.scrollHeight;
     }
 
-    hide() { this.root.hidden = true; this.visible = false; }
+    hide() {
+        this.root.hidden = true;
+        this.visible = false;
+        this._stopBreakTimer();
+    }
 
     setLocalSlot(slot) {
         this.localSlot = (slot === undefined || slot === null) ? -1 : slot | 0;
@@ -211,6 +223,11 @@ export class LobbyScreen {
             this.myReady = !!me.ready;
         }
 
+        // Чемпионат разбирается ПЕРВЫМ: от него зависят и кнопка готовности,
+        // и подсветка трассы в настройках — там ещё стоит трасса прошлого
+        // этапа, она сменится только при старте следующего.
+        this._applyChampionship(msg.championship || null);
+
         this._renderPlayers();
         this._syncCarCards();
         this._syncColorButtons();
@@ -218,6 +235,77 @@ export class LobbyScreen {
         this._applySettings(msg.settings || {});
         this._syncOwnerControls(msg);
         this._renderChat(msg.chat || []);
+    }
+
+    // --- чемпионат ----------------------------------------------------------
+
+    /**
+     * Поле `championship` события room. Пусто — панель прячется, и лобби
+     * выглядит ровно как в одиночной комнате.
+     *
+     * Обратный отсчёт паузы между этапами тикает здесь, а не приходит с
+     * сервера каждую секунду: сервер присылает остаток один раз (`break_left`),
+     * клиент досчитывает сам. Тридцать лишних рассылок состояния комнаты на
+     * каждый этап — не та цена, которую стоит платить за секундную точность.
+     */
+    _applyChampionship(champ) {
+        this.champ = champ;
+        this._stopBreakTimer();
+        const on = !!(champ && champ.active);
+        this.champPanel.hidden = !on;
+        if (!on) return;
+
+        this.champTitle.textContent = champ.phase === 'final'
+            ? 'Чемпионат завершён'
+            : 'Чемпионат · этап ' + champ.stage + ' из ' + champ.stages;
+        this.champPhase.textContent = CHAMP_PHASE_LABELS[champ.phase] || '';
+
+        this.champCalendar.innerHTML = '';
+        const calendar = champ.calendar || [];
+        for (let i = 0; i < calendar.length; i++) {
+            const stage = calendar[i];
+            const chip = el('div', 'champ-chip'
+                + (stage.done ? ' done' : '') + (stage.current ? ' current' : ''));
+            chip.appendChild(el('span', 'n', String(i + 1)));
+            chip.appendChild(el('span', 't', stage.name || stage.track));
+            this.champCalendar.appendChild(chip);
+        }
+
+        this.champTable.innerHTML = '';
+        const table = champ.table || [];
+        for (let i = 0; i < table.length; i++) {
+            const row = table[i];
+            const node = el('div', 'champ-lobby-row'
+                + (row.slot === this.localSlot ? ' is-me' : '')
+                + (row.online === false ? ' offline' : ''));
+            node.appendChild(el('div', 'clr-pos', String(row.pos)));
+            node.appendChild(el('div', 'clr-name', row.name || 'Гонщик'));
+            node.appendChild(el('div', 'clr-note',
+                row.online === false ? 'не в сети' : ''));
+            node.appendChild(el('div', 'clr-points num', String(row.points)));
+            this.champTable.appendChild(node);
+        }
+
+        const breaking = champ.phase === 'break' && champ.break_left > 0;
+        this.champBreak.hidden = !breaking;
+        if (breaking) this._startBreakTimer(champ.break_left);
+    }
+
+    _startBreakTimer(seconds) {
+        this.breakLeft = Math.max(0, Math.round(seconds));
+        this.champBreakValue.textContent = String(this.breakLeft);
+        this.breakTimer = setInterval(() => {
+            this.breakLeft--;
+            if (this.breakLeft <= 0) {
+                this.breakLeft = 0;
+                this._stopBreakTimer();
+            }
+            this.champBreakValue.textContent = String(this.breakLeft);
+        }, 1000);
+    }
+
+    _stopBreakTimer() {
+        if (this.breakTimer) { clearInterval(this.breakTimer); this.breakTimer = 0; }
     }
 
     /** Событие `countdown`: 3, 2, 1, 0 крупно поверх всего экрана. */
@@ -339,6 +427,40 @@ export class LobbyScreen {
         }
         panel.appendChild(this.playersList);
         col.appendChild(panel);
+
+        // --- чемпионат ------------------------------------------------------
+        // Панель показывается только когда серия идёт: в одиночной комнате
+        // экран лобби обязан выглядеть ровно как прежде.
+        const champPanel = el('div', 'panel champ-panel');
+        champPanel.hidden = true;
+        this.champPanel = champPanel;
+        const champHead = el('div', 'panel-head');
+        this.champTitle = el('h2', null, 'Чемпионат');
+        champHead.appendChild(this.champTitle);
+        const champSpacer = el('div');
+        champSpacer.style.flex = '1';
+        champHead.appendChild(champSpacer);
+        this.champPhase = el('div', 'label', '');
+        champHead.appendChild(this.champPhase);
+        champPanel.appendChild(champHead);
+
+        const champBody = el('div', 'champ-lobby');
+        this.champCalendar = el('div', 'champ-calendar');
+        champBody.appendChild(this.champCalendar);
+
+        this.champBreak = el('div', 'champ-break');
+        this.champBreakValue = el('div', 'n', '0');
+        this.champBreak.appendChild(this.champBreakValue);
+        this.champBreakText = el('span', null, 'с до следующего этапа — успейте сменить машину');
+        this.champBreak.appendChild(this.champBreakText);
+        this.champBreak.hidden = true;
+        champBody.appendChild(this.champBreak);
+
+        this.champTable = el('div', 'champ-lobby-rows');
+        champBody.appendChild(this.champTable);
+        champPanel.appendChild(champBody);
+        col.appendChild(champPanel);
+
         return col;
     }
 
@@ -415,7 +537,7 @@ export class LobbyScreen {
         const col = el('div', 'lobby-col');
 
         // Настройки комнаты
-        const setPanel = el('div', 'panel');
+        const setPanel = el('div', 'panel settings-panel');
         const setHead = el('div', 'panel-head');
         setHead.appendChild(el('h2', null, 'Настройки'));
         const spacer = el('div');
@@ -425,7 +547,30 @@ export class LobbyScreen {
         setHead.appendChild(this.ownerTag);
         setPanel.appendChild(setHead);
 
-        const body = el('div', 'settings-view');
+        const body = el('div', 'settings-view scroll');
+
+        // Режим комнаты: одиночная гонка или серия этапов.
+        const modeRow = el('div', 'set-row');
+        modeRow.appendChild(el('div', 'k', 'Режим'));
+        const modeSeg = el('div', 'segmented');
+        this.modeButtons = [];
+        for (let i = 0; i < ROOM_MODES.length; i++) {
+            const mode = ROOM_MODES[i];
+            const btn = el('button', 'seg', ROOM_MODE_LABELS[mode]);
+            btn.type = 'button';
+            btn.addEventListener('click', () => this._pushSettings({ mode: mode }));
+            modeSeg.appendChild(btn);
+            this.modeButtons.push({ id: mode, node: btn });
+        }
+        modeRow.appendChild(modeSeg);
+        body.appendChild(modeRow);
+
+        this.stagesRow = el('div', 'set-row');
+        this.stagesRow.appendChild(el('div', 'k', 'Этапов'));
+        this.stagesControl = this._buildMiniStepper(STAGES_MIN, STAGES_MAX,
+            (v) => this._pushSettings({ stages: v }));
+        this.stagesRow.appendChild(this.stagesControl.node);
+        body.appendChild(this.stagesRow);
 
         // Трасса
         body.appendChild(el('div', 'label', 'Трасса'));
@@ -520,6 +665,35 @@ export class LobbyScreen {
         mirrorToggle.appendChild(el('span', 'toggle-track'));
         mirrorRow.appendChild(mirrorToggle);
         body.appendChild(mirrorRow);
+
+        // Гандикап и повтор финиша: обе по умолчанию выключены.
+        const handicapRow = el('div', 'set-row');
+        const handicapKey = el('div', 'k', 'Гандикап');
+        handicapKey.title = 'Победитель прошлой гонки едет следующую чуть медленнее';
+        handicapRow.appendChild(handicapKey);
+        const handicapToggle = el('label', 'toggle');
+        this.handicapInput = el('input');
+        this.handicapInput.type = 'checkbox';
+        this.handicapInput.addEventListener('change', () =>
+            this._pushSettings({ handicap: this.handicapInput.checked }));
+        handicapToggle.appendChild(this.handicapInput);
+        handicapToggle.appendChild(el('span', 'toggle-track'));
+        handicapRow.appendChild(handicapToggle);
+        body.appendChild(handicapRow);
+
+        const replayRow = el('div', 'set-row');
+        const replayKey = el('div', 'k', 'Повтор финиша');
+        replayKey.title = 'Последние три секунды гонки на экране итогов';
+        replayRow.appendChild(replayKey);
+        const replayToggle = el('label', 'toggle');
+        this.replayInput = el('input');
+        this.replayInput.type = 'checkbox';
+        this.replayInput.addEventListener('change', () =>
+            this._pushSettings({ replay: this.replayInput.checked }));
+        replayToggle.appendChild(this.replayInput);
+        replayToggle.appendChild(el('span', 'toggle-track'));
+        replayRow.appendChild(replayToggle);
+        body.appendChild(replayRow);
 
         setPanel.appendChild(body);
         col.appendChild(setPanel);
@@ -730,6 +904,15 @@ export class LobbyScreen {
             this.readyButton.className = 'btn btn-lg btn-ghost';
             return;
         }
+        // В идущей серии готовность не спрашивают (см. Room.start_race):
+        // кнопка, которая ни на что не влияет, — обман, поэтому она гаснет.
+        const champ = this.champ;
+        if (champ && champ.active && champ.phase !== 'final') {
+            this.readyButton.disabled = true;
+            this.readyButton.textContent = 'Этап стартует сам';
+            this.readyButton.className = 'btn btn-lg btn-ghost';
+            return;
+        }
         this.readyButton.textContent = this.myReady ? 'Готов — отменить' : 'Я готов';
         this.readyButton.className = this.myReady ? 'btn btn-lg btn-green' : 'btn btn-lg';
     }
@@ -811,10 +994,17 @@ export class LobbyScreen {
     _applySettings(settings) {
         this.currentSettings = settings;
 
+        let shownTrack = settings.track;
+        const champ = this.champ;
+        if (champ && champ.active && champ.phase !== 'final') {
+            for (let i = 0; i < (champ.calendar || []).length; i++) {
+                if (champ.calendar[i].current) { shownTrack = champ.calendar[i].track; break; }
+            }
+        }
         if (this.trackButtons) {
             for (let i = 0; i < this.trackButtons.length; i++) {
                 this.trackButtons[i].node.classList.toggle('is-active',
-                    this.trackButtons[i].id === settings.track);
+                    this.trackButtons[i].id === shownTrack);
             }
         }
         this._syncTimeOfDay(settings);
@@ -823,6 +1013,16 @@ export class LobbyScreen {
         this.itemsEnabledInput.checked = !!settings.items_enabled;
         this.collisionsInput.checked = !!settings.collisions;
         this.mirrorInput.checked = !!settings.mirror;
+        this.handicapInput.checked = !!settings.handicap;
+        this.replayInput.checked = !!settings.replay;
+
+        const mode = ROOM_MODES.indexOf(settings.mode) >= 0 ? settings.mode : ROOM_MODES[0];
+        for (let i = 0; i < this.modeButtons.length; i++) {
+            this.modeButtons[i].node.classList.toggle('is-active',
+                this.modeButtons[i].id === mode);
+        }
+        this.stagesRow.hidden = mode !== 'championship';
+        this.stagesControl.set(settings.stages || STAGES_MIN, true);
 
         const items = settings.items || [];
         for (let i = 0; i < this.itemButtons.length; i++) {
@@ -858,17 +1058,27 @@ export class LobbyScreen {
 
     _syncOwnerControls(room) {
         const editable = this.isOwner && room.state === 'LOBBY';
+        // Пока серия идёт, трассу задаёт календарь, а режим и длину серии
+        // менять поздно: очки уже начислены (та же проверка на сервере).
+        const seriesRunning = !!(this.champ && this.champ.active);
+        const seriesEditable = editable && !seriesRunning;
         this.ownerTag.textContent = this.isOwner ? 'вы хозяин' : 'только чтение';
         this.ownerTag.style.color = this.isOwner ? 'var(--accent)' : '';
 
         this.lapsControl.setEditable(editable);
         this.maxControl.setEditable(editable);
+        this.stagesControl.setEditable(seriesEditable);
         this.itemsEnabledInput.disabled = !editable;
         this.collisionsInput.disabled = !editable;
         this.mirrorInput.disabled = !editable;
+        this.handicapInput.disabled = !editable;
+        this.replayInput.disabled = !editable;
+        for (let i = 0; i < this.modeButtons.length; i++) {
+            this.modeButtons[i].node.disabled = !seriesEditable;
+        }
         if (this.trackButtons) {
             for (let i = 0; i < this.trackButtons.length; i++) {
-                this.trackButtons[i].node.disabled = !editable;
+                this.trackButtons[i].node.disabled = !seriesEditable;
             }
         }
         if (this.todButtons) {
@@ -889,6 +1099,14 @@ export class LobbyScreen {
         this.startButton.hidden = !this.isOwner;
         const players = room.players || [];
         this.startButton.disabled = room.state !== 'LOBBY' || players.length === 0;
+        const champ = this.champ;
+        if (champ && champ.active && champ.phase !== 'final') {
+            this.startButton.textContent = 'Этап ' + champ.stage + ' — начать сейчас';
+        } else if ((room.settings || {}).mode === 'championship') {
+            this.startButton.textContent = 'Старт чемпионата';
+        } else {
+            this.startButton.textContent = 'Старт гонки';
+        }
         this.startButton.title = room.state !== 'LOBBY'
             ? 'Гонка уже идёт' : (players.length ? '' : 'В комнате никого нет');
     }

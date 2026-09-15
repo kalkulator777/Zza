@@ -6,6 +6,8 @@
     python3 run.py --no-browser    # только сервер
     python3 run.py --port 8000
     python3 run.py --name "Комп Васи"
+    python3 run.py --records /srv/racing/records.json   # где хранить рекорды
+    python3 run.py --no-records                         # не хранить их вовсе
 
 Запустивший получает ссылку с токеном хоста; остальные заходят на
 http://<ip-этой-машины>:<порт>. Адреса, которые надо диктовать соседям,
@@ -34,6 +36,7 @@ import tornado.log
 from server import config
 from server.app import ServerContext, make_app
 from server.discovery import Discovery, local_addresses
+from server.records import RecordStore
 from server.room import ContentLibrary, RoomManager, simulation_is_stub
 
 
@@ -52,6 +55,12 @@ def parse_args(argv=None):
                         help='имя сервера, видное соседям по сети')
     parser.add_argument('--content', default=os.path.join(BASE_DIR, 'content'),
                         help='каталог с трассами и машинами (по умолчанию ./content)')
+    parser.add_argument('--records', default=os.path.join(BASE_DIR, config.RECORDS_FILE),
+                        help='файл рекордов кругов (по умолчанию ./%s)'
+                             % config.RECORDS_FILE)
+    parser.add_argument('--no-records', action='store_true',
+                        help='не хранить рекорды кругов: ничего не читать и '
+                             'не писать на диск')
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error('порт вне диапазона 1..65535')
@@ -88,6 +97,7 @@ def print_banner(args, host_url, addresses, notes):
         print('  похоже, машина сейчас без сети. Соседи подключиться не смогут.')
         print('')
     print('  Обнаружение других серверов: UDP %d' % config.DISCOVERY_PORT)
+    print('  Рекорды кругов: %s' % (args.records if not args.no_records else 'выключены'))
     print('  Комнату может создать любой, кто зашёл на этот сервер')
     for note in notes:
         print('  ! %s' % note)
@@ -125,8 +135,20 @@ async def serve(args):
     content = ContentLibrary(args.content, log=log).load()
     notes.extend(content.issues)
 
+    # Рекорды кругов. Чтение и разбор здесь могут не удаться как угодно —
+    # RecordStore.load() ничего наружу не бросает: игра обязана стартовать
+    # даже с испорченным или недоступным файлом.
+    records = RecordStore(args.records, enabled=not args.no_records,
+                          log=log).load()
+    if args.no_records:
+        notes.append('рекорды отключены ключом --no-records')
+    elif not records.enabled:
+        notes.append('рекорды только в памяти: файл %s записать не удастся'
+                     % args.records)
+
     discovery = Discovery(args.name, args.port, log=log)
-    manager = RoomManager(content, servers_provider=discovery.servers, log=log)
+    manager = RoomManager(content, servers_provider=discovery.servers, log=log,
+                          records=records)
     if simulation_is_stub():
         notes.append('game/sim.py ещё нет: работает временная заглушка симуляции '
                      '(тик идёт, машины не едут)')
@@ -175,6 +197,9 @@ async def serve(args):
     print('\n  Остановка...', flush=True)
     discovery.stop()
     manager.stop()
+    # Несохранённые рекорды дописываем синхронно: цикл уже никому не нужен,
+    # а терять рекорд из-за штатной остановки сервера незачем.
+    records.close()
     http_server.stop()
     await http_server.close_all_connections()
     print('  Сервер остановлен.', flush=True)

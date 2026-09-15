@@ -1,0 +1,22 @@
+# Обёртка Rapier с плоским ABI: один .wasm на сервер (Python + wasmtime)
+# и на клиент (браузер). Никакого wasm-bindgen — модуль обязан иметь
+# НОЛЬ импортов, иначе его нельзя запустить из Python без хозяйских функций.
+[package]
+name = "racing_physics"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# cdylib даёт wasm-модуль, rlib нужен для нативных замеров и тестов
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rapier3d = { version = "0.32", default-features = false, features = ["dim3", "f32"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

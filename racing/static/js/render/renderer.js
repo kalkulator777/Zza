@@ -88,7 +88,15 @@ export const GFX_KEYS = {
     // добавлены вместе с отсечением и временем суток
     viewDistance: 'racing.gfx.viewdistance',
     nightLights: 'racing.gfx.nightlights',
-    timeOfDay: 'racing.gfx.timeofday'
+    timeOfDay: 'racing.gfx.timeofday',
+    // добавлены вместе с запечённым светом, погодой, следами шин,
+    // отражением на кузове и тональной коррекцией
+    bakedLight: 'racing.gfx.bakedlight',
+    wetRoad: 'racing.gfx.wetroad',
+    weather: 'racing.gfx.weather',
+    tireMarks: 'racing.gfx.tiremarks',
+    carReflect: 'racing.gfx.carreflect',
+    toneMap: 'racing.gfx.tonemap'
 };
 
 export const DECOR_LEVELS = ['sparse', 'normal', 'dense'];
@@ -114,24 +122,58 @@ const NIGHT_LIGHT_K = { off: 0, normal: 1.0, bright: 1.45 };
  */
 export const TIME_OF_DAY_MODES = ['auto', 'day', 'dusk', 'night'];
 
+/**
+ * Погода. Устроена ровно как время суток: `auto` — как в комнате, остальное
+ * перебивает её локально. Комната погоду пока не рассылает (это следующий
+ * этап, строка под неё в серверной таблице ENV_FIELDS лежит закомментированной),
+ * поэтому до тех пор `auto` означает «сухо».
+ */
+export const WEATHER_MODES = ['auto', 'clear', 'wet'];
+
+/** Сила отражения окружения на кузове по времени суток. */
+const REFLECT_K = { day: 0.40, dusk: 0.48, night: 0.60 };
+
+/**
+ * Тональная коррекция. Ставится ОДИН РАЗ на рендер, при создании и при
+ * пересборке: смена на лету пересобрала бы все шейдерные программы сцены,
+ * а Firefox компилирует их синхронно (KHR_parallel_shader_compile у него нет).
+ * В кадре стоит несколько ALU на пиксель и ноль проходов.
+ */
+const TONE_EXPOSURE = 1.05;
+
 /** Что выставляет каждый пресет. Это ТОЛЬКО умолчания: галочки главнее. */
 export const GFX_PRESETS = {
     low: {
         ao: true, glow: false, decor: 'sparse', decorAnim: false, particles: 'few',
-        renderScale: 0.5, viewDistance: 'near', nightLights: 'normal', timeOfDay: 'auto'
+        renderScale: 0.5, viewDistance: 'near', nightLights: 'normal', timeOfDay: 'auto',
+        // запечённый свет включён и на низком: он не тратит ресурсы,
+        // а освобождает — треть памяти геометрии и 12 байт выборки на вершину
+        bakedLight: true, wetRoad: false, weather: 'auto', tireMarks: false,
+        carReflect: false, toneMap: false
     },
     medium: {
         ao: true, glow: true, decor: 'normal', decorAnim: true, particles: 'normal',
-        renderScale: 0.75, viewDistance: 'normal', nightLights: 'normal', timeOfDay: 'auto'
+        renderScale: 0.75, viewDistance: 'normal', nightLights: 'normal', timeOfDay: 'auto',
+        bakedLight: true, wetRoad: true, weather: 'auto', tireMarks: true,
+        carReflect: true, toneMap: true
     },
     high: {
         ao: true, glow: true, decor: 'dense', decorAnim: true, particles: 'many',
-        renderScale: 1.0, viewDistance: 'far', nightLights: 'bright', timeOfDay: 'auto'
+        renderScale: 1.0, viewDistance: 'far', nightLights: 'bright', timeOfDay: 'auto',
+        bakedLight: true, wetRoad: true, weather: 'auto', tireMarks: true,
+        carReflect: true, toneMap: true
     }
 };
 
 /** Настройки, ради которых сцену приходится пересобирать. */
-const GFX_REBUILD = ['ao', 'decor', 'decorAnim', 'particles', 'nightLights', 'timeOfDay'];
+const GFX_REBUILD = [
+    'ao', 'decor', 'decorAnim', 'particles', 'nightLights', 'timeOfDay',
+    // запечённый свет меняет материалы и выбрасывает атрибут нормалей;
+    // погода и мокрый асфальт запечены в вершинные цвета; следы шин — это
+    // атрибут uv и текстура; отражение — снятая кубкарта; тональная
+    // коррекция — пересборка всех шейдерных программ
+    'bakedLight', 'wetRoad', 'weather', 'tireMarks', 'carReflect', 'toneMap'
+];
 
 function lsGet(key) {
     try {
@@ -177,6 +219,12 @@ export function loadGfxSettings(quality) {
         viewDistance: readEnum(GFX_KEYS.viewDistance, VIEW_DISTANCES, preset.viewDistance),
         nightLights: readEnum(GFX_KEYS.nightLights, NIGHT_LIGHT_LEVELS, preset.nightLights),
         timeOfDay: readEnum(GFX_KEYS.timeOfDay, TIME_OF_DAY_MODES, preset.timeOfDay),
+        bakedLight: readBool(GFX_KEYS.bakedLight, preset.bakedLight),
+        wetRoad: readBool(GFX_KEYS.wetRoad, preset.wetRoad),
+        weather: readEnum(GFX_KEYS.weather, WEATHER_MODES, preset.weather),
+        tireMarks: readBool(GFX_KEYS.tireMarks, preset.tireMarks),
+        carReflect: readBool(GFX_KEYS.carReflect, preset.carReflect),
+        toneMap: readBool(GFX_KEYS.toneMap, preset.toneMap),
         renderScale: RENDER_SCALES.indexOf(scaleRaw) >= 0 ? scaleRaw : preset.renderScale
     };
 }
@@ -192,8 +240,57 @@ export function saveGfxSettings(patch, quality) {
     if (patch.viewDistance !== undefined) lsSet(GFX_KEYS.viewDistance, patch.viewDistance);
     if (patch.nightLights !== undefined) lsSet(GFX_KEYS.nightLights, patch.nightLights);
     if (patch.timeOfDay !== undefined) lsSet(GFX_KEYS.timeOfDay, patch.timeOfDay);
+    if (patch.bakedLight !== undefined) lsSet(GFX_KEYS.bakedLight, patch.bakedLight ? '1' : '0');
+    if (patch.wetRoad !== undefined) lsSet(GFX_KEYS.wetRoad, patch.wetRoad ? '1' : '0');
+    if (patch.weather !== undefined) lsSet(GFX_KEYS.weather, patch.weather);
+    if (patch.tireMarks !== undefined) lsSet(GFX_KEYS.tireMarks, patch.tireMarks ? '1' : '0');
+    if (patch.carReflect !== undefined) lsSet(GFX_KEYS.carReflect, patch.carReflect ? '1' : '0');
+    if (patch.toneMap !== undefined) lsSet(GFX_KEYS.toneMap, patch.toneMap ? '1' : '0');
     return loadGfxSettings(quality);
 }
+
+/**
+ * Описание всех отдельных настроек графики в одном месте.
+ *
+ * Владелец значений — этот файл (12.14), меню только показывает и пишет их
+ * через loadGfxSettings/saveGfxSettings. Таблица нужна, чтобы новая галочка
+ * появлялась в меню сама: `ui/menu.js` обходит её и строит по строке на
+ * запись, вместо того чтобы перечислять настройки второй раз у себя.
+ *
+ *   key    — поле в объекте настроек и в GFX_KEYS;
+ *   kind   — 'toggle' (галочка) или 'enum' (сегментированный выбор);
+ *   values — допустимые значения для 'enum';
+ *   label  — подпись, hint — пояснение под ней.
+ */
+export const GFX_OPTIONS = [
+    { key: 'ao', kind: 'toggle', label: 'Запечённое затенение',
+      hint: 'Тени в стыках и у оснований. В кадре бесплатно.' },
+    { key: 'bakedLight', kind: 'toggle', label: 'Запечённый свет',
+      hint: 'Свет солнца и неба считается один раз при сборке трассы. Освобождает треть памяти геометрии.' },
+    { key: 'glow', kind: 'toggle', label: 'Свечение огней',
+      hint: 'Фары, стоп-сигналы, турбо, маяки мин.' },
+    { key: 'carReflect', kind: 'toggle', label: 'Отражение на кузове',
+      hint: 'Небо и дома отражаются в краске. Ночью в отражении видны окна.' },
+    { key: 'wetRoad', kind: 'toggle', label: 'Мокрый асфальт',
+      hint: 'Тёмное полотно и блик отражённого неба в дождливую погоду.' },
+    { key: 'weather', kind: 'enum', values: WEATHER_MODES, label: 'Погода',
+      hint: 'Обычно берётся из настроек комнаты. Здесь можно перебить для себя.' },
+    { key: 'tireMarks', kind: 'toggle', label: 'Следы шин',
+      hint: 'Чёрные полосы там, где несло и тормозили юзом. Копятся за гонку.' },
+    { key: 'toneMap', kind: 'toggle', label: 'Тональная коррекция',
+      hint: 'Мягкие света и глубокие тени вместо плоской заливки.' },
+    { key: 'decorAnim', kind: 'toggle', label: 'Анимация декора',
+      hint: 'Качание деревьев и флагов, движение толпы.' },
+    { key: 'decor', kind: 'enum', values: DECOR_LEVELS, label: 'Плотность декора' },
+    { key: 'particles', kind: 'enum', values: PARTICLE_LEVELS, label: 'Частицы' },
+    { key: 'renderScale', kind: 'enum', values: RENDER_SCALES, label: 'Чёткость картинки' },
+    { key: 'viewDistance', kind: 'enum', values: VIEW_DISTANCES, label: 'Дальность отрисовки',
+      hint: 'Докуда тянется туман и что попадает в кадр.' },
+    { key: 'nightLights', kind: 'enum', values: NIGHT_LIGHT_LEVELS, label: 'Яркость ночных огней',
+      hint: 'Фонари, окна, подсветка щитов и пятна фар.' },
+    { key: 'timeOfDay', kind: 'enum', values: TIME_OF_DAY_MODES, label: 'Время суток',
+      hint: 'Обычно берётся из настроек комнаты. Здесь можно перебить для себя.' }
+];
 
 /** Выставить все галочки по пресету — это и есть «быстрая заготовка». */
 export function applyGfxPreset(quality) {
@@ -244,6 +341,12 @@ const SLOPE_SAMPLE = 1.4;        // м вперёд/назад для замер
 const BEAM_AHEAD = 8.0;   // м, центр пятна перед машиной
 const BEAM_LENGTH = 17.0; // м, длина пятна вдоль курса
 const BEAM_WIDTH = 6.0;   // м, ширина пятна
+
+// --- отражение окружения на кузове ------------------------------------------
+const ENV_CUBE_SIZE = 128; // грань кубкарты: 0,38 МБ на всю сцену
+
+// --- следы шин ---------------------------------------------------------------
+const MARK_MIN_SPEED = 3.0; // м/с, ниже неё след не пишется (стоящая машина)
 
 const CAM_GROUND_CLEARANCE = 0.75; // м, ниже рельефа камера не опускается
 const NEAR_PLANE = 0.12;
@@ -336,6 +439,7 @@ export class RaceRenderer {
         this.renderer.autoClear = true;
         this.renderer.shadowMap.enabled = false;
         this.renderer.info.autoReset = true;
+        this.applyToneMapping();
 
         this.scene = new THREE.Scene();
         this.camera = new THREE.PerspectiveCamera(FOV_BASE, 16 / 9, NEAR_PLANE, 1200);
@@ -373,6 +477,7 @@ export class RaceRenderer {
         this.environment = normalizeEnvironment(null, ENV_DEFAULT);
         this.envExplicit = false;   // приходило ли окружение снаружи хоть раз
         this.timeOfDay = 'day';
+        this.weather = 'clear';
 
         // Отсечение по пирамиде видимости: один объект на рендер, в кадре
         // только перечитывается камера. Владеет им renderer, применяют его
@@ -400,6 +505,10 @@ export class RaceRenderer {
         this.views = [];
         for (let i = 0; i < MAX_CARS; i++) this.views.push(new CarView(i));
         this.localSlot = -1;
+
+        // Кубическая карта окружения для отражения на кузове: снимается один
+        // раз при сборке гонки, в кадре стоит ноль.
+        this.envCubeRT = null;
 
         this.shadowMesh = null;
         this.shadowTex = null;
@@ -520,6 +629,7 @@ export class RaceRenderer {
             this.renderScale = next.renderScale;
             this.applySize();
         }
+        this.applyToneMapping();
         // свечение включается на живой сцене, без пересборки
         if (this.effects) this.effects.setGlowEnabled(next.glow);
         // дальность отрисовки — тоже без пересборки: она правит только
@@ -566,6 +676,30 @@ export class RaceRenderer {
         const forced = this.gfx.timeOfDay;
         if (forced && forced !== 'auto') return forced;
         return this.environment.timeOfDay;
+    }
+
+    /**
+     * Погода, которой реально собирается сцена. Галочка «мокрый асфальт»
+     * главнее всего: снятая, она возвращает сухую картинку целиком, чтобы
+     * выключенная тема не стоила ни пикселя разницы.
+     */
+    resolveWeather() {
+        if (!this.gfx.wetRoad) return 'clear';
+        const forced = this.gfx.weather;
+        if (forced && forced !== 'auto') return forced;
+        return this.environment.weather;
+    }
+
+    /**
+     * Тональная коррекция. Ноль вызовов, ноль треугольников, ноль фрагментов —
+     * несколько ALU на пиксель. Ставится до сборки сцены: смена на живой сцене
+     * пересобрала бы все шейдерные программы разом, а в Firefox компиляция
+     * синхронна.
+     */
+    applyToneMapping() {
+        const on = this.gfx.toneMap;
+        this.renderer.toneMapping = on ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping;
+        this.renderer.toneMappingExposure = on ? TONE_EXPOSURE : 1.0;
     }
 
     /**
@@ -627,16 +761,30 @@ export class RaceRenderer {
         // quality, иначе декор всплывёт над землёй.
         const gfx = this.gfx;
         const nightLights = NIGHT_LIGHT_K[gfx.nightLights] === undefined ? 1 : NIGHT_LIGHT_K[gfx.nightLights];
-        this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality, {
-            ao: gfx.ao,
-            timeOfDay: todName
-        });
+        const weather = this.resolveWeather();
+        this.weather = weather;
+        this.applyToneMapping();
+
+        // Окружение строится ПЕРВЫМ: из него берутся параметры света, а их
+        // запекание в вершины полотна — и есть тема «запечённый свет».
         this.scenery = buildScenery(this.track, this.theme, this.track.decorSeed, quality, {
             ao: gfx.ao,
             decor: gfx.decor,
             anim: gfx.decorAnim,
-            env: { timeOfDay: todName, weather: this.environment.weather },
+            env: { timeOfDay: todName, weather: weather },
             nightLights: nightLights
+        });
+        this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality, {
+            ao: gfx.ao,
+            timeOfDay: todName,
+            weather: weather,
+            wet: gfx.wetRoad,
+            marks: gfx.tireMarks,
+            // Запекается ТОЛЬКО неинстансная статика. Инстансный декор
+            // остаётся Ламбертом: поворот экземпляра вокруг Y в нормаль
+            // геометрии не входит, и запекание увело бы 14 % пикселей.
+            light: gfx.bakedLight ? this.scenery.light : null,
+            sky: this.scenery.fog.color
         });
         this.sampler = createTerrainSampler(this.track, this.theme, quality);
 
@@ -658,6 +806,12 @@ export class RaceRenderer {
         this.sun.position.set((d[0] / dl) * 220, (d[1] / dl) * 220, (d[2] / dl) * 220);
         this.sunTarget.position.set(0, 0, 0);
 
+        // Кубкарта снимается, пока в сцене только статика: машин, теней,
+        // боксов и эффектов в отражении быть не должно. Заодно это прогрев
+        // шейдеров — шесть сторон видят то, чего первый кадр не видит,
+        // а Firefox компилирует синхронно.
+        if (gfx.carReflect) this.bakeEnvMap();
+
         this.buildShadows();
         this.buildBeams(nightLights);
         this.buildBoxes();
@@ -669,7 +823,10 @@ export class RaceRenderer {
             glow: gfx.glow,
             fogColor: sc.fog.color,
             heightAt: this._heightAt,
-            night: this.nightK * nightLights
+            night: this.nightK * nightLights,
+            // брызги из-под колёс — тот же пул дыма, другой цвет и другое
+            // условие рождения: ноль дополнительных вызовов отрисовки
+            wet: weather === 'wet'
         });
         this.scene.add(this.effects.root);
         if (this.boxMesh) {
@@ -713,7 +870,13 @@ export class RaceRenderer {
             }
 
             const view = this.views[slot];
-            const mesh = buildCarMesh(shape, p.color || '#e5484d', this.quality, { ao: this.gfx.ao });
+            const mesh = buildCarMesh(shape, p.color || '#e5484d', this.quality, {
+                ao: this.gfx.ao,
+                envMap: this.envCubeRT ? this.envCubeRT.texture : null,
+                // ночью в отражении появляются окна домов — самое красивое,
+                // что даёт тема; 0,70 уже вымывает краску
+                reflect: REFLECT_K[this.timeOfDay] === undefined ? 0.4 : REFLECT_K[this.timeOfDay]
+            });
             if (mesh.setNight) mesh.setNight(night);
             // Колёса крутятся вокруг своей оси УЖЕ ПОВЁРНУТОЙ рулём, поэтому
             // порядок Эйлера обязан быть YXZ: при XYZ спин ушёл бы вокруг оси
@@ -752,6 +915,55 @@ export class RaceRenderer {
         let n = 0;
         for (let i = 0; i < MAX_CARS; i++) if (this.views[i].present) n++;
         return n;
+    }
+
+    /**
+     * Снять кубическую карту окружения для отражения на кузове.
+     *
+     * Цена разовая: шесть отрисовок статики в грани 128² (0,38 МБ), то есть
+     * доли секунды при загрузке трассы — соизмеримо с самой сборкой геометрии.
+     * В кадре это ноль вызовов, ноль треугольников и ноль лишних фрагментов:
+     * одна кубическая выборка в пикселях кузова.
+     *
+     * Карта снимается из ОДНОЙ точки — центра трассы. Для мультяшного стиля
+     * этого достаточно; «правильное» отражение потребовало бы карты на каждую
+     * четверть круга (4 x 0,38 МБ) и переключения по прогрессу.
+     */
+    bakeEnvMap() {
+        const T = this.track;
+        let cx = 0,
+            cz = 0,
+            maxY = -1e9;
+        for (let i = 0; i < T.count; i++) {
+            cx += T.cx[i];
+            cz += T.cz[i];
+            if (T.cy[i] > maxY) maxY = T.cy[i];
+        }
+        cx /= T.count;
+        cz /= T.count;
+
+        const rt = new THREE.WebGLCubeRenderTarget(ENV_CUBE_SIZE, {
+            generateMipmaps: false,
+            minFilter: THREE.LinearFilter,
+            magFilter: THREE.LinearFilter
+        });
+        rt.texture.name = 'carEnvCube';
+        const cam = new THREE.CubeCamera(1.0, 1500, rt);
+        cam.position.set(cx, maxY + 6, cz);
+
+        // Посегментное отсечение настроено под главную камеру — на время
+        // съёмки показываем всё кольцо, иначе в отражении будут дыры.
+        this.trackMeshes.cull(null);
+        this.scenery.cull(null);
+        this.scenery.updateSky(cam);
+        // тональная коррекция применится уже к самому кадру: если снимать
+        // карту через неё, отражение окажется скорректированным дважды
+        const tone = this.renderer.toneMapping;
+        this.renderer.toneMapping = THREE.NoToneMapping;
+        cam.update(this.renderer, this.scene);
+        this.renderer.toneMapping = tone;
+        this.scenery.updateSky(this.camera);
+        this.envCubeRT = rt;
     }
 
     /**
@@ -962,6 +1174,23 @@ export class RaceRenderer {
     explosionAt(x, z, power) {
         if (!this.effects) return;
         this.effects.explosion(x, this._heightAt(x, z), z, power);
+        this.sootAt(x, z, power);
+    }
+
+    /**
+     * Круг копоти в карту полотна. Карта уже натянута ради следов шин,
+     * поэтому любая новая декаль в неё стоит ноль вызовов и ноль треугольников:
+     * это самый выгодный рычаг из всего списка, и открывается он один раз.
+     */
+    sootAt(x, z, power) {
+        const marks = this.trackMeshes && this.trackMeshes.marks;
+        if (!marks) return;
+        const s = this.track.surface(x, z, this._fxHint);
+        this._fxHint = s.index;
+        const p = power === undefined ? 1 : power;
+        marks.blob(this.track.cs[s.index] + (x - this.track.cx[s.index]) * this.track.ctx[s.index]
+            + (z - this.track.cz[s.index]) * this.track.ctz[s.index],
+            s.lateral, s.halfWidth, 0.42, 1.6 + 0.8 * p);
     }
 
     /** Попадание по машине: взрыв в её точке. */
@@ -969,6 +1198,7 @@ export class RaceRenderer {
         if (slot < 0 || slot >= MAX_CARS || !this.effects) return;
         const v = this.views[slot];
         this.effects.explosion(v.x, v.y, v.z, power);
+        this.sootAt(v.x, v.z, power);
     }
 
     /** Щит погасил попадание. */
@@ -1000,6 +1230,7 @@ export class RaceRenderer {
         const step = dt > 0.1 ? 0.1 : dt < 0 ? 0 : dt;
         this.time += step;
 
+        const marks = this.trackMeshes.marks;
         const shadowArr = this.shadowMesh.instanceMatrix.array;
         let shadowN = 0;
         const beamArr = this.beamMesh ? this.beamMesh.instanceMatrix.array : null;
@@ -1036,7 +1267,16 @@ export class RaceRenderer {
                 beamN++;
             }
 
+            if (marks) this.stampMarks(marks, v);
+
             this.effects.emitFromCar(v, step);
+        }
+
+        if (marks) {
+            // Выцветание идёт полосами, догрузка — прямоугольниками: карта
+            // конечная, и без выцветания за сессию полотно станет чёрным.
+            marks.fade(step);
+            marks.upload(this.renderer);
         }
 
         this.shadowMesh.count = shadowN;
@@ -1067,6 +1307,68 @@ export class RaceRenderer {
         this.scenery.cull(this.culler);
 
         this.effects.update(step, this.camera, target ? target.speed : 0);
+    }
+
+    /**
+     * Отпечатать след задних колёс в карту полотна.
+     *
+     * Ноль вызовов отрисовки, ноль треугольников, ноль фрагментов: след — это
+     * несколько байт, дописанных в текстуру, которую полотно и так читает.
+     * Вариант с растущей лентой квадов стоил бы 96 тыс. треугольников за гонку
+     * (весь бюджет кадра), а декали — столько же.
+     *
+     * Точка контакта колеса не ищется отдельным запросом к трассе: смещение
+     * колеса от центра машины раскладывается по касательной и нормали осевой
+     * линии. На двух метрах выборки кривизна ничего не меняет, а поиск
+     * ближайшей точки экономится шестнадцать раз за кадр.
+     */
+    stampMarks(marks, v) {
+        const slot = v.slot;
+        const b0 = slot * 2;
+        const drifting = (v.flags & FLAG_DRIFTING) !== 0;
+        const braking = (v.flags & FLAG_BRAKING) !== 0 && v.vfwd > MARK_MIN_SPEED;
+        const dust = (v.flags & FLAG_OFFTRACK) !== 0;
+        if ((v.flags & FLAG_GHOST) || v.speed < MARK_MIN_SPEED || (!drifting && !braking && !dust)) {
+            marks.release(b0);
+            marks.release(b0 + 1);
+            return;
+        }
+
+        const T = this.track;
+        const s = T.surface(v.x, v.z, v.hint);
+        v.hint = s.index;
+        const i = s.index;
+        const tx = T.ctx[i],
+            tz = T.ctz[i];
+        const nx = T.cnx[i],
+            nz = T.cnz[i];
+        // путь до ближайшей выборки плюс продольная поправка: без неё след
+        // прыгал бы по двухметровой сетке выборок
+        const arc = T.cs[i] + (v.x - T.cx[i]) * tx + (v.z - T.cz[i]) * tz;
+
+        let strength;
+        if (drifting) {
+            const slip = Math.abs(v.vlat);
+            strength = 0.18 + 0.42 * Math.min(1, slip / 9);
+        } else if (braking) {
+            strength = 0.26;
+        } else {
+            strength = 0.13; // пыль и примятая трава вне трассы
+        }
+
+        const sinY = Math.sin(v.yaw);
+        const cosY = Math.cos(v.yaw);
+        const fx = sinY, fz = cosY;
+        const lx = cosY, lz = -sinY;
+        for (let k = 0; k < 2; k++) {
+            const side = k === 0 ? 1 : -1;
+            const ox = fx * v.rearZ + lx * v.halfWidth * side;
+            const oz = fz * v.rearZ + lz * v.halfWidth * side;
+            marks.stroke(b0 + k,
+                arc + ox * tx + oz * tz,
+                s.lateral + ox * nx + oz * nz,
+                s.halfWidth, strength, 1);
+        }
     }
 
     firstVisibleCar() {
@@ -1385,6 +1687,7 @@ export class RaceRenderer {
         s.decorTotal = this.scenery ? this.scenery.stats.totalInstances : 0;
         s.trackSegments = this.trackMeshes ? this.trackMeshes.stats.visibleSegments : 0;
         s.timeOfDay = this.timeOfDay;
+        s.weather = this.weather;
         s.quality = this.quality;
         s.renderScale = this.renderScale;
         return s;
@@ -1459,6 +1762,11 @@ export class RaceRenderer {
             this.scene.remove(this.effects.root);
             this.effects.dispose();
             this.effects = null;
+        }
+        if (this.envCubeRT) {
+            // 12.11: текстуры обязаны возвращаться в ноль
+            this.envCubeRT.dispose();
+            this.envCubeRT = null;
         }
         if (this.shadowMesh) {
             this.scene.remove(this.shadowMesh);
