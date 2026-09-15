@@ -265,6 +265,43 @@ export function weatherIconSvg(weather, size) {
     return envIconSvg(art, color, size);
 }
 
+// --- модель физики комнаты (§12.23, §12.24) ---------------------------------
+//
+// Зеркало server/config.PHYSICS_MODES. Сервер проверяет поле сам (код ошибки
+// bad_physics), здесь это только форма и подписи. Порядок тот же, что на
+// сервере: первое значение — умолчание.
+//
+// Переключатель имеет смысл ТОЛЬКО когда сервер поднят с --physics rapier:
+// при прежней физике режим не меняет в заезде ничего, и показывать его
+// значило бы врать игроку. Прячет его лобби, по welcome.physics_backend.
+
+export const ROOM_PHYSICS = ['arcade', 'sim'];
+
+export const ROOM_PHYSICS_LABELS = {
+    arcade: 'Аркада', sim: 'Симулятор',
+};
+
+// Пояснение — про руль в руках, а не про движок: игроку выбирать ощущение.
+export const ROOM_PHYSICS_DESC = {
+    arcade: 'Цепко и послушно: короткий тормоз, крутая дуга, ручник помогает',
+    sim: 'Честно и без помощи: длинный тормоз, широкая дуга, возить рулём',
+};
+
+const PHYSICS_ART = {
+    arcade: '<path d="M38 8L18 33h13l-3 15 20-25H35z"/>',
+    sim: '<path d="M11 42a23 23 0 0 1 46 0"/><path d="M34 42l15-13"/>'
+        + '<path d="M16 42v.01M22 28v.01M34 22v.01"/>',
+};
+
+const PHYSICS_COLORS = { arcade: '#ffb224', sim: '#5aa9ff' };
+
+/** Иконка модели физики в том же кадре 68x56, что и силуэт трассы. */
+export function physicsIconSvg(mode, size) {
+    const art = PHYSICS_ART[mode] || PHYSICS_ART.arcade;
+    const color = PHYSICS_COLORS[mode] || PHYSICS_COLORS.arcade;
+    return envIconSvg(art, color, size);
+}
+
 /** Общий кадр иконок окружения: тёмный «карандаш» под цветным контуром. */
 function envIconSvg(art, color, size) {
     return '<svg viewBox="0 0 68 56" width="' + size + '" height="' + (size * 56 / 68)

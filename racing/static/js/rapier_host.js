@@ -39,8 +39,12 @@ export function meshParams(track) {
     return [margin, height, rub];
 }
 
-// Порядок столбцов залитой осевой линии — 12.1.
+// Порядок столбцов залитой осевой линии — 12.1. Первое имя — как поле зовётся
+// в сыром race_init.track, второе — как его назвал Track.fromServer у себя.
+// Оба источника несут ОДНИ И ТЕ ЖЕ числа (round(v, 3) в f32), и брать их надо
+// уметь из обоих: рендеру уходит объект Track, а по проводу идёт словарь.
 const COLUMNS = ['x', 'y', 'z', 'tx', 'tz', 'nx', 'nz', 'hw', 's'];
+const COLUMNS_TRACK = ['cx', 'cy', 'cz', 'ctx', 'ctz', 'cnx', 'cnz', 'chw', 'cs'];
 
 export class HostError extends Error {}
 
@@ -140,15 +144,20 @@ export class RapierHost {
         if (wallMargin === undefined) wallMargin = fromTrack[0];
         if (wallHeight === undefined) wallHeight = fromTrack[1];
         if (friction === undefined) friction = fromTrack[2];
-        const n = track.count || track.x.length;
+        const names = track.x !== undefined ? COLUMNS : COLUMNS_TRACK;
+        const first = track[names[0]];
+        if (first === undefined) {
+            throw new HostError('в записи трассы нет осевой линии: ни x, ни cx');
+        }
+        const n = track.count || first.length;
         if (n < 3) throw new HostError('осевая линия короче трёх точек');
         const offset = this.x.rp_track_alloc_centerline(n);
         if (offset === 0) throw new HostError('модуль не дал буфер под осевую линию');
         // Аллокация могла сдвинуть память: вид строим ПОСЛЕ неё.
         this._sync(true);
-        const flat = new Float32Array(this.mem.buffer, offset, n * COLUMNS.length);
-        for (let c = 0; c < COLUMNS.length; c++) {
-            const column = track[COLUMNS[c]];
+        const flat = new Float32Array(this.mem.buffer, offset, n * names.length);
+        for (let c = 0; c < names.length; c++) {
+            const column = track[names[c]];
             const base = c * n;
             for (let i = 0; i < n; i++) flat[base + i] = column[i];
         }
@@ -185,6 +194,47 @@ export class RapierHost {
     tuningPreset(preset) {
         this.x.rp_tuning_preset(preset | 0);
         this._sync();
+    }
+
+    /** Имя поля CarTuning -> индекс во f32. ВЫВОДИТСЯ из раскладки. */
+    tuningIndex() {
+        if (this._tuningIndex) return this._tuningIndex;
+        const out = Object.create(null);
+        const src = this.abi.CarTuning;
+        for (const name of Object.keys(src)) {
+            if (name === 'SIZE' || name === 'FLOATS') continue;
+            if (name !== name.toUpperCase()) continue;
+            out[name.toLowerCase()] = src[name];
+        }
+        this._tuningIndex = out;
+        return out;
+    }
+
+    /**
+     * Наложить настройки машины на шаблон: {имя поля: число}. Зеркало
+     * RapierHost.set_tuning из game/rapier_host.py — правки ложатся ПОВЕРХ
+     * загруженного пресета, следующая spawnCar читает шаблон как есть.
+     */
+    setTuning(values) {
+        if (!values) return;
+        this._sync();
+        const index = this.tuningIndex();
+        for (const name of Object.keys(values)) {
+            const at = index[name];
+            if (at === undefined) {
+                throw new HostError('в CarTuning нет поля ' + name);
+            }
+            this.tuning[at] = values[name];
+        }
+    }
+
+    /** Шаблон целиком, именами полей. */
+    tuningValues() {
+        this._sync();
+        const index = this.tuningIndex();
+        const out = Object.create(null);
+        for (const name of Object.keys(index)) out[name] = this.tuning[index[name]];
+        return out;
     }
 
     // --- шаг ------------------------------------------------------------
@@ -246,6 +296,260 @@ export class RapierHost {
         return [this._hash('rp_track_verts_hash'), this._hash('rp_track_tris_hash')];
     }
     meshSize() { return [this.x.rp_track_vert_count(), this.x.rp_track_tri_count()]; }
+}
+
+// ===========================================================================
+// Гонку считает Rapier: предсказание и реконсиляция своей машины (§12.24)
+// ===========================================================================
+//
+// Зеркало RapierRace из game/rapier_host.py, но с одной принципиальной
+// разницей: у клиента в мире ОДНА машина — своя. Чужих тел у него нет и
+// быть не может (снапшот везёт позы, а не состояние солвера), поэтому
+// столкновения с соседями клиент не предсказывает — ровно как и в классике
+// (§6.2: resolve_collisions считает только сервер). Толчок от соседа
+// приезжает следующим снапшотом и гасится обычной реконсиляцией.
+
+// Те же числа, что на сервере. Расходиться им нельзя: с ними считается
+// первый тик гонки и высота над полотном.
+export const SETTLE_TICKS = 24;
+export const DRIFT_MIN_SPEED = 4.0;
+export const DRIFT_MIN_SLIP = 0.12;
+
+// Зеркало game/rapier_host.PRESET_NAMES и server/config.PHYSICS_MODES.
+export const PRESET_NAMES = ['arcade', 'sim'];
+
+export function presetIndex(name) {
+    const at = PRESET_NAMES.indexOf(String(name || '').toLowerCase());
+    return at < 0 ? 0 : at;
+}
+
+/**
+ * Правки CarTuning для машины каталога в выбранном режиме (§12.23).
+ * Блок body общий для обоих режимов: кузов у машины один.
+ */
+export function carTuning(spec, mode) {
+    const tuning = spec && spec.tuning;
+    if (!tuning) return null;
+    const out = Object.assign({}, tuning.body || null);
+    return Object.assign(out, tuning[mode] || null);
+}
+
+function shortAngle(from, to) {
+    let d = to - from;
+    const TAU = Math.PI * 2;
+    while (d > Math.PI) d -= TAU;
+    while (d < -Math.PI) d += TAU;
+    return d;
+}
+
+/** Курс тела по кватерниону — ровно так же, как считает сам модуль. */
+function yawOfQuat(qx, qy, qz, qw) {
+    const fx = 2.0 * (qx * qz + qw * qy);
+    const fz = 1.0 - 2.0 * (qx * qx + qy * qy);
+    return Math.atan2(fx, fz);
+}
+
+export class RapierLocal {
+    /** Загрузить модуль. Мир строится позже, в beginRace. */
+    static async load(opts = {}) {
+        return new RapierLocal(await RapierHost.load(opts));
+    }
+
+    constructor(host) {
+        this.host = host;
+        this.abi = host.abi;
+        this.ready = false;       // мир под эту гонку построен
+        this.idx = 0;
+        this.restY = 0;           // высота центра кузова, когда колёса на полотне
+        this.invSteerMax = 1;
+        this.ring = null;         // кольцо состояний тела, параллельное кольцу net.js
+        this.ringLen = 0;
+        this.grid = null;         // куда поставлена машина на решётке
+    }
+
+    /**
+     * Построить мир под эту гонку: полотно, своя машина, осадка подвески.
+     *
+     * @param track     Track.fromServer — те же числа, что у сервера
+     * @param spec      CarSpec своей машины (нужен только его tuning)
+     * @param mode      'arcade' | 'sim' — настройка комнаты physics
+     * @param gripMul   множитель сцепления по погоде: уезжает в трение сетки
+     * @param ringLen   длина кольца предсказания net.js (INPUT_RING)
+     * @param grid      {x, z, yaw} — место на решётке
+     */
+    beginRace(track, spec, mode, gripMul, ringLen, grid) {
+        const preset = presetIndex(mode);
+        const host = this.host;
+        this.ready = false;
+        host.reset(preset);
+        const p = meshParams(track);
+        // Погода — единственное, чем правится покрытие: её множитель уезжает
+        // в ТРЕНИЕ СЕТКИ. Сервер делает ровно то же в RapierRace.__init__,
+        // и оба числа обязаны совпасть до бита, иначе предсказание поедет.
+        host.buildTrack(track, p[0], p[1], p[2] * (gripMul || 1));
+        host.freeTrackMesh();
+        host.tuningPreset(preset);
+        host.setTuning(carTuning(spec, mode));
+        const t = host.tuningValues();
+        this.restY = t.wheel_radius + t.suspension_rest + t.half_height * 0.2;
+        this.invSteerMax = 1 / (t.steer_max || 1);
+        const surf = track.surface(grid.x, grid.z, 0);
+        this.idx = host.spawnCar(grid.x, surf.y + this.restY, grid.z, grid.yaw);
+        // §8.4 разведки: широкая фаза обновляется только внутри step, поэтому
+        // на первом шаге лучи подвески не находят полотна. Холостые шаги
+        // делает и сервер — ровно столько же и с тем же нулевым вводом.
+        host.setInput(this.idx, 0, 0, 0, 0);
+        host.step(SETTLE_TICKS);
+        const floats = this.abi.CarSave.FLOATS;
+        if (!this.ring || this.ringLen !== ringLen) {
+            this.ring = new Float32Array(ringLen * floats);
+            this.ringLen = ringLen;
+        }
+        this.grid = grid;
+        this.ready = true;
+    }
+
+    // --- шаг ------------------------------------------------------------
+
+    /** Один шаг по битовой маске кнопок протокола. */
+    step(buttons, btn) {
+        const host = this.host;
+        host._sync();
+        const a = this.abi.CarInput;
+        const base = this.idx * a.FLOATS;
+        const inputs = host.inputs;
+        inputs[base + a.THROTTLE] = (buttons & btn.THROTTLE) ? 1 : 0;
+        inputs[base + a.BRAKE] = (buttons & btn.BRAKE) ? 1 : 0;
+        let steer = 0;
+        if (buttons & btn.LEFT) steer += 1;
+        if (buttons & btn.RIGHT) steer -= 1;
+        inputs[base + a.STEER] = steer;
+        inputs[base + a.HANDBRAKE] = (buttons & btn.DRIFT) ? 1 : 0;
+        host.x.rp_step(1);
+    }
+
+    /**
+     * Поза из модуля -> CarState, затем шаг 16 из track.js.
+     * Ровно то же, что делает RapierRace._read_all на сервере.
+     */
+    readInto(state, track) {
+        const host = this.host;
+        host._sync();
+        const o = this.abi.CarOut;
+        const out = host.outputs;
+        const base = this.idx * o.FLOATS;
+        const x = out[base + o.PX];
+        const y = out[base + o.PY];
+        const z = out[base + o.PZ];
+        state.x = x;
+        state.z = z;
+        state.yaw = out[base + o.YAW];
+        state.vx = out[base + o.VX];
+        state.vz = out[base + o.VZ];
+        state.vVert = out[base + o.VY];
+        state.steer = out[base + o.WHEELS + this.abi.WheelOut.STEERING] * this.invSteerMax;
+        state.driftCharge = out[base + o.DRIFT_CHARGE];
+        state.driftDir = out[base + o.DRIFT_DIR] | 0;
+        const grounded = out[base + o.WHEELS_ON_GROUND];
+        state.airborne = grounded === 0;
+        const slip = Math.abs(out[base + o.SLIP_ANGLE]);
+        state.driftActive = slip > DRIFT_MIN_SLIP
+            && out[base + o.SPEED] > DRIFT_MIN_SPEED && grounded > 0;
+        // Шаг 14 остался модулю: стены стоят в сетке полотна. Хозяину нужен
+        // только флаг «вне полотна» — его читает HUD и звук.
+        const surf = track.surface(x, z, state.sampleIdx);
+        state.sampleIdx = surf.index;
+        state.offtrack = surf.lateral > surf.halfWidth || surf.lateral < -surf.halfWidth;
+        const h = y - surf.y - this.restY;
+        state.height = h > 0 ? h : 0;
+        // Шаг 16 — слово в слово прежний, в f64 и в track.js (§8.5 разведки).
+        track.advanceProgress(state, surf.index);
+    }
+
+    // --- кольцо отката ----------------------------------------------------
+    //
+    // Состояние тела — 96 байт: поза, скорости, руль и заряд заноса
+    // (§8.3 разведки). Контроллер колёс своего состояния не хранит, подвеска
+    // целиком пересчитывается лучом на каждом шаге, поэтому клонировать мир
+    // не надо. Откат при этом НЕ бит в бит: кэши разогрева узкой фазы не
+    // восстанавливаются, и переигранная траектория отличается на ~1e-4 м.
+
+    saveRing(slot) {
+        const host = this.host;
+        host.carSave(this.idx);
+        host._sync();
+        const floats = this.abi.CarSave.FLOATS;
+        const src = this.idx * floats;
+        const dst = slot * floats;
+        for (let k = 0; k < floats; k++) this.ring[dst + k] = host.saves[src + k];
+    }
+
+    restoreRing(slot) {
+        const host = this.host;
+        host._sync();
+        const floats = this.abi.CarSave.FLOATS;
+        const src = slot * floats;
+        const dst = this.idx * floats;
+        for (let k = 0; k < floats; k++) host.saves[dst + k] = this.ring[src + k];
+        host.carRestore(this.idx);
+    }
+
+    /**
+     * Наложить авторитетную позу на восстановленное из кольца тело.
+     *
+     * Снапшот везёт x, z, yaw, vx, vz — и всё (раздел 5.3). Крена, тангажа,
+     * вертикальной скорости и угловой скорости в нём нет, и выдумывать их
+     * нельзя: подменить кватернион чистым поворотом вокруг Y значит
+     * поставить машину плашмя посреди виража. Поэтому курс ДОВОРАЧИВАЕТСЯ
+     * на разницу, а остальные оси остаются своими.
+     *
+     * Зовётся ПОСЛЕ restoreRing(slot): в saves уже лежит наше состояние на
+     * этот тик, правится только то, что сервер действительно прислал.
+     */
+    applyAuthoritative(state) {
+        const host = this.host;
+        host._sync();
+        const a = this.abi.CarSave;
+        const saves = host.saves;
+        const base = this.idx * a.FLOATS;
+        const qx = saves[base + a.QX], qy = saves[base + a.QY];
+        const qz = saves[base + a.QZ], qw = saves[base + a.QW];
+        const d = shortAngle(yawOfQuat(qx, qy, qz, qw), state.yaw) * 0.5;
+        const sn = Math.sin(d), cs = Math.cos(d);
+        // q' = rotY(d) * q — доворот вокруг мировой вертикали.
+        saves[base + a.QX] = cs * qx + sn * qz;
+        saves[base + a.QY] = cs * qy + sn * qw;
+        saves[base + a.QZ] = cs * qz - sn * qx;
+        saves[base + a.QW] = cs * qw - sn * qy;
+        saves[base + a.PX] = state.x;
+        saves[base + a.PZ] = state.z;
+        saves[base + a.VX] = state.vx;
+        saves[base + a.VZ] = state.vz;
+        host.carRestore(this.idx);
+    }
+
+    /**
+     * Полная пересинхронизация: кольца нет, класть в тело нечего, кроме
+     * того, что прислал сервер. Высота берётся от полотна — та самая, на
+     * которой машина стоит колёсами.
+     */
+    teleport(state, track) {
+        const host = this.host;
+        host._sync();
+        const a = this.abi.CarSave;
+        const saves = host.saves;
+        const base = this.idx * a.FLOATS;
+        for (let k = 0; k < a.FLOATS; k++) saves[base + k] = 0;
+        const surf = track.surface(state.x, state.z, state.sampleIdx);
+        saves[base + a.PX] = state.x;
+        saves[base + a.PY] = surf.y + this.restY;
+        saves[base + a.PZ] = state.z;
+        saves[base + a.QY] = Math.sin(state.yaw * 0.5);
+        saves[base + a.QW] = Math.cos(state.yaw * 0.5);
+        saves[base + a.VX] = state.vx;
+        saves[base + a.VZ] = state.vz;
+        host.carRestore(this.idx);
+    }
 }
 
 export default RapierHost;

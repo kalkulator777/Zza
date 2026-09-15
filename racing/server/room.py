@@ -29,6 +29,7 @@ import time
 from tornado.ioloop import IOLoop, PeriodicCallback
 
 from game import protocol
+from game import rapier_host
 
 from . import config
 from .player import sanitize_text
@@ -1132,6 +1133,14 @@ class Room(object):
                             'message': 'гонка не стартовала: %s' % exc})
             return False
 
+        # Физика Rapier считает не всё (§12.24): симуляция могла опустить
+        # часть настроек. Дальше по коду идут ТЕ настройки, по которым гонка
+        # реально поедет, — иначе HUD обещал бы бонусы, которых не будет.
+        race_settings = dict(getattr(sim, 'settings', None) or self.settings)
+        disabled = list(getattr(sim, 'disabled_features', ()) or ())
+        if disabled:
+            self._system_chat('Физика Rapier: %s (§12.24)' % ', '.join(disabled))
+
         self._cancel_champ_timer()
         self._sim = sim
         self._race_slots = tuple(p.slot for p in racers)
@@ -1165,11 +1174,20 @@ class Room(object):
             self._system_chat('Этап %d из %d: %s'
                               % (champ.stage_number(), champ.stages,
                                  content.track_name(self.settings['track'])))
+        # Трамплины при physics=rapier из записи трассы вынимаются (§12.24):
+        # в сетке полотна их нет, шаг 14б модулю неизвестен, и машина сквозь
+        # них проезжает. Оставить их нарисованными значило бы показать игроку
+        # прыжок, которого не будет, — честнее не рисовать вовсе.
+        track_payload = track.to_client()
+        if rapier_host.race_enabled() and track_payload.get('ramps'):
+            track_payload = dict(track_payload)
+            track_payload['ramps'] = []
+
         self.broadcast({
             't': 'race_init',
-            'track': track.to_client(),
+            'track': track_payload,
             'laps': self.settings['laps'],
-            'settings': dict(self.settings),
+            'settings': race_settings,
             'players': players_payload,
         })
         self.broadcast_state()
@@ -1337,6 +1355,12 @@ class Room(object):
         """
         store = self.manager.records
         if store is None or not store.enabled:
+            return
+        # Круг, проеханный на Rapier, в общую таблицу не идёт (§12.24):
+        # таблица рекордов разбита по трассе и машине, но не по физике, а
+        # времена у двух физик разные. Смешать их значит сделать таблицу
+        # бессмысленной для обеих.
+        if rapier_host.race_enabled():
             return
         slot = event.get('slot')
         record = store.submit(self.settings['track'], self.settings['mirror'],

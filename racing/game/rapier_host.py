@@ -24,15 +24,20 @@ wasm32 (§12.21). Импортов у модуля ноль, наружу тор
   ней не импортирует wasmtime и не создаёт ни одного объекта;
 * ``shadow`` — Rapier крутится ТЕНЬЮ рядом с гонкой: те же вводы, тот же
   темп, но состояние машин из него не берётся. Нужен, чтобы мерить цену
-  тика и сверять хэш мира на живой трассе, ничем не рискуя в гонке.
+  тика и сверять хэш мира на живой трассе, ничем не рискуя в гонке;
+* ``rapier`` — гонку считает Rapier (§12.24). ``game/physics.py`` при этом
+  не зовётся вовсе, а прогресс, круги и отсечки по-прежнему считает
+  ``game/track.py`` поверх позы из модуля: они игровые правила, а не физика,
+  и в f32 их затаскивать нельзя (§8.5 разведки).
 
-Смена физики на настоящую — этап 4c, здесь её нет намеренно.
+Умолчание — ``classic``, и оно обязано вести себя ровно как до 4b.
 """
 
 from __future__ import annotations
 
 import ctypes
 import importlib.util
+import math
 import os
 import struct
 import sys
@@ -48,7 +53,8 @@ WASM_PATH = os.path.join(BASE_DIR, 'native', 'testbed', 'racing_physics.wasm')
 ENV_VAR = 'RACING_PHYSICS'
 CLASSIC = 'classic'
 SHADOW = 'shadow'
-BACKENDS = (CLASSIC, SHADOW)
+RAPIER = 'rapier'
+BACKENDS = (CLASSIC, SHADOW, RAPIER)
 
 
 def backend() -> str:
@@ -58,7 +64,53 @@ def backend() -> str:
 
 
 def enabled() -> bool:
+    """Нужен ли процессу модуль физики вообще (тень ИЛИ настоящая гонка)."""
     return backend() != CLASSIC
+
+
+def race_enabled() -> bool:
+    """Считает ли гонку Rapier. Только при этом значении меняется заезд."""
+    return backend() == RAPIER
+
+
+# --- что Rapier пока не считает (§12.24) -------------------------------------
+#
+# Бонусы, поток машин и происшествия живут в game/items.py, game/traffic.py и
+# game/events.py и написаны под состояние старой физики: они правят x/z/vx/vz
+# и подменяют характеристики между шагами. У Rapier состояние машины лежит
+# внутри модуля, менять его снаружи между шагами нечем, а на половину
+# перенесённой механике играть хуже, чем без неё. Поэтому при physics=rapier
+# эти три настройки честно опускаются, и комната об этом СООБЩАЕТ.
+#
+# Столкновения в этом списке с другой стороны: их Rapier считает ВНУТРИ
+# шага, и выключить их нечем — групп столкновений в ABI нет. Галочка
+# «Столкновения» при этом режиме не врёт только принудительно включённой.
+#
+# (имя поля настроек, во что оно ставится, что сказать игроку)
+RESTRICTED = (
+    ('items_enabled', False, 'бонусы выключены'),
+    ('traffic', 'off', 'поток машин выключен'),
+    ('events', 'off', 'происшествия выключены'),
+    ('collisions', True, 'столкновения включены всегда'),
+)
+
+
+def restrict_settings(settings) -> list:
+    """Привести настройки к тому, что Rapier действительно считает.
+
+    Правит переданный словарь на месте, возвращает список фраз для игрока.
+    Пустой список — править было нечего, то есть игрок и не просил ничего
+    из этого.
+    """
+    off = []
+    for name, value, label in RESTRICTED:
+        if name not in settings:
+            continue
+        if settings[name] == value:
+            continue
+        settings[name] = value
+        off.append(label)
+    return off
 
 
 # --- модель управляемости ----------------------------------------------------
@@ -532,14 +584,274 @@ class ShadowWorld(object):
         }
 
 
+
+# --- гонку считает Rapier (§12.24) -------------------------------------------
+#
+# Холостые шаги после расстановки на решётке. §8.4 разведки: широкая фаза
+# обновляется ТОЛЬКО внутри pipeline.step, поэтому на первом шаге после
+# постройки мира лучи подвески не находят полотна и машина падает свободно.
+# Один шаг чинит луч, остальные дают подвеске осесть: без них гонка начинается
+# с просадки на сантиметр, и первый же снапшот уезжает от предсказания.
+SETTLE_TICKS = 24
+
+# Ниже этого под полотном машина считается выпавшей из мира и ставится
+# обратно на ось. Сеткой полотно закрыто (12.21), стены в ней настоящие, но
+# рельеф теперь тоже настоящий: на гребне машину может выкинуть за стену.
+FELL_THROUGH = 8.0
+
+# Занос: ниже этой скорости и этого угла скольжения флаг не поднимается.
+# Флаг едет в снапшот битом 1 и кормит звук, дым и HUD; у старой физики его
+# поднимал ручник вместе с шагом 15, здесь его приходится собрать из вывода
+# модуля, потому что состояния «идёт занос» у Rapier нет.
+DRIFT_MIN_SPEED = 4.0      # м/с
+DRIFT_MIN_SLIP = 0.12      # рад, около 7 градусов
+
+
+class RapierRace(object):
+    """Мир Rapier, из которого гонка БЕРЁТ состояние машин.
+
+    Что переносится сюда из раздела 6 и что остаётся на месте:
+
+    * шаги 1–13 (управление, силы, интегрирование) — внутри модуля;
+    * шаг 14 (границы полотна) — стены стоят в сетке, солвер держит их сам;
+      хозяину остаётся флаг ``offtrack`` (его читает HUD и снапшот) и сеть
+      безопасности на случай вылета за мир;
+    * шаг 14б (трамплины) — трамплинов в сетке нет, зато есть настоящий
+      рельеф: подъёмы тормозят, спуски разгоняют. ``height`` считается от
+      полотна, как и раньше, но её теперь диктует не геометрия трамплина,
+      а сама машина;
+    * шаг 15 (заряд заноса) — модуль копит ``drift_charge`` сам, НАГРАДЫ за
+      него нет: она даётся ускорением, а API «добавить импульс машине» у
+      модуля нет;
+    * шаг 16 (прогресс, круги, отсечки) — остаётся в ``game/track.py``
+      слово в слово. Это игровое правило, а не физика, и считать его надо
+      в f64 (§8.5 разведки);
+    * ``resolve_collisions`` — внутри шага модуля, отдельным проходом не
+      зовётся (§12.23 ожидал этого, §8.6 разведки это записал).
+    """
+
+    def __init__(self, sim, wasm_path: str = WASM_PATH):
+        self.sim = sim
+        track = sim.track
+        self.preset = preset_index(sim.settings.get('physics'))
+        self.mode = PRESET_NAMES[self.preset]
+        self.host = RapierHost(wasm_path, self.preset)
+        # Погода — единственное, чем правится покрытие в этом режиме: её
+        # множитель уезжает в ТРЕНИЕ СЕТКИ полотна. Живого крюка «сцепление
+        # этой машины на этом шаге» у модуля нет, поэтому масло и обломки
+        # сюда не переносятся, а честно выключаются (RESTRICTED).
+        margin, height, friction = mesh_params(track)
+        self.host.build_track(track, margin, height, friction * sim.grip_mul)
+        self.host.free_track_mesh()
+
+        self.slots = []          # (car, idx, in_base, out_base, rest_y)
+        for car in sim.cars:
+            state = car.state
+            self.host.tuning_preset(self.preset)
+            self.host.set_tuning(car_tuning(car.stats, self.mode))
+            tuning = self.host.tuning_values()
+            # Высота центра кузова, когда машина стоит колёсами на полотне:
+            # колесо плюс ход подвески плюс вынос точки крепления вниз
+            # (world.rs ставит её на -half_height * 0.2).
+            rest_y = (tuning['wheel_radius'] + tuning['suspension_rest']
+                      + tuning['half_height'] * 0.2)
+            steer_max = tuning['steer_max'] or 1.0
+            ground = track.surface(state.x, state.z, state.sample_idx)[3]
+            idx = self.host.spawn_car(state.x, ground + rest_y, state.z, state.yaw)
+            self.slots.append([car, idx, idx * abi.CarInput.FLOATS,
+                               idx * abi.CarOut.FLOATS, rest_y, 1.0 / steer_max])
+
+        self.ticks = 0
+        self.micros = []
+        self._settle()
+
+    # --- расстановка ----------------------------------------------------
+
+    def _settle(self):
+        """Дать подвеске осесть до первого тика гонки (§8.4 разведки)."""
+        host = self.host
+        host._sync()
+        inputs = host.inputs
+        for i in range(len(inputs)):
+            inputs[i] = 0.0
+        host._f_step(host._store, SETTLE_TICKS)
+        self._read_all()
+
+    def _teleport(self, idx: int, x: float, y: float, z: float, yaw: float) -> None:
+        """Поставить тело в точку: пишем слот сохранения и просим restore.
+
+        Отдельного «телепорта» в ABI нет и не надо: слот сохранения — это
+        и есть полное состояние тела, а ``rp_car_restore`` его применяет.
+        """
+        host = self.host
+        host._sync()
+        saves = host.saves
+        base = idx * abi.CarSave.FLOATS
+        for k in range(abi.CarSave.FLOATS):
+            saves[base + k] = 0.0
+        saves[base + abi.CarSave.PX] = x
+        saves[base + abi.CarSave.PY] = y
+        saves[base + abi.CarSave.PZ] = z
+        saves[base + abi.CarSave.QY] = math.sin(yaw * 0.5)
+        saves[base + abi.CarSave.QW] = math.cos(yaw * 0.5)
+        host.car_restore(idx)
+
+    def _retire(self, entry):
+        """Машина исчезла из гонки — убрать её тело с дороги.
+
+        Снять тело из мира модуль не умеет, а оставить его на полотне нельзя:
+        призрак, который уже никому не виден, продолжал бы расталкивать
+        живых. Уводим под мир и гасим скорости.
+        """
+        self._teleport(entry[1], 0.0, -500.0, 0.0, 0.0)
+
+    def _respawn(self, entry, state):
+        """Сеть безопасности: машина ушла из мира — вернуть её на ось."""
+        track = self.sim.track
+        i = state.sample_idx
+        x = track._cx[i]
+        z = track._cz[i]
+        y = track._cy[i] + entry[4]
+        yaw = math.atan2(track._ctx[i], track._ctz[i])
+        self._teleport(entry[1], x, y, z, yaw)
+        state.x = x
+        state.z = z
+        state.yaw = yaw
+        state.vx = 0.0
+        state.vz = 0.0
+        state.height = 0.0
+        state.v_vert = 0.0
+        state.airborne = False
+
+    # --- горячий путь ---------------------------------------------------
+
+    def step_cars(self, dt, events):
+        """Подменяет ``Simulation._step_cars``: старая физика не зовётся."""
+        host = self.host
+        host._sync()
+        inputs = host.inputs
+        for entry in self.slots:
+            car = entry[0]
+            if car.removed:
+                continue
+            if car.ghost:
+                left = car.ghost_time - dt
+                if left <= 0.0:
+                    car.ghost_time = 0.0
+                    car.removed = True
+                    self._retire(entry)
+                    continue
+                car.ghost_time = left
+                buttons = 0
+            else:
+                buttons = car.buttons
+            base = entry[2]
+            inputs[base + abi.CarInput.THROTTLE] = 1.0 if buttons & BTN_THROTTLE else 0.0
+            inputs[base + abi.CarInput.BRAKE] = 1.0 if buttons & BTN_BRAKE else 0.0
+            steer = 0.0
+            if buttons & BTN_LEFT:
+                steer += 1.0
+            if buttons & BTN_RIGHT:
+                steer -= 1.0
+            inputs[base + abi.CarInput.STEER] = steer
+            inputs[base + abi.CarInput.HANDBRAKE] = 1.0 if buttons & BTN_DRIFT else 0.0
+        started = time.perf_counter()
+        host._f_step(host._store, 1)
+        self.micros.append((time.perf_counter() - started) * 1e6)
+        self.ticks += 1
+        self._read_all()
+
+    def _read_all(self):
+        """Поза из модуля -> CarState, затем шаг 16 из game/track.py."""
+        host = self.host
+        out = host.outputs
+        track = self.sim.track
+        surface = track.surface
+        advance = track.advance_progress
+        o = abi.CarOut
+        wheel_steer = o.WHEELS + abi.WheelOut.STEERING
+        for entry in self.slots:
+            car = entry[0]
+            if car.removed:
+                continue
+            state = car.state
+            base = entry[3]
+            x = out[base + o.PX]
+            y = out[base + o.PY]
+            z = out[base + o.PZ]
+            state.x = x
+            state.z = z
+            state.yaw = out[base + o.YAW]
+            state.vx = out[base + o.VX]
+            state.vz = out[base + o.VZ]
+            state.v_vert = out[base + o.VY]
+            state.steer = out[base + wheel_steer] * entry[5]
+            state.drift_charge = out[base + o.DRIFT_CHARGE]
+            state.drift_dir = int(out[base + o.DRIFT_DIR])
+            grounded = out[base + o.WHEELS_ON_GROUND]
+            state.airborne = grounded == 0.0
+            slip = out[base + o.SLIP_ANGLE]
+            if slip < 0.0:
+                slip = -slip
+            speed = out[base + o.SPEED]
+            state.drift_active = (slip > DRIFT_MIN_SLIP
+                                  and speed > DRIFT_MIN_SPEED
+                                  and grounded > 0.0)
+            # Шаг 14 остался модулю: стены стоят в сетке. Хозяину нужен
+            # только флаг «вне полотна» — его читают снапшот и HUD.
+            i, lateral, half_width, ground, _pitch = surface(x, z, state.sample_idx)
+            state.sample_idx = i
+            state.offtrack = lateral > half_width or lateral < -half_width
+            height = y - ground - entry[4]
+            state.height = height if height > 0.0 else 0.0
+            if height < -FELL_THROUGH:
+                self._respawn(entry, state)
+            # Шаг 16 — слово в слово прежний, в f64 и в game/track.py.
+            advance(state, i)
+
+    def noop_collisions(self):
+        """Подменяет ``Simulation._resolve_collisions``: считать нечего.
+
+        Столкновения машина-машина Rapier делает внутри шага. Болванок
+        потока в его мире нет — поток при этом режиме выключен (RESTRICTED),
+        поэтому и второго участника у прохода не осталось.
+        """
+        return
+
+    # --- замеры ---------------------------------------------------------
+
+    def stats(self) -> dict:
+        rows = sorted(self.micros)
+        if not rows:
+            return {'ticks': 0}
+        return {
+            'ticks': self.ticks,
+            'cars': len(self.slots),
+            'mean_us': sum(rows) / len(rows),
+            'p50_us': rows[len(rows) // 2],
+            'p99_us': rows[min(len(rows) - 1, int(len(rows) * 0.99))],
+            'max_us': rows[-1],
+            'world_hash': self.host.world_hash(),
+        }
+
+
 def attach(sim):
-    """Подвесить теневой мир к симуляции. Возвращает ShadowWorld или None.
+    """Подвесить мир Rapier к симуляции. Возвращает ShadowWorld/RapierRace.
 
     Горячий путь выбирается здесь и только здесь: метод ``_step_cars``
     подменяется на экземпляре. При выключенном флаге ни эта функция, ни
     wasmtime не трогаются вовсе — ``game/sim.py`` зовёт прежний метод,
     и ни одной лишней проверки за тик не появляется.
     """
+    if race_enabled():
+        world = RapierRace(sim)
+        sim._step_cars = world.step_cars
+        # Столкновения машина-машина Rapier делает ВНУТРИ шага (§8.6
+        # разведки). Прежний отдельный проход обязан замолчать: он работает
+        # по состоянию, которое модуль на следующем шаге всё равно перепишет,
+        # то есть только тратил бы тик и врал бы клиенту.
+        sim._resolve_collisions = world.noop_collisions
+        return world
     world = ShadowWorld(sim)
     world._classic = sim._step_cars
     sim._step_cars = world.step_cars

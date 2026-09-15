@@ -311,6 +311,10 @@ class GameSocket(tornado.websocket.WebSocketHandler):
             'is_host': player.is_host,
             'server_name': self.ctx.server_name,
             'content': self.ctx.content.welcome_content,
+            # Какая физика считает гонку на этом сервере (§12.24). Клиент
+            # обязан предсказывать ТОЙ ЖЕ, а модуль качается заранее —
+            # поэтому значение едет в welcome, а не в race_init.
+            'physics_backend': rapier_host.backend(),
         })
         player.send_event(self.ctx.manager.rooms_event())
         player.start_ping(time.monotonic())

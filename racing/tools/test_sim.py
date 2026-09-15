@@ -299,6 +299,18 @@ def check_generated(report):
     report.check(_config.DEFAULT_SETTINGS['physics'] == _rh.PRESET_NAMES[0],
                  'умолчание физики в настройках комнаты — аркада',
                  _config.DEFAULT_SETTINGS['physics'])
+    # Что Rapier не считает и потому опускает (§12.24). Имя поля, которого нет
+    # в настройках комнаты, опустить нельзя — оно молча ничего не выключит,
+    # и игрок поедет с бонусами, которых симуляция не считает.
+    from server import room as _room
+    known = set(_config.DEFAULT_SETTINGS) | {name for name, _v, _c, _t in _room.ROAD_FIELDS}
+    unknown = [name for name, _value, _label in _rh.RESTRICTED if name not in known]
+    report.check(not unknown,
+                 'все поля, опускаемые при physics=rapier, есть в настройках комнаты',
+                 'нет таких полей: %s' % ', '.join(unknown) if unknown else '')
+    report.check(_rh.RAPIER in _rh.BACKENDS and _rh.backend() == _rh.CLASSIC,
+                 'умолчание флага физики — classic, значение rapier объявлено',
+                 'флаг сейчас %r' % _rh.backend())
     # Настройки машин каталога: под оба режима у всех пяти, имена полей —
     # поля CarTuning выпущенной раскладки (проверяет game/cars.py при загрузке).
     from game import cars as _cars

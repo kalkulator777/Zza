@@ -208,6 +208,12 @@ class Simulation(object):
     def __init__(self, track, settings, players):
         self.track = track
         self.settings = dict(settings) if settings else {}
+        # При physics=rapier часть механик честно опускается (§12.24): они
+        # написаны под состояние старой физики, а наполовину перенесённые
+        # были бы хуже выключенных. Настройки правятся ЗДЕСЬ, до того как по
+        # ним заводятся подсистемы, и комната рассказывает об этом игрокам.
+        self.disabled_features = (rapier_host.restrict_settings(self.settings)
+                                  if rapier_host.race_enabled() else [])
         self.tick_no = 0
         self.race_time = 0.0
 

@@ -150,6 +150,21 @@ PREDICT_P95_MAX = 3.00         # хвост на медленном стенде
                                # от кадра к кадру, поэтому он тут страховка
                                # от грубой поломки, а работает медиана
 PREDICT_OVER_EPS_MAX = 0.40    # доля снапшотов, где потребовалась коррекция
+# Тот же порог для --physics rapier, и он ВЫШЕ не для того, чтобы прогон
+# позеленел, а потому что мерит там другое. В классике клиент повторяет
+# сервер до бита, и доля 21 % — это только просадки кадрового цикла стенда.
+# У Rapier коррекция неполная: снапшот не везёт ни крена, ни угловой
+# скорости (раздел 5.3), а переигровка не бит в бит (§8.3 разведки), поэтому
+# после каждой просадки остаётся хвост в пару сантиметров. Замерено спина
+# к спине на одном стенде (§12.24): классика 21 %, медиана 0,007–0,008 м;
+# Rapier 29–41 % при медиане 0,027–0,034 м и p99 0,19–0,24 м. Порог 0,60
+# оставляет полтора запаса над худшим виденным прогоном и всё ещё ловит
+# грубую поломку — при ней доля уходит за 90 %.
+PREDICT_OVER_EPS_RAPIER = 0.60
+
+# Какой физикой поднят сервер этого прогона: ключ --physics. Модульная
+# переменная, а не аргумент через пять вызовов: её читает ровно одна проверка.
+PHYSICS = 'classic'
 DIVERGE_MEDIAN_MAX = 0.05
 DIVERGE_P95_MAX = 0.10
 
@@ -339,9 +354,12 @@ class Server(object):
     # Тornado с pretty logging печатает ошибки как «[E 260914 18:35:57 ...]».
     ERROR_RE = re.compile(r'^\[E \d', re.M)
 
-    def __init__(self, port, verbose=False):
+    def __init__(self, port, verbose=False, physics=None):
         self.port = port
         self.verbose = verbose
+        # Какой физикой сервер считает гонку (§12.22, §12.24). None — не
+        # передавать ключ вовсе, то есть ровно прежний прогон.
+        self.physics = physics
         self.proc = None
         self.lines = []
         self._reader = None
@@ -353,6 +371,8 @@ class Server(object):
         cmd = [sys.executable, 'run.py', '--no-browser',
                '--port', str(self.port), '--bind', '127.0.0.1',
                '--name', 'Приёмка']
+        if self.physics:
+            cmd += ['--physics', self.physics]
         try:
             self.proc = subprocess.Popen(
                 cmd, cwd=BASE_DIR, stdout=subprocess.PIPE,
@@ -1416,15 +1436,19 @@ def measure_stage(report, host, guest, host_slot, guest_slot):
             continue
         median = percentile(rec, 0.5)
         p95 = percentile(rec, 0.95)
+        # p99 порогом не служит (хвост короткий и шумный), но печатается:
+        # им меряют физику Rapier, где расхождение живёт именно в хвосте.
+        p99 = percentile(rec, 0.99)
         over = sum(1 for v in rec if v > 0.05) / len(rec)
+        over_max = (PREDICT_OVER_EPS_RAPIER if PHYSICS == 'rapier'
+                    else PREDICT_OVER_EPS_MAX)
         report.check(median <= PREDICT_MEDIAN_MAX and p95 <= PREDICT_P95_MAX
-                     and over <= PREDICT_OVER_EPS_MAX,
+                     and over <= over_max,
                      '%s предсказывает себя верно: расхождение с авторитетом '
-                     'медиана %.3f м, p95 %.3f м, сверх 0,05 м — %.0f %% из %d '
-                     'снапшотов (пороги %.2f м, %.2f м, %.0f %%)'
-                     % (client.name, median, p95, over * 100.0, len(rec),
-                        PREDICT_MEDIAN_MAX, PREDICT_P95_MAX,
-                        PREDICT_OVER_EPS_MAX * 100.0))
+                     'медиана %.3f м, p95 %.3f м, p99 %.3f м, сверх 0,05 м — '
+                     '%.0f %% из %d снапшотов (пороги %.2f м, %.2f м, %.0f %%)'
+                     % (client.name, median, p95, p99, over * 100.0, len(rec),
+                        PREDICT_MEDIAN_MAX, PREDICT_P95_MAX, over_max * 100.0))
 
     # Половина вторая: хозяин против сервера — там ли он рисует гостя.
     guest_data = data['guest']
@@ -1925,11 +1949,18 @@ def parse_args(argv=None):
                              '(по умолчанию не сохраняются)')
     parser.add_argument('--no-browser', action='store_true',
                         help='не открывать браузер: только серверная проверка')
+    parser.add_argument('--physics', default=None,
+                        help='чем сервер считает гонку: classic (умолчание), '
+                             'shadow или rapier. Ключ уезжает в run.py как '
+                             'есть; при rapier бонусов в заезде нет (§12.24), '
+                             'и проверки бонусов прогон пропускает')
     return parser.parse_args(argv)
 
 
 def main(argv=None):
+    global PHYSICS
     args = parse_args(argv)
+    PHYSICS = args.physics or 'classic'
     report = Report(args.verbose)
 
     shots_dir = None
@@ -1942,7 +1973,7 @@ def main(argv=None):
             return 2
 
     port = args.port or free_port()
-    server = Server(port, args.verbose)
+    server = Server(port, args.verbose, args.physics)
     broken = None
     try:
         print('Приёмка: порт %d, трасса %s, кругов %d'

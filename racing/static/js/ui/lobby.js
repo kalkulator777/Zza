@@ -42,6 +42,10 @@ import {
     trackIconSvg,
     timeOfDayIconSvg,
     weatherIconSvg,
+    ROOM_PHYSICS,
+    ROOM_PHYSICS_LABELS,
+    ROOM_PHYSICS_DESC,
+    physicsIconSvg,
     ROOM_TIMES_OF_DAY,
     ROOM_TOD_LABELS,
     ROOM_WEATHERS,
@@ -207,6 +211,10 @@ export class LobbyScreen {
 
     /** Событие `welcome`: машины, цвета и трассы сервера. */
     applyWelcome(msg) {
+        // Какой физикой сервер считает гонку (§12.24). От этого зависит,
+        // показывать ли переключатель модели: см. комментарий у ряда.
+        this.physicsBackend = msg.physics_backend || 'classic';
+        this._showPhysicsRow(this.physicsBackend === 'rapier');
         this.content = msg.content || null;
         this.cars = (this.content && this.content.cars) || [];
         this.colors = (this.content && this.content.colors) || [];
@@ -602,6 +610,19 @@ export class LobbyScreen {
         this.weatherButtons = weather.buttons;
         this.weatherHint = weather.hint;
 
+        // Модель физики (§12.23). Ряд того же механизма, что погода, но с
+        // одной особенностью: он показывается ТОЛЬКО когда сервер считает
+        // гонку Rapier (--physics rapier). При прежней физике режим не
+        // меняет в заезде ничего, и переключатель врал бы игроку — ровно
+        // поэтому его не было до 4e.
+        const phys = this._buildEnvRow(body, 'Модель физики', ROOM_PHYSICS,
+            ROOM_PHYSICS_LABELS, physicsIconSvg,
+            (id) => this._pushSettings({ physics: id }));
+        this.physicsRow = phys;
+        this.physicsButtons = phys.buttons;
+        this.physicsHint = phys.hint;
+        this._showPhysicsRow(false);
+
         // Поток машин и происшествия на дороге. Это настройки комнаты, и
         // меняет их владелец в лобби — так же, как время суток и погоду.
         // Умолчания от карты у них нет (поток и ДТП — режим игры, а не
@@ -763,7 +784,8 @@ export class LobbyScreen {
      * переноситься на вторую строку, а стили трогать нельзя.
      */
     _buildEnvRow(body, title, values, labels, iconSvg, onPick) {
-        body.appendChild(el('div', 'label', title));
+        const label = el('div', 'label', title);
+        body.appendChild(label);
         const row = el('div', 'set-track-row');
         const wide = values.length > 3;
         if (wide) row.style.gridTemplateColumns = 'repeat(' + values.length + ', 1fr)';
@@ -786,7 +808,16 @@ export class LobbyScreen {
         // с предложением карты видно строкой, а не остаётся сюрпризом.
         const hint = el('div', 'gfx-hint');
         body.appendChild(hint);
-        return { row: row, buttons: buttons, hint: hint };
+        return { label: label, row: row, buttons: buttons, hint: hint };
+    }
+
+    /** Показать или спрятать ряд модели физики целиком, вместе с подписью. */
+    _showPhysicsRow(on) {
+        const row = this.physicsRow;
+        if (!row) return;
+        row.label.hidden = !on;
+        row.row.hidden = !on;
+        row.hint.hidden = !on;
     }
 
     _buildMiniStepper(min, max, onChange) {
@@ -1096,6 +1127,13 @@ export class LobbyScreen {
             settings.traffic, settings.traffic, ROOM_TRAFFIC_LABELS);
         this._syncEnvRow(this.eventButtons, this.eventHint,
             settings.events, settings.events, ROOM_EVENT_LABELS);
+        // У модели физики предложения карты нет и быть не может, зато есть
+        // что сказать про руль в руках: подсказка — описание выбранного.
+        this._syncEnvRow(this.physicsButtons, this.physicsHint,
+            settings.physics, settings.physics, ROOM_PHYSICS_LABELS);
+        if (this.physicsHint) {
+            this.physicsHint.textContent = ROOM_PHYSICS_DESC[settings.physics] || '';
+        }
     }
 
     _syncEnvRow(buttons, hint, chosen, proposed, labels) {
@@ -1156,6 +1194,7 @@ export class LobbyScreen {
         this._setEnvRowEditable(this.weatherButtons, editable);
         this._setEnvRowEditable(this.trafficButtons, editable);
         this._setEnvRowEditable(this.eventButtons, editable);
+        this._setEnvRowEditable(this.physicsButtons, editable);
         for (let i = 0; i < this.itemButtons.length; i++) {
             this.itemButtons[i].node.disabled = !editable || !this.itemsEnabledInput.checked;
         }

@@ -9,6 +9,7 @@
     python3 run.py --records /srv/racing/records.json   # где хранить рекорды
     python3 run.py --no-records                         # не хранить их вовсе
     python3 run.py --physics shadow    # рядом с гонкой крутится мир Rapier
+    python3 run.py --physics rapier    # гонку считает Rapier (§12.24)
 
 Запустивший получает ссылку с токеном хоста; остальные заходят на
 http://<ip-этой-машины>:<порт>. Адреса, которые надо диктовать соседям,
@@ -69,7 +70,9 @@ def parse_args(argv=None):
                         default=rapier_host.backend(),
                         help='какая физика считает гонку: classic — прежняя '
                              '(умолчание), shadow — прежняя плюс мир Rapier '
-                             'рядом, для замеров и сверки хэша')
+                             'рядом, для замеров и сверки хэша, rapier — '
+                             'гонку считает Rapier (бонусов, потока и '
+                             'происшествий при нём нет, §12.24)')
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error('порт вне диапазона 1..65535')
@@ -111,7 +114,10 @@ def print_banner(args, host_url, addresses, notes):
     print('  Обнаружение других серверов: UDP %d' % config.DISCOVERY_PORT)
     print('  Рекорды кругов: %s' % (args.records if not args.no_records else 'выключены'))
     print('  Комнату может создать любой, кто зашёл на этот сервер')
-    if args.physics != rapier_host.CLASSIC:
+    if args.physics == rapier_host.RAPIER:
+        print('  Физика: ГОНКУ СЧИТАЕТ RAPIER (§12.24).')
+        print('          Бонусов, потока машин и происшествий в этом режиме нет.')
+    elif args.physics != rapier_host.CLASSIC:
         print('  Физика: %s — мир Rapier крутится РЯДОМ с гонкой (§12.22)' % args.physics)
     for note in notes:
         print('  ! %s' % note)

@@ -339,6 +339,9 @@ function onWelcome(msg) {
     // 12.8: в welcome слот почти всегда null, боевое значение придёт в room.you.
     setLocalSlot(msg.slot === undefined || msg.slot === null ? -1 : msg.slot | 0);
     setScreen(SCREEN_MENU);
+    // Сервер сказал, какой физикой он считает гонку (§12.24). Модуль качается
+    // ЗДЕСЬ, пока игрок в меню, — к старту он уже готов.
+    bootRapier(msg.physics_backend);
 }
 
 function onRooms(msg) {
@@ -439,7 +442,9 @@ function onRaceInit(msg) {
 
     // Полотно теневому миру — из того же объекта трассы, что ушёл рендеру:
     // квантованная осевая линия и есть вход физики (§12.21).
-    if (rapierHost) rapierHost.buildTrack(net.track || msg.track);
+    // Только теневой режим: при rapier мир под гонку строит net.js вместе
+    // с расстановкой своей машины, и второй раз его строить нельзя.
+    if (rapierHost && rapierHost.buildTrack) rapierHost.buildTrack(net.track || msg.track);
 
     setScreen(SCREEN_RACE);
 }
@@ -1134,17 +1139,36 @@ function wsUrl() {
     return proto + '//' + location.host + '/ws';
 }
 
-// --- вторая физика за флагом (§12.22) ---------------------------------------
+// --- вторая физика за флагом (§12.22, §12.24) -------------------------------
 //
-// ?physics=shadow подгружает хозяина модуля Rapier и строит им полотно
-// текущей гонки. Кадровый цикл о нём не знает: предсказание своей машины
-// по-прежнему считает static/js/physics.js. Без флага модуль даже не
-// скачивается — ни одного лишнего килобайта и ни одной проверки в кадре.
+// КАКАЯ физика считает гонку, решает сервер, и он же говорит об этом в
+// welcome.physics_backend. Адресная строка тут ни при чём: клиент, который
+// предсказывает не тем движком, что сервер, — это не режим, а рассинхрон.
+// ?physics=... оставлен только как ручной перебив для стенда.
+//
+//   shadow — хозяин грузится и строит полотно, гонку по-прежнему считает
+//            static/js/physics.js: это стенд для замеров;
+//   rapier — своя машина предсказывается миром Rapier, и net.js переключает
+//            на него шаг и переигровку.
+//
+// При classic модуль даже не скачивается: ни одного лишнего килобайта.
 let rapierHost = null;
 
-function bootRapier() {
-    const wanted = new URLSearchParams(location.search).get('physics');
-    if (!wanted || wanted === 'classic') return;
+function bootRapier(backend) {
+    const forced = new URLSearchParams(location.search).get('physics');
+    const wanted = forced || backend || 'classic';
+    if (wanted === 'classic' || rapierHost !== null) return;
+    if (wanted === 'rapier') {
+        import('./rapier_host.js').then((mod) => mod.RapierLocal.load({})).then((local) => {
+            rapierHost = local;
+            window.__racing.rapier = local;
+            net.attachRapier(local);
+            console.log('Rapier: гонку считает он, dt=' + local.host.dt);
+        }).catch((err) => {
+            console.error('Rapier: хозяин не загрузился —', err);
+        });
+        return;
+    }
     import('./rapier_host.js').then((mod) => mod.RapierHost.load({})).then((host) => {
         rapierHost = host;
         window.__racing.rapier = host;
@@ -1200,7 +1224,9 @@ function boot() {
         menu: menu,
     };
 
-    bootRapier();
+    // Сервер сам скажет, какой физикой он считает гонку (welcome). До неё
+    // грузить нечего; ?physics=... на стенде срабатывает сразу.
+    bootRapier(null);
 }
 
 boot();

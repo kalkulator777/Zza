@@ -159,7 +159,13 @@ python3 tools/test_physics_parity.py   # сверка физики Python и JS
 python3 tools/preview_track.py office  # сводка по трассе и рисунок в SVG
 python3 tools/test_sim.py              # прогон гонки с ботами
 python3 tools/smoke_test.py            # сервер плюс браузер, сквозная проверка
+python3 tools/smoke_test.py --physics rapier   # то же, но гонку считает Rapier
 ```
+
+Физика выбирается ключом `run.py --physics`: `classic` (умолчание, прежняя
+арифметика), `shadow` (прежняя плюс мир Rapier рядом, для замеров) и `rapier`
+(гонку считает Rapier). В режиме `rapier` бонусов, потока машин и происшествий
+нет, а круги не идут в таблицу рекордов — подробности в DESIGN.md, 12.24.
 
 ## Состояние
 

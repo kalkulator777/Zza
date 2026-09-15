@@ -22,6 +22,10 @@ export class CarSpec {
         this.bars = row.bars || { speed: 3, accel: 3, grip: 3, weight: 3 };
         this.stats = row.stats || null;
         this.shape = row.shape || null;
+        // Правки CarTuning под Rapier (§12.23): едут рядом со stats по той же
+        // причине — предсказывать чужими числами нельзя. Классике поле не
+        // нужно и ею не читается.
+        this.tuning = row.tuning || null;
         // Фактический потолок скорости: корень уравнения
         // engine_force*(1 - v/max_speed) = drag*v^2 + roll*v.
         // max_speed — опорная скорость двигателя, а не достижимая; HUD и лобби

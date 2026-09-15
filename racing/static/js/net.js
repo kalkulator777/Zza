@@ -69,9 +69,15 @@ import {
     ROAD_BLOCKADE,
     ROAD_PHASE_ACTIVE,
     ROAD_PHASE_DEBRIS,
+    BTN_THROTTLE,
+    BTN_BRAKE,
+    BTN_LEFT,
+    BTN_RIGHT,
+    BTN_DRIFT,
 } from './protocol.js';
 
-import { DT, createCarState, createCarStats, step as physicsStep } from './physics.js';
+import { DT, createCarState, createCarStats, step as physicsStep,
+         WEATHER_GRIP } from './physics.js';
 import { Track } from './track.js';
 import { getCatalog } from './cars.js';
 
@@ -80,6 +86,17 @@ import { getCatalog } from './cars.js';
 // ---------------------------------------------------------------------------
 
 export const RECONCILE_EPS = 0.05;      // м, ниже расхождение не трогаем
+// Тот же порог для режима rapier — и он НИЖЕ не по вкусу, а по замеру.
+//
+// В классике коррекция восстанавливает состояние ПОЛНОСТЬЮ: снапшот везёт
+// все поля, которыми шаг распоряжается, и переигровка в f64 повторяет
+// сервер до бита. У Rapier состояние тела шире снапшота: крена, тангажа,
+// вертикальной и угловой скорости в нём нет (раздел 5.3), а переигровка
+// вдобавок не бит в бит (§8.3 разведки). Поэтому после коррекции остаётся
+// хвост, и чем реже корректировать, тем выше он успевает подняться.
+// Замерено сквозным прогоном: при 0,05 медиана расхождения 0,032–0,036 м,
+// при 0,02 — см. 12.24. Платим переигровкой чаще, выигрываем полосу.
+export const RECONCILE_EPS_RAPIER = 0.02;
 export const RECONCILE_SMOOTH = 0.15;   // с, за это время гасится видимый сдвиг
 export const INTERP_DELAY = 100;        // мс, на сколько отстаёт показ чужих
 export const EXTRAPOLATE_MAX = 250;     // мс, дальше экстраполяции — заморозка
@@ -133,6 +150,13 @@ const CLOCK_RESYNC_GAP = 250;           // мс, выше этого разры�
 const CLOCK_RESYNC_HITS = 20;           // столько замеров подряд — и окно сбрасывается
 
 const TAU = Math.PI * 2;
+
+// Биты ввода одним объектом: RapierLocal.step разбирает маску по нему и не
+// тянет protocol.js к себе. Числа те же, из protocol.js, копии нет.
+const BTN_MASK = Object.freeze({
+    THROTTLE: BTN_THROTTLE, BRAKE: BTN_BRAKE,
+    LEFT: BTN_LEFT, RIGHT: BTN_RIGHT, DRIFT: BTN_DRIFT,
+});
 
 // ---------------------------------------------------------------------------
 // Траффик и происшествия на дороге
@@ -368,6 +392,13 @@ export class NetClient {
         this.ping = 0;
         this.serverPing = 0;            // что намерял сервер, приходит в room
 
+        // Гонку считает Rapier (§12.24): мир своей машины и последний
+        // race_init, по которому его строить. При умолчальном флаге оба
+        // поля так и остаются null, и горячий путь идёт мимо них.
+        this.rapier = null;
+        this.raceInitMsg = null;
+        this.physicsBackend = 'classic';
+
         this.reconcileError = 0;        // м, последнее расхождение
         this.reconcileMax = 0;
         this.reconcileCount = 0;
@@ -578,7 +609,49 @@ export class NetClient {
         this.slotToken = msg.slot_token || '';
         this.isHost = !!msg.is_host;
         this.serverName = msg.server_name || '';
+        // Какая физика считает гонку на ЭТОМ сервере (§12.24). Предсказывать
+        // надо той же: адресная строка тут не при чём, выбор делает сервер.
+        this.physicsBackend = msg.physics_backend || 'classic';
         if (this.h.onWelcome) this.h.onWelcome(msg);
+    }
+
+    /**
+     * Подвесить мир Rapier: с этого момента своя машина предсказывается им
+     * (§12.24). Зовётся ОДИН раз, из main.js, когда модуль догрузился.
+     * Гонка могла успеть начаться — тогда мир строится сразу.
+     */
+    attachRapier(local) {
+        this.rapier = local;
+        if (local && this.track && this.raceInitMsg) {
+            this._beginRapierRace(this.raceInitMsg);
+        }
+    }
+
+    /** Построить мир Rapier под гонку из race_init. */
+    _beginRapierRace(msg) {
+        const local = this.rapier;
+        const players = msg.players || [];
+        let mine = null;
+        for (let i = 0; i < players.length; i++) {
+            if (players[i].slot === this.localSlot) { mine = players[i]; break; }
+        }
+        const spec = getCatalog().resolve(mine ? mine.car : null);
+        const grid = (mine && mine.grid) ? mine.grid : { x: 0, z: 0, yaw: 0 };
+        const settings = msg.settings || {};
+        const grip = WEATHER_GRIP[settings.weather];
+        try {
+            local.beginRace(this.track, spec, settings.physics || 'arcade',
+                            grip === undefined ? 1 : grip, INPUT_RING, grid);
+            local.readInto(this.state, this.track);
+            this.prevX = this.state.x;
+            this.prevZ = this.state.z;
+            this.prevYaw = this.state.yaw;
+        } catch (err) {
+            // Мир не построился — гонка не должна из-за этого встать. Своя
+            // машина будет ехать по одним снапшотам, рывками, но поедет.
+            local.ready = false;
+            console.error('Rapier: мир под гонку не построился —', err);
+        }
     }
 
     /**
@@ -716,6 +789,12 @@ export class NetClient {
         this._resetPause();
         this._resetPrediction();
         this._resetSnapshots();
+
+        // Гонку считает Rapier (§12.24): мир под неё строится здесь, на тех же
+        // числах трассы, что у сервера. Если модуль ещё качается, мир построит
+        // attachRapier() — до тех пор своя машина идёт по снапшотам.
+        this.raceInitMsg = msg;
+        if (this.rapier) this._beginRapierRace(msg);
 
         if (this.h.onRaceInit) this.h.onRaceInit(msg);
     }
@@ -1150,7 +1229,10 @@ export class NetClient {
         const err = Math.sqrt(dx * dx + dz * dz);
         this.reconcileError = err;
         if (err > this.reconcileMax) this.reconcileMax = err;
-        if (err <= RECONCILE_EPS) return;   // пункт 3: расхождение мало — не трогаем
+        // Пункт 3: расхождение мало — не трогаем. Порог у Rapier свой, ниже:
+        // его коррекция неполная, и хвост надо снимать чаще (см. константу).
+        const eps = this.rapier !== null ? RECONCILE_EPS_RAPIER : RECONCILE_EPS;
+        if (err <= eps) return;
 
         this.reconcileCount++;
 
@@ -1161,7 +1243,15 @@ export class NetClient {
 
         // Пункт 4: подставить авторитетное состояние на этот момент...
         this._restoreState(slot);
+        const rapier = this.rapier;
+        if (rapier !== null) rapier.restoreRing(slot);
         this._applyAuthoritative(snap, idxInSnap);
+        // ...и в само тело Rapier: крен, тангаж и угловую скорость снапшот
+        // не везёт, поэтому они остаются своими, а курс доворачивается.
+        if (rapier !== null) {
+            rapier.applyAuthoritative(this.state);
+            rapier.saveRing(slot);
+        }
         this._recordState(slot);
 
         // ...и переиграть сохранённые вводы с base + 1 до текущего seq.
@@ -1179,6 +1269,13 @@ export class NetClient {
             // с происшествиями: иначе машина, стоящая в масле, каждую
             // реконсиляцию переигрывалась бы по сухому сцеплению и
             // расхождение не гасло бы, а копилось.
+            if (rapier !== null) {
+                rapier.step(buttons[i], BTN_MASK);
+                rapier.readInto(state, track);
+                this._recordState(i);
+                rapier.saveRing(i);
+                continue;
+            }
             let replayStats = stats;
             if (road) {
                 const scale = this.roadGrip(state);
@@ -1223,6 +1320,11 @@ export class NetClient {
         const state = this.state;
         if (this.track) {
             state.sampleIdx = this.track.nearestIndex(state.x, state.z, state.sampleIdx);
+        }
+        // Кольца больше нет — телу Rapier тоже нечего восстанавливать:
+        // ставим его туда, где машину видит сервер, колёсами на полотно.
+        if (this.rapier !== null && this.rapier.ready && this.track) {
+            this.rapier.teleport(state, this.track);
         }
         this.prevX = state.x;
         this.prevZ = state.z;
@@ -1446,9 +1548,20 @@ export class NetClient {
             const scale = this.roadGrip(state);
             if (scale < 1) stats = this._slippery(scale);
         }
-        // step() включает шаги 14 (границы) и 16 (progress) — им передан track.
-        physicsStep(state, stats, buttons, DT, this.track, state.sampleIdx);
-        if (this.roadCount > 0) this.roadAfterStep(state);
+        const rapier = this.rapier;
+        if (rapier !== null) {
+            // Гонку считает Rapier: шаг делает модуль, прогресс и круги —
+            // по-прежнему track.js (§8.5 разведки: в f32 их тащить нельзя).
+            // Пока мир не построен, предсказывать нечем: ввод всё равно
+            // уходит, а машину ведёт авторитет сервера.
+            if (!rapier.ready) return this._sendInput(buttons);
+            rapier.step(buttons, BTN_MASK);
+            rapier.readInto(state, this.track);
+        } else {
+            // step() включает шаги 14 (границы) и 16 (progress) — им передан track.
+            physicsStep(state, stats, buttons, DT, this.track, state.sampleIdx);
+            if (this.roadCount > 0) this.roadAfterStep(state);
+        }
 
         const seq = this.seq + 1;
         this.seq = seq;
@@ -1456,12 +1569,29 @@ export class NetClient {
         this.ringButtons[i] = buttons;
         this.ringStamp[i] = now();
         this._recordState(i);
+        if (rapier !== null) rapier.saveRing(i);
 
         const ws = this.ws;
         if (ws && ws.readyState === 1) {
             // Бинарный кадр обязателен (раздел 5, 12.6).
             ws.send(encodeInput(seq, buttons));
         }
+    }
+
+    /**
+     * Ввод без предсказания: мир Rapier ещё не построен. Номер всё равно
+     * растёт, иначе сервер не примет следующий пакет, а кольцо помечается
+     * негодным — переигрывать по нему нечего.
+     */
+    _sendInput(buttons) {
+        const seq = this.seq + 1;
+        this.seq = seq;
+        const i = seq % INPUT_RING;
+        this.ringButtons[i] = buttons;
+        this.ringStamp[i] = now();
+        this.ringValid[i] = 0;
+        const ws = this.ws;
+        if (ws && ws.readyState === 1) ws.send(encodeInput(seq, buttons));
     }
 
     /**
