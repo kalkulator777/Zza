@@ -9,6 +9,11 @@
 гонки (игра офисная), состояние комнаты при этом не меняется, а игровой цикл
 останавливается целиком — см. раздел «глобальная пауза» ниже.
 
+Поверх ВСЕГО автомата живёт чемпионат: серия из нескольких гонок с общим
+зачётом. Он тоже не добавляет состояний — только календарь этапов, таблицу
+очков и паузу между этапами внутри обычного LOBBY (см. класс Championship
+и раздел «чемпионат» ниже).
+
 Комната ничего не знает про физику, трассу и бонусы: вся игровая логика живёт
 за интерфейсом ``Simulation`` из §12.4. Комната отвечает за темп (фиксированный
 шаг 1/60 с с накопителем), за рассылку снапшотов каждый третий тик, за
@@ -284,6 +289,13 @@ class ContentLibrary(object):
     def default_car_id(self):
         return self.car_ids[0] if self.car_ids else None
 
+    def track_name(self, track_id):
+        """Человеческое имя трассы для сообщений и таблиц. Мусор -> сам id."""
+        for entry in self.tracks:
+            if entry['id'] == track_id:
+                return entry.get('name') or track_id
+        return track_id or '—'
+
     def default_settings(self):
         """Настройки комнаты по умолчанию с подставленной первой трассой."""
         settings = dict(config.DEFAULT_SETTINGS)
@@ -374,7 +386,32 @@ def validate_settings(raw, content, base=None, min_players=1):
                                 'в комнате уже %d игроков' % min_players)
         out['max_players'] = limit
 
-    for flag in ('items_enabled', 'collisions', 'mirror'):
+    # Режим комнаты: одиночная гонка или чемпионат из нескольких этапов.
+    if 'mode' in raw:
+        mode = raw['mode']
+        if not isinstance(mode, str) or mode not in config.ROOM_MODES:
+            raise SettingsError('bad_mode', 'режим: ожидается одно из %s'
+                                % ', '.join(config.ROOM_MODES))
+        out['mode'] = mode
+    if out.get('mode') not in config.ROOM_MODES:
+        out['mode'] = config.ROOM_MODES[0]
+
+    if 'stages' in raw:
+        stages = raw['stages']
+        if not isinstance(stages, int) or isinstance(stages, bool):
+            raise SettingsError('bad_stages', 'этапов: нужно целое число')
+        if not config.STAGES_MIN <= stages <= config.STAGES_MAX:
+            raise SettingsError('bad_stages', 'этапов: от %d до %d'
+                                % (config.STAGES_MIN, config.STAGES_MAX))
+        out['stages'] = stages
+    stages = out.get('stages')
+    if (not isinstance(stages, int) or isinstance(stages, bool)
+            or not config.STAGES_MIN <= stages <= config.STAGES_MAX):
+        out['stages'] = config.STAGES_DEFAULT
+
+    # items_enabled, collisions, mirror и две галочки доработки: гандикап
+    # и повтор финиша. Обе по умолчанию выключены (config.DEFAULT_SETTINGS).
+    for flag in config.SETTING_FLAGS:
         if flag in raw:
             value = raw[flag]
             if not isinstance(value, bool):
@@ -394,6 +431,185 @@ def validate_settings(raw, content, base=None, min_players=1):
         out['items'] = [item for item in config.ITEM_IDS if item in chosen]
 
     return out
+
+
+# --- чемпионат ---------------------------------------------------------------
+#
+# Серия гонок с общим зачётом. Новых состояний комнаты не появляется: этап —
+# это обычная гонка, а между этапами комната стоит в LOBBY с заведённым
+# таймером автостарта (пауза, за которую можно сменить машину).
+#
+# ЛИЧНОСТЬ УЧАСТНИКА. Слот — это место в КОМНАТЕ, а не игрок (§12.8): он
+# выдаётся при входе, освобождается при выходе и может достаться другому.
+# Поэтому очки нельзя держать по слоту: отключившийся обязан сохранить
+# очки и вернуться к ним. Ключ зачёта — нормализованное имя: именно им
+# люди зовут друг друга в офисе, и именно его игрок наберёт снова, когда
+# переподключится. Цена решения честная: два Васи в одной серии поделят
+# одну строку таблицы, и это видно всем сразу.
+
+def champ_key(name):
+    """Ключ участника чемпионата: имя без регистра и лишних пробелов."""
+    key = ' '.join((name or '').split()).casefold()
+    return key[:config.NAME_MAX_LEN] if key else '?'
+
+
+def stage_points(place):
+    """Очки за место на этапе (config.CHAMPIONSHIP_POINTS)."""
+    table = config.CHAMPIONSHIP_POINTS
+    if 1 <= place <= len(table):
+        return table[place - 1]
+    return 0
+
+
+class Championship(object):
+    """Календарь этапов и общий зачёт одной серии."""
+
+    def __init__(self, stages, calendar):
+        self.stages = stages
+        self.calendar = list(calendar)   # id трасс по этапам, длина == stages
+        self.stage_done = 0              # сколько этапов уже проведено
+        self.finished = False
+        self.standings = {}              # ключ -> строка зачёта
+        self.order = []                  # ключи в порядке появления
+        self.winner_key = None           # победитель последнего этапа
+
+    # --- календарь ----------------------------------------------------------
+
+    @staticmethod
+    def build_calendar(stages, first_track, track_ids, rng):
+        """Трассы этапов: первая — выбранная в лобби, дальше случайные.
+
+        Случайный календарь без повторов практичнее заранее выбранных трасс:
+        форма создания комнаты не обрастает N селекторами, владельцу не надо
+        принимать N решений до старта, а офис получает разнообразие даром.
+        Календарь строится ОДИН раз, при старте первого этапа, и целиком
+        уезжает клиентам — значит, он всё равно известен заранее и сюрпризом
+        не становится. Трасса первого этапа остаётся за владельцем: она уже
+        выбрана в лобби, и отбирать этот выбор было бы странно.
+
+        Трасс на сервере может быть меньше, чем этапов: тогда список идёт
+        по кругу новой случайной перестановкой, а не отказом стартовать.
+        """
+        pool = [tid for tid in track_ids if tid != first_track]
+        rng.shuffle(pool)
+        calendar = [first_track]
+        while len(calendar) < stages:
+            if not pool:
+                pool = list(track_ids)
+                rng.shuffle(pool)
+                # Не повторять трассу встык, если есть из чего выбрать.
+                if len(pool) > 1 and pool[0] == calendar[-1]:
+                    pool.append(pool.pop(0))
+            calendar.append(pool.pop(0))
+        return calendar[:stages]
+
+    def next_track(self):
+        """Трасса ближайшего непроведённого этапа."""
+        index = min(self.stage_done, len(self.calendar) - 1)
+        return self.calendar[index] if self.calendar else ''
+
+    def stage_number(self):
+        """Номер ближайшего этапа, 1..stages."""
+        return min(self.stage_done + 1, self.stages)
+
+    # --- зачёт --------------------------------------------------------------
+
+    def ensure(self, name):
+        """Строка зачёта участника. Новый входит с нулём со следующего этапа."""
+        key = champ_key(name)
+        row = self.standings.get(key)
+        if row is None:
+            row = {
+                'key': key,
+                'name': name or 'Гонщик',
+                'seq': len(self.order),
+                'points': 0,
+                'wins': 0,
+                'stage_points': 0,
+                'last_place': 0,
+                'joined_stage': min(self.stage_done + 1, self.stages),
+                'pos': 0,
+                'prev_pos': 0,
+            }
+            self.standings[key] = row
+            self.order.append(key)
+        elif name:
+            row['name'] = name           # регистр мог поменяться, ключ — нет
+        return row
+
+    def ranking(self):
+        """Ключи по местам: очки, затем победы, затем порядок появления."""
+        rows = self.standings
+        keys = list(self.order)
+        keys.sort(key=lambda k: (-rows[k]['points'], -rows[k]['wins'],
+                                 rows[k]['seq']))
+        return keys
+
+    def apply_results(self, rows):
+        """Учесть итоги этапа. rows — как в событии results (§9)."""
+        # Позиции ДО этапа: по ним считается изменение места в таблице.
+        for pos, key in enumerate(self.ranking(), 1):
+            self.standings[key]['prev_pos'] = pos
+        for row in self.standings.values():
+            row['stage_points'] = 0
+            row['last_place'] = 0
+
+        self.winner_key = None
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entry = self.ensure(row.get('name'))
+            place = row.get('place')
+            place = int(place) if isinstance(place, int) else 0
+            # Очки даются по месту в протоколе, сошедшим тоже: в офисной
+            # серии «не доехал» уже наказано последним местом, обнулять
+            # человека вторым разом — верный способ его потерять.
+            points = stage_points(place)
+            entry['stage_points'] = points
+            entry['points'] += points
+            entry['last_place'] = place
+            if place == 1 and not row.get('dnf'):
+                entry['wins'] += 1
+                self.winner_key = entry['key']
+
+        self.stage_done += 1
+        for pos, key in enumerate(self.ranking(), 1):
+            self.standings[key]['pos'] = pos
+        if self.stage_done >= self.stages:
+            self.finished = True
+
+    def champion(self):
+        """Строка чемпиона или None, если зачёт пуст."""
+        keys = self.ranking()
+        return self.standings[keys[0]] if keys else None
+
+    def table_payload(self, slot_by_key, online_keys):
+        """Таблица зачёта для клиента."""
+        out = []
+        for pos, key in enumerate(self.ranking(), 1):
+            row = self.standings[key]
+            prev = row['prev_pos']
+            out.append({
+                'key': key,
+                'name': row['name'],
+                'slot': slot_by_key.get(key, -1),
+                'online': key in online_keys,
+                'points': row['points'],
+                'stage_points': row['stage_points'],
+                'place': row['last_place'],
+                'pos': pos,
+                'prev_pos': prev,
+                # 0 — новичок или без изменений; + вверх, − вниз.
+                'delta': (prev - pos) if prev else 0,
+                'joined_stage': row['joined_stage'],
+                'wins': row['wins'],
+            })
+        return out
+
+    def __repr__(self):
+        return '<Championship этап %d/%d, участников %d%s>' % (
+            self.stage_done, self.stages, len(self.standings),
+            ', завершён' if self.finished else '')
 
 
 # --- комната -----------------------------------------------------------------
@@ -435,6 +651,17 @@ class Room(object):
         self._timeout_tick = 0       # тик, на котором истекает RACE_TIMEOUT
         self._countdown_value = 0
         self._dirty_ping = False     # ping кого-то изменился — лобби обновить
+        # Чемпионат: серия этапов с общим зачётом (см. класс Championship).
+        self.champ = None
+        self._champ_timer = None     # автостарт следующего этапа
+        self._champ_break_at = 0.0   # монотонное время конца паузы между этапами
+        # Гандикап: победитель прошлой гонки едет следующую чуть медленнее.
+        self._last_winner_key = None
+        self._handicap_slot = -1
+        self._handicap_factor = 0.0
+        # Кто на каком слоте ехал: нужно рекордам уже после отключения игрока.
+        self._race_cars = {}
+        self._race_names = {}
         # Измерения для приёмки: время тика и провалы темпа.
         self.tick_ms_max = 0.0
         self.tick_ms_sum = 0.0
@@ -462,7 +689,7 @@ class Room(object):
         уже после welcome, поэтому «какая строка в players моя» клиент узнаёт
         именно отсюда (§12.6).
         """
-        return {
+        payload = {
             't': 'room',
             'you': you,
             'id': self.id,
@@ -473,6 +700,108 @@ class Room(object):
             'players': [player.lobby_info() for player in self.order],
             'chat': list(self.chat),
         }
+        # Чемпионат — часть состояния комнаты, поэтому едет здесь же, а не
+        # отдельным событием: клиент и так пересобирает по room весь экран
+        # лобби, а лишний тип события пришлось бы заводить в чужом net.js.
+        champ = self.championship_payload()
+        if champ is not None:
+            payload['championship'] = champ
+        return payload
+
+    # --- чемпионат ----------------------------------------------------------
+
+    def championship_payload(self):
+        """Поле championship событий room и results или None, если серии нет."""
+        champ = self.champ
+        if champ is None:
+            return None
+        content = self.manager.content
+        slot_by_key = {}
+        online = set()
+        for player in self.order:
+            key = champ_key(player.name)
+            if key not in slot_by_key:
+                slot_by_key[key] = player.slot
+            if player.connected:
+                online.add(key)
+
+        if champ.finished:
+            phase = 'final'
+        elif self.state == config.STATE_RESULTS:
+            phase = 'results'
+        elif self.state in (config.STATE_COUNTDOWN, config.STATE_RACING):
+            phase = 'racing'
+        elif self._champ_break_at > 0.0:
+            phase = 'break'
+        else:
+            phase = 'lobby'
+
+        break_left = 0.0
+        if phase == 'break':
+            break_left = self._champ_break_at - time.monotonic()
+            if break_left < 0.0:
+                break_left = 0.0
+
+        calendar = []
+        for index, track_id in enumerate(champ.calendar):
+            calendar.append({
+                'track': track_id,
+                'name': content.track_name(track_id),
+                'done': index < champ.stage_done,
+                'current': index == champ.stage_done and not champ.finished,
+            })
+
+        payload = {
+            'active': True,
+            'phase': phase,
+            'stages': champ.stages,
+            'stage': champ.stage_number(),
+            'stage_done': champ.stage_done,
+            'break_left': round(break_left, 1),
+            'calendar': calendar,
+            'table': champ.table_payload(slot_by_key, online),
+        }
+        if champ.finished:
+            best = champ.champion()
+            if best is not None:
+                payload['champion'] = {
+                    'key': best['key'], 'name': best['name'],
+                    'points': best['points'], 'wins': best['wins'],
+                    'slot': slot_by_key.get(best['key'], -1),
+                }
+        return payload
+
+    def _system_chat(self, text):
+        """Системная строка в чат комнаты (§9: slot < 0). Рассылает вызывающий."""
+        self.chat.append({'slot': -1, 'name': '', 'text': text,
+                          'ts': round(time.time(), 3)})
+        if len(self.chat) > config.CHAT_HISTORY:
+            del self.chat[:len(self.chat) - config.CHAT_HISTORY]
+
+    def _cancel_champ_timer(self):
+        if self._champ_timer is not None:
+            IOLoop.current().remove_timeout(self._champ_timer)
+            self._champ_timer = None
+        self._champ_break_at = 0.0
+
+    def _start_champ_break(self):
+        """Пауза между этапами: время сменить машину, потом автостарт."""
+        self._cancel_champ_timer()
+        self._champ_break_at = time.monotonic() + config.CHAMPIONSHIP_BREAK
+        self._champ_timer = IOLoop.current().call_later(
+            config.CHAMPIONSHIP_BREAK, self._champ_next_stage)
+
+    def _champ_next_stage(self):
+        """Пауза кончилась — стартуем следующий этап сами, без владельца."""
+        self._champ_timer = None
+        self._champ_break_at = 0.0
+        if self.champ is None or self.state != config.STATE_LOBBY:
+            return
+        if not self._launch_race(None):
+            # Ехать сейчас некому (все наблюдатели или отвалились). Серию
+            # не рвём: ждём ещё одну паузу — вдруг кто-то вернётся.
+            self._start_champ_break()
+            self.broadcast_state()
 
     # --- рассылка -----------------------------------------------------------
 
@@ -666,19 +995,75 @@ class Room(object):
         if self.state != config.STATE_LOBBY:
             player.send_error('busy', 'гонка уже идёт')
             return
+        # Доигранная серия не мешает завести новую той же кнопкой.
+        if self.champ is not None and self.champ.finished:
+            self.champ = None
+            self._cancel_champ_timer()
         racers = [p for p in self.order if p.connected and not p.spectator]
         racers.sort(key=lambda p: p.slot)
         if len(racers) < config.START_PLAYERS_MIN:
             player.send_error('not_enough', 'некому ехать')
             return
-        if any(not p.ready for p in racers):
+        # Между этапами чемпионата готовность не спрашиваем: люди уже
+        # в серии, а нажимать «я готов» перед каждым из семи этапов —
+        # ровно тот обряд, из-за которого лига и разваливается.
+        if self.champ is None and any(not p.ready for p in racers):
             player.send_error('not_ready', 'не все готовы')
             return
+        if self.champ is None and self.settings.get('mode') == 'championship':
+            content = self.manager.content
+            if not content.track_ids:
+                player.send_error('bad_track', 'на сервере нет ни одной трассы')
+                return
+            calendar = Championship.build_calendar(
+                int(self.settings.get('stages', config.STAGES_DEFAULT)),
+                self.settings['track'], list(content.track_ids),
+                self.manager.rng)
+            self.champ = Championship(
+                int(self.settings.get('stages', config.STAGES_DEFAULT)), calendar)
+            self._system_chat('Чемпионат из %d этапов: %s'
+                              % (self.champ.stages,
+                                 ', '.join(content.track_name(t) for t in calendar)))
+        self._launch_race(player)
+
+    def _launch_race(self, starter):
+        """Собственно старт гонки (этапа). True — поехали.
+
+        ``starter`` — кто нажал «Старт»; None означает автостарт этапа
+        чемпионата, тогда ошибки уходят в комнату, а не одному игроку.
+        """
+        def complain(code, message):
+            if starter is not None:
+                starter.send_error(code, message)
+            else:
+                self._log('комната %s: этап не стартовал (%s): %s'
+                          % (self.id, code, message))
+
+        racers = [p for p in self.order if p.connected and not p.spectator]
+        racers.sort(key=lambda p: p.slot)
+        if len(racers) < config.START_PLAYERS_MIN:
+            complain('not_enough', 'некому ехать')
+            return False
+
         content = self.manager.content
+        champ = self.champ
+        if champ is not None:
+            # Трассу этапа задаёт календарь. Через validate_settings —
+            # чтобы вместе с картой по правилу §12.16 поехало и время суток.
+            stage_track = champ.next_track()
+            if stage_track and stage_track != self.settings.get('track'):
+                try:
+                    self.settings = validate_settings(
+                        {'track': stage_track}, content, base=self.settings,
+                        min_players=len(self.players))
+                except SettingsError as exc:
+                    complain(exc.code, exc.message)
+                    return False
+
         track = content.track(self.settings['track'], self.settings['mirror'])
         if track is None:
-            player.send_error('bad_track', 'трасса не загружена')
-            return
+            complain('bad_track', 'трасса не загружена')
+            return False
         default_car = content.default_car_id()
         for racer in racers:
             if racer.car is None:
@@ -691,8 +1076,9 @@ class Room(object):
             self._log('комната %s: симуляция не создалась: %s' % (self.id, exc))
             self.broadcast({'t': 'error', 'code': 'sim_failed',
                             'message': 'гонка не стартовала: %s' % exc})
-            return
+            return False
 
+        self._cancel_champ_timer()
         self._sim = sim
         self._race_slots = tuple(p.slot for p in racers)
         self._reserved = set(self._race_slots)
