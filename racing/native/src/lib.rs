@@ -5,18 +5,30 @@
 // Проверка «ноль импортов» — в tools проверочного стенда.
 
 pub mod abi;
+#[rustfmt::skip]
+pub mod abi_gen;
+pub mod trackmesh;
 pub mod world;
 
-use abi::{fnv1a, CarInput, CarOut, DESCS, INPUTS, MAX_CARS, OUTPUTS, PROPS, SAVES};
+use abi::{fnv1a, CarInput, CarOut, FNV_SEED, DESCS, INPUTS, MAX_CARS, OUTPUTS, PROPS, SAVES,
+          TRACK_COLUMNS, TUNING};
+use trackmesh::Centerline;
 use world::{CarTuning, Preset, World, DT};
 
 /// Единственный мир на модуль. Экземпляр wasm = одна симуляция,
 /// так что таблица миров не нужна и ABI остаётся плоским.
 static mut WORLD: Option<World> = None;
 
-/// Буфер под заливку вершин полотна. Хозяин пишет сюда напрямую.
-static mut VERT_STAGE: Vec<f32> = Vec::new();
-static mut TRIS_STAGE: Vec<u32> = Vec::new();
+/// Буфер под заливку осевой линии: TRACK_COLUMNS массивов подряд по N f32.
+/// Хозяин пишет сюда напрямую, одним куском памяти.
+static mut CENTERLINE: Vec<f32> = Vec::new();
+static mut CENTERLINE_N: u32 = 0;
+
+/// Готовая сетка полотна. Остаётся в модуле после постройки: хозяину она
+/// нужна не для физики (та уже внутри), а чтобы сверить сетку хэшем или
+/// вычитать её при разборе полёта. Освобождается rp_track_free_mesh.
+static mut MESH_VERTS: Vec<f32> = Vec::new();
+static mut MESH_TRIS: Vec<u32> = Vec::new();
 
 #[allow(static_mut_refs)]
 fn w() -> &'static mut World {
@@ -88,11 +100,7 @@ pub extern "C" fn rp_prop_count() -> u32 {
     w().props.len() as u32
 }
 
-/// Шаблон настроек, из которого берёт параметры следующая rp_car_spawn.
-/// Плоский массив f32 в общей памяти: хозяин правит поля напрямую.
-static mut TUNING: CarTuning = CarTuning::ARCADE;
-
-/// Адрес шаблона настроек.
+/// Адрес шаблона настроек (сам буфер TUNING выпущен в abi_gen.rs).
 #[no_mangle]
 #[allow(static_mut_refs)]
 pub extern "C" fn rp_tuning_ptr() -> u32 {
@@ -149,8 +157,10 @@ pub extern "C" fn rp_world_reset(preset: u32) {
         } else {
             CarTuning::ARCADE
         };
-        VERT_STAGE = Vec::new();
-        TRIS_STAGE = Vec::new();
+        CENTERLINE = Vec::new();
+        CENTERLINE_N = 0;
+        MESH_VERTS = Vec::new();
+        MESH_TRIS = Vec::new();
     }
 }
 
@@ -177,66 +187,133 @@ pub extern "C" fn rp_add_box(
     w().add_box(hx, hy, hz, x, y, z, yaw, pitch, friction, mass);
 }
 
-/// Обычный Rust-доступ к буферу вершин. Wasm-ABI ниже — тонкая обёртка
-/// над этим; отдельная функция нужна нативным прогонам, где адрес
+/// Сколько массивов по N чисел ждёт rp_track_alloc_centerline.
+#[no_mangle]
+pub extern "C" fn rp_track_columns() -> u32 {
+    TRACK_COLUMNS as u32
+}
+
+/// Обычный Rust-доступ к буферу осевой линии. Wasm-ABI ниже — тонкая
+/// обёртка над этим; отдельная функция нужна нативным прогонам, где адрес
 /// не влезает в u32.
 #[allow(static_mut_refs)]
-pub fn track_stage_verts(nv: u32) -> &'static mut [f32] {
+pub fn track_stage_centerline(n: u32) -> &'static mut [f32] {
     unsafe {
-        VERT_STAGE = vec![0.0f32; nv as usize * 3];
-        &mut VERT_STAGE
+        CENTERLINE = vec![0.0f32; n as usize * TRACK_COLUMNS];
+        CENTERLINE_N = n;
+        &mut CENTERLINE
     }
 }
 
-#[allow(static_mut_refs)]
-pub fn track_stage_tris(nt: u32) -> &'static mut [u32] {
-    unsafe {
-        TRIS_STAGE = vec![0u32; nt as usize * 3];
-        &mut TRIS_STAGE
-    }
-}
-
-/// Выделяет место под сетку полотна и отдаёт адрес буфера вершин
-/// (nv троек f32). Хозяин заливает вершины ОДНИМ куском памяти.
+/// Выделяет место под осевую линию и отдаёт адрес буфера: TRACK_COLUMNS
+/// массивов подряд по `n` чисел каждый, в порядке 12.1 — x, y, z, tx, tz,
+/// nx, nz, hw, s. Хозяин заливает те же квантованные числа, что уходят
+/// клиенту в race_init, ОДНИМ куском памяти.
+///
+/// Осторожно: аллокация внутри модуля отсоединяет уже созданные на стороне
+/// JS Float32Array. Виды надо пересоздавать после этого вызова.
 #[no_mangle]
-pub extern "C" fn rp_track_alloc_verts(nv: u32) -> u32 {
-    track_stage_verts(nv).as_ptr() as u32
+pub extern "C" fn rp_track_alloc_centerline(n: u32) -> u32 {
+    track_stage_centerline(n).as_ptr() as u32
 }
 
-/// То же для треугольников (nt троек u32).
-#[no_mangle]
-pub extern "C" fn rp_track_alloc_tris(nt: u32) -> u32 {
-    track_stage_tris(nt).as_ptr() as u32
-}
-
-/// Строит треугольную сетку из залитых буферов. 0 — успех.
+/// Строит полотно из залитой осевой линии и ставит его в мир.
+///
+/// `wall_margin` — обочина за кромкой (зона вылета из 12.7), `wall_height` —
+/// высота стенки за обочиной, `friction` — трение полотна. Игровые константы
+/// приходят снаружи: модуль их не знает и знать не должен.
+///
+/// 0 — успех, 1 — осевая линия не залита или короче трёх точек,
+/// 2 — Rapier не принял сетку.
 #[no_mangle]
 #[allow(static_mut_refs)]
-pub extern "C" fn rp_track_commit(friction: f32) -> u32 {
+pub extern "C" fn rp_track_build(wall_margin: f32, wall_height: f32, friction: f32) -> u32 {
     let world = w();
     unsafe {
-        let nv = VERT_STAGE.len() / 3;
-        world.track_verts.clear();
-        world.track_verts.reserve(nv);
-        for i in 0..nv {
-            world.track_verts.push(rapier3d::prelude::Vector::new(
-                VERT_STAGE[i * 3],
-                VERT_STAGE[i * 3 + 1],
-                VERT_STAGE[i * 3 + 2],
-            ));
-        }
-        let nt = TRIS_STAGE.len() / 3;
-        world.track_tris.clear();
-        world.track_tris.reserve(nt);
-        for i in 0..nt {
-            world
-                .track_tris
-                .push([TRIS_STAGE[i * 3], TRIS_STAGE[i * 3 + 1], TRIS_STAGE[i * 3 + 2]]);
-        }
-        VERT_STAGE = Vec::new();
-        TRIS_STAGE = Vec::new();
+        let n = CENTERLINE_N as usize;
+        let cl = match Centerline::new(&CENTERLINE, n) {
+            Some(c) => c,
+            None => return 1,
+        };
+        trackmesh::build(&cl, wall_margin, wall_height, &mut MESH_VERTS, &mut MESH_TRIS);
+        world.commit_track(&MESH_VERTS, &MESH_TRIS, friction)
     }
-    world.commit_track(friction)
+}
+
+/// Сколько вершин в построенной сетке.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_track_vert_count() -> u32 {
+    unsafe { (MESH_VERTS.len() / 3) as u32 }
+}
+
+/// Сколько треугольников в построенной сетке.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_track_tri_count() -> u32 {
+    unsafe { (MESH_TRIS.len() / 3) as u32 }
+}
+
+/// Адрес вершин построенной сетки: троек f32 ровно rp_track_vert_count().
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_track_verts_ptr() -> u32 {
+    unsafe { MESH_VERTS.as_ptr() as u32 }
+}
+
+/// Адрес треугольников: троек u32 ровно rp_track_tri_count().
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_track_tris_ptr() -> u32 {
+    unsafe { MESH_TRIS.as_ptr() as u32 }
+}
+
+/// FNV-1a по байтам вершин. Это и есть ответ на вопрос «сетка та же самая?»
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_track_verts_hash() -> u64 {
+    unsafe { trackmesh::verts_hash(&MESH_VERTS) }
+}
+
+#[no_mangle]
+pub extern "C" fn rp_track_verts_hash_lo() -> u32 {
+    rp_track_verts_hash() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn rp_track_verts_hash_hi() -> u32 {
+    (rp_track_verts_hash() >> 32) as u32
+}
+
+/// То же по индексам треугольников.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_track_tris_hash() -> u64 {
+    unsafe { trackmesh::tris_hash(&MESH_TRIS) }
+}
+
+#[no_mangle]
+pub extern "C" fn rp_track_tris_hash_lo() -> u32 {
+    rp_track_tris_hash() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn rp_track_tris_hash_hi() -> u32 {
+    (rp_track_tris_hash() >> 32) as u32
+}
+
+/// Отдаёт память под осевой линией и копией сетки. Сама сетка уже внутри
+/// Rapier, так что на физику это не влияет; §6 разведки напоминает, что
+/// линейная память wasm умеет только расти, поэтому лишние сотни килобайт
+/// лучше вернуть аллокатору до следующей трассы.
+#[no_mangle]
+pub extern "C" fn rp_track_free_mesh() {
+    unsafe {
+        CENTERLINE = Vec::new();
+        CENTERLINE_N = 0;
+        MESH_VERTS = Vec::new();
+        MESH_TRIS = Vec::new();
+    }
 }
 
 /// Ставит машину, возвращает её индекс.
@@ -306,7 +383,7 @@ pub extern "C" fn rp_state_hash() -> u64 {
             OUTPUTS.as_ptr() as *const u8,
             n * core::mem::size_of::<CarOut>(),
         );
-        fnv1a(0xcbf2_9ce4_8422_2325, bytes)
+        fnv1a(FNV_SEED, bytes)
     }
 }
 
@@ -327,7 +404,7 @@ pub extern "C" fn rp_state_hash_hi() -> u32 {
 #[no_mangle]
 pub extern "C" fn rp_world_hash() -> u64 {
     let world = w();
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = FNV_SEED;
     let mut buf = [0u8; 4];
     let mut push = |h: &mut u64, v: f32| {
         buf = v.to_le_bytes();

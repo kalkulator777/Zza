@@ -22,73 +22,12 @@ pub enum Preset {
 /// Настройки машины. Всё, что различает пресеты и модели машин,
 /// собрано здесь — чтобы не искать магические числа по коду.
 ///
-/// Раскладка `repr(C)` из одних f32 — это ещё и часть ABI: хозяин видит
-/// эту структуру как плоский массив чисел в общей памяти и правит её
-/// напрямую, без единого дополнительного вызова. Так «аркада» и
-/// «симулятор» становятся данными, а не кодом.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct CarTuning {
-    // --- кузов ---
-    /// полугабариты кузова: длина/2 по Z, высота/2 по Y, ширина/2 по X
-    pub half_length: f32,
-    pub half_height: f32,
-    pub half_width: f32,
-    /// масса кузова, кг
-    pub mass: f32,
-    /// смещение центра масс вниз, м (устойчивость от переворота)
-    pub com_drop: f32,
-
-    // --- подвеска ---
-    pub suspension_rest: f32,
-    pub suspension_stiffness: f32,
-    pub suspension_compression: f32,
-    pub suspension_damping: f32,
-    pub max_suspension_travel: f32,
-    pub max_suspension_force: f32,
-    pub wheel_radius: f32,
-    /// вынос колеса от центра: по Z (вперёд) и по X (влево)
-    pub axle_z: f32,
-    pub axle_x: f32,
-
-    // --- сцепление ---
-    pub friction_slip: f32,
-    pub side_friction_stiffness: f32,
-    /// во сколько раз ручник роняет боковое сцепление задней оси
-    pub handbrake_side_drop: f32,
-    /// насколько ручник поднимает просимый доворот (аналог HANDBRAKE_TURN_GAIN)
-    pub handbrake_turn_gain: f32,
-
-    // --- двигатель и тормоза ---
-    /// максимальная тяга на ось, Н
-    pub engine_force: f32,
-    /// опорная скорость двигателя, м/с (тяга падает как 1 - v/max_speed)
-    pub max_speed: f32,
-    pub brake_force: f32,
-    pub handbrake_force: f32,
-    pub reverse_force: f32,
-
-    // --- руль ---
-    /// максимальный угол поворота колёс, рад
-    pub steer_max: f32,
-    /// скорость подхода руля к цели, 1/с
-    pub steer_rate: f32,
-    pub steer_return: f32,
-    /// во сколько раз ужимается руль на максимальной скорости
-    pub steer_speed_falloff: f32,
-
-    // --- аркадная надстройка ---
-    /// момент доворота по рулю, Н·м на рад невязки
-    pub yaw_assist: f32,
-    /// гашение паразитного рыскания, Н·м·с/рад
-    pub yaw_damp: f32,
-    /// прижим, Н на (м/с)^2
-    pub downforce: f32,
-    /// доля боковой скорости, снимаемая за шаг (аркадное «держит»)
-    pub lateral_bite: f32,
-    /// момент выравнивания кузова в воздухе, Н·м на рад
-    pub air_righting: f32,
-}
+/// Сама структура описана в tools/abi_layout.json и выпущена генератором
+/// в `abi_gen.rs`: её раскладка `repr(C)` из одних f32 — часть ABI, хозяин
+/// видит её как плоский массив чисел в общей памяти и правит напрямую,
+/// без единого дополнительного вызова. Так «аркада» и «симулятор»
+/// становятся данными, а не кодом. Здесь — только сами пресеты.
+pub use crate::abi::CarTuning;
 
 impl CarTuning {
     /// «Симулятор»: мягче подвеска, живое сцепление, никакой помощи в руле.
@@ -195,10 +134,6 @@ pub struct World {
     pub cars: Vec<Car>,
     pub preset: Preset,
     pub tick: u64,
-    /// буфер вершин полотна, пока хозяин их заливает
-    pub track_verts: Vec<Vector>,
-    /// буфер треугольников полотна
-    pub track_tris: Vec<[u32; 3]>,
     /// подвижные предметы: тело и его полуразмер (для рендера)
     pub props: Vec<(RigidBodyHandle, f32)>,
 }
@@ -224,8 +159,6 @@ impl World {
             cars: Vec::new(),
             preset,
             tick: 0,
-            track_verts: Vec::new(),
-            track_tris: Vec::new(),
             props: Vec::new(),
         }
     }
@@ -278,16 +211,22 @@ impl World {
 
     /// Полотно трассы одной треугольной сеткой.
     /// Возвращает 0 при успехе.
-    pub fn commit_track(&mut self, friction: f32) -> u32 {
-        if self.track_verts.is_empty() || self.track_tris.is_empty() {
+    /// Ставит полотно трассы треугольной сеткой. Вершины и треугольники
+    /// считает сам модуль (см. trackmesh.rs), сюда приходят готовые срезы.
+    /// 0 — успех, 1 — пустая сетка, 2 — Rapier не принял.
+    pub fn commit_track(&mut self, verts: &[f32], tris: &[u32], friction: f32) -> u32 {
+        if verts.len() < 9 || tris.len() < 3 {
             return 1;
         }
-        let verts = core::mem::take(&mut self.track_verts);
-        let tris = core::mem::take(&mut self.track_tris);
+        let pts: Vec<Vector> = verts
+            .chunks_exact(3)
+            .map(|c| Vector::new(c[0], c[1], c[2]))
+            .collect();
+        let idx: Vec<[u32; 3]> = tris.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
         // FIX_INTERNAL_EDGES снимает «зацепы» на швах между треугольниками —
         // без него машина спотыкается о рёбра полотна.
         let flags = TriMeshFlags::FIX_INTERNAL_EDGES;
-        match ColliderBuilder::trimesh_with_flags(verts, tris, flags) {
+        match ColliderBuilder::trimesh_with_flags(pts, idx, flags) {
             Ok(b) => {
                 self.colliders.insert(b.friction(friction).build());
                 0

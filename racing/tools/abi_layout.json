@@ -1,0 +1,670 @@
+{
+  "doc": "Единственное описание раскладок общей памяти модуля физики.\nИз него tools/gen_abi.py выпускает native/src/abi_gen.rs, native/abi/abi_layout.py и native/abi/abi_layout.js.\nРуками правится ТОЛЬКО этот файл; всё остальное — вывод генератора, и `python3 tools/gen_abi.py --check` ловит расхождение.",
+  "abi_version": 1,
+  "consts": [
+    {
+      "name": "MAX_CARS",
+      "value": 16,
+      "rust_type": "usize",
+      "doc": "Максимум машин в мире. Восемь по контракту, держим запас."
+    },
+    {
+      "name": "MAX_PROPS",
+      "value": 64,
+      "rust_type": "usize",
+      "doc": "Максимум подвижных предметов (конусы и прочее), чьи позы едут наружу."
+    },
+    {
+      "name": "TRACK_COLUMNS",
+      "value": 9,
+      "rust_type": "usize",
+      "doc": "Сколько массивов по N f32 занимает залитая осевая линия: x, y, z, tx, tz, nx, nz, hw, s (12.1)."
+    },
+    {
+      "name": "TRACK_MESH_COLS",
+      "value": 7,
+      "rust_type": "usize",
+      "doc": "Столбцов вершин поперёк полотна: верх и низ левой стены, кромка, ось, кромка, низ и верх правой стены."
+    }
+  ],
+  "buffers": [
+    {
+      "name": "INPUTS",
+      "struct": "CarInput",
+      "count": "MAX_CARS",
+      "export": "rp_inputs_ptr",
+      "doc": "Массив вводов. Хозяин пишет сюда напрямую."
+    },
+    {
+      "name": "OUTPUTS",
+      "struct": "CarOut",
+      "count": "MAX_CARS",
+      "export": "rp_outputs_ptr",
+      "doc": "Массив состояний. Хозяин читает отсюда напрямую."
+    },
+    {
+      "name": "DESCS",
+      "struct": "CarDesc",
+      "count": "MAX_CARS",
+      "export": "rp_descs_ptr",
+      "doc": "Описания машин. Читается один раз после создания машины."
+    },
+    {
+      "name": "PROPS",
+      "struct": "PropOut",
+      "count": "MAX_PROPS",
+      "export": "rp_props_ptr",
+      "doc": "Позы подвижных предметов. Хозяин читает напрямую."
+    },
+    {
+      "name": "SAVES",
+      "struct": "CarSave",
+      "count": "MAX_CARS",
+      "export": "rp_saves_ptr",
+      "doc": "Слоты сохранений. Хозяин читает и пишет их напрямую."
+    },
+    {
+      "name": "TUNING",
+      "struct": "CarTuning",
+      "count": 1,
+      "export": "rp_tuning_ptr",
+      "doc": "Шаблон настроек, из которого берёт параметры следующая rp_car_spawn. Единственный буфер с ненулевым начальным значением: до первого rp_world_reset в нём лежит аркадный пресет.",
+      "rust_init": "CarTuning::ARCADE"
+    }
+  ],
+  "structs": [
+    {
+      "name": "CarInput",
+      "doc": "Ввод одной машины.",
+      "fields": [
+        {
+          "name": "throttle",
+          "type": "f32",
+          "doc": [
+            "газ, 0..1"
+          ]
+        },
+        {
+          "name": "brake",
+          "type": "f32",
+          "doc": [
+            "тормоз, 0..1"
+          ]
+        },
+        {
+          "name": "steer",
+          "type": "f32",
+          "doc": [
+            "руль, -1..1; плюс — налево, как в разделе 4 контракта"
+          ]
+        },
+        {
+          "name": "handbrake",
+          "type": "f32",
+          "doc": [
+            "ручник, 0..1"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "WheelOut",
+      "doc": "Телеметрия одного колеса.",
+      "fields": [
+        {
+          "name": "suspension_length",
+          "type": "f32",
+          "doc": [
+            "текущая длина подвески, м"
+          ]
+        },
+        {
+          "name": "suspension_travel",
+          "type": "f32",
+          "doc": [
+            "ход подвески от полного отбоя, м (0 — вывешено, растёт при сжатии)"
+          ]
+        },
+        {
+          "name": "suspension_force",
+          "type": "f32",
+          "doc": [
+            "сила подвески, Н"
+          ]
+        },
+        {
+          "name": "steering",
+          "type": "f32",
+          "doc": [
+            "угол поворота колеса вокруг вертикали, рад"
+          ]
+        },
+        {
+          "name": "rotation",
+          "type": "f32",
+          "doc": [
+            "угол проворота колеса вокруг оси, рад"
+          ]
+        },
+        {
+          "name": "forward_impulse",
+          "type": "f32",
+          "doc": [
+            "продольный импульс на колесе, Н·с"
+          ]
+        },
+        {
+          "name": "side_impulse",
+          "type": "f32",
+          "doc": [
+            "боковой импульс на колесе, Н·с"
+          ]
+        },
+        {
+          "name": "contact",
+          "type": "f32",
+          "doc": [
+            "1.0 — колесо на земле, 0.0 — в воздухе"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CarOut",
+      "doc": "Состояние одной машины наружу.",
+      "fields": [
+        {
+          "name": "px",
+          "type": "f32",
+          "doc": [
+            "позиция центра масс, м"
+          ]
+        },
+        {
+          "name": "py",
+          "type": "f32"
+        },
+        {
+          "name": "pz",
+          "type": "f32"
+        },
+        {
+          "name": "yaw",
+          "type": "f32",
+          "doc": [
+            "курс вокруг Y, рад (для совместимости с разделом 4)"
+          ]
+        },
+        {
+          "name": "qx",
+          "type": "f32",
+          "doc": [
+            "кватернион ориентации кузова"
+          ]
+        },
+        {
+          "name": "qy",
+          "type": "f32"
+        },
+        {
+          "name": "qz",
+          "type": "f32"
+        },
+        {
+          "name": "qw",
+          "type": "f32",
+          "init": 1.0
+        },
+        {
+          "name": "vx",
+          "type": "f32",
+          "doc": [
+            "линейная скорость, м/с"
+          ]
+        },
+        {
+          "name": "vy",
+          "type": "f32"
+        },
+        {
+          "name": "vz",
+          "type": "f32"
+        },
+        {
+          "name": "speed",
+          "type": "f32",
+          "doc": [
+            "модуль горизонтальной скорости, м/с"
+          ]
+        },
+        {
+          "name": "wx",
+          "type": "f32",
+          "doc": [
+            "угловая скорость, рад/с"
+          ]
+        },
+        {
+          "name": "wy",
+          "type": "f32"
+        },
+        {
+          "name": "wz",
+          "type": "f32"
+        },
+        {
+          "name": "slip_angle",
+          "type": "f32",
+          "doc": [
+            "угол скольжения кузова, рад"
+          ]
+        },
+        {
+          "name": "engine_rpm",
+          "type": "f32",
+          "doc": [
+            "условные обороты двигателя, об/мин"
+          ]
+        },
+        {
+          "name": "wheels_on_ground",
+          "type": "f32",
+          "doc": [
+            "сколько колёс на земле"
+          ]
+        },
+        {
+          "name": "drift_charge",
+          "type": "f32",
+          "doc": [
+            "накопленный заряд заноса, с (аналог drift_charge из 6.3)"
+          ]
+        },
+        {
+          "name": "drift_dir",
+          "type": "f32",
+          "doc": [
+            "сторона заноса: +1 налево, -1 направо, 0 нет"
+          ]
+        },
+        {
+          "name": "wheels",
+          "type": "WheelOut[4]",
+          "doc": [
+            "четыре колеса: FL, FR, RL, RR"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CarDesc",
+      "doc": "Неизменные размеры машины: рендеру — поставить колёса, хозяину — не дублировать константы из Rust.",
+      "fields": [
+        {
+          "name": "half_width",
+          "type": "f32"
+        },
+        {
+          "name": "half_height",
+          "type": "f32"
+        },
+        {
+          "name": "half_length",
+          "type": "f32"
+        },
+        {
+          "name": "wheel_radius",
+          "type": "f32"
+        },
+        {
+          "name": "axle_x",
+          "type": "f32",
+          "doc": [
+            "вынос колеса вбок от оси кузова, м"
+          ]
+        },
+        {
+          "name": "axle_z",
+          "type": "f32",
+          "doc": [
+            "вынос колеса вперёд от центра, м"
+          ]
+        },
+        {
+          "name": "connection_y",
+          "type": "f32",
+          "doc": [
+            "точка крепления подвески по Y в локальных координатах, м"
+          ]
+        },
+        {
+          "name": "suspension_rest",
+          "type": "f32",
+          "doc": [
+            "длина подвески в покое, м"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "PropOut",
+      "doc": "Поза одного подвижного предмета.",
+      "fields": [
+        {
+          "name": "px",
+          "type": "f32"
+        },
+        {
+          "name": "py",
+          "type": "f32"
+        },
+        {
+          "name": "pz",
+          "type": "f32"
+        },
+        {
+          "name": "hx",
+          "type": "f32",
+          "doc": [
+            "полугабариты, чтобы рендер не хранил их отдельно"
+          ]
+        },
+        {
+          "name": "qx",
+          "type": "f32"
+        },
+        {
+          "name": "qy",
+          "type": "f32"
+        },
+        {
+          "name": "qz",
+          "type": "f32"
+        },
+        {
+          "name": "qw",
+          "type": "f32",
+          "init": 1.0
+        }
+      ]
+    },
+    {
+      "name": "CarSave",
+      "doc": "Полное состояние машины для отката.\nКонтроллер колёс НЕ хранит физического состояния: подвеска целиком пересчитывается лучом из позы кузова на каждом шаге. Поэтому откат машины — это «поза + скорости + четыре моих скаляра», а не сериализация всего мира.",
+      "fields": [
+        {
+          "name": "px",
+          "type": "f32"
+        },
+        {
+          "name": "py",
+          "type": "f32"
+        },
+        {
+          "name": "pz",
+          "type": "f32"
+        },
+        {
+          "name": "qx",
+          "type": "f32"
+        },
+        {
+          "name": "qy",
+          "type": "f32"
+        },
+        {
+          "name": "qz",
+          "type": "f32"
+        },
+        {
+          "name": "qw",
+          "type": "f32",
+          "init": 1.0
+        },
+        {
+          "name": "vx",
+          "type": "f32"
+        },
+        {
+          "name": "vy",
+          "type": "f32"
+        },
+        {
+          "name": "vz",
+          "type": "f32"
+        },
+        {
+          "name": "wx",
+          "type": "f32"
+        },
+        {
+          "name": "wy",
+          "type": "f32"
+        },
+        {
+          "name": "wz",
+          "type": "f32"
+        },
+        {
+          "name": "steer",
+          "type": "f32"
+        },
+        {
+          "name": "steer_angle",
+          "type": "f32"
+        },
+        {
+          "name": "drift_charge",
+          "type": "f32"
+        },
+        {
+          "name": "drift_dir",
+          "type": "f32"
+        },
+        {
+          "name": "wheel_rot",
+          "type": "f32[4]",
+          "doc": [
+            "углы проворота колёс — только для картинки"
+          ]
+        },
+        {
+          "name": "_pad",
+          "type": "f32[3]"
+        }
+      ]
+    },
+    {
+      "name": "CarTuning",
+      "doc": "Шаблон настроек машины. Хозяин правит поля напрямую в общей памяти, следующая rp_car_spawn берёт их отсюда.",
+      "fields": [
+        {
+          "name": "half_length",
+          "type": "f32",
+          "doc": [
+            "--- кузов ---",
+            "полугабариты кузова: длина/2 по Z, высота/2 по Y, ширина/2 по X"
+          ]
+        },
+        {
+          "name": "half_height",
+          "type": "f32"
+        },
+        {
+          "name": "half_width",
+          "type": "f32"
+        },
+        {
+          "name": "mass",
+          "type": "f32",
+          "doc": [
+            "масса кузова, кг"
+          ]
+        },
+        {
+          "name": "com_drop",
+          "type": "f32",
+          "doc": [
+            "смещение центра масс вниз, м (устойчивость от переворота)"
+          ]
+        },
+        {
+          "name": "suspension_rest",
+          "type": "f32",
+          "doc": [
+            "--- подвеска ---"
+          ]
+        },
+        {
+          "name": "suspension_stiffness",
+          "type": "f32"
+        },
+        {
+          "name": "suspension_compression",
+          "type": "f32"
+        },
+        {
+          "name": "suspension_damping",
+          "type": "f32"
+        },
+        {
+          "name": "max_suspension_travel",
+          "type": "f32"
+        },
+        {
+          "name": "max_suspension_force",
+          "type": "f32"
+        },
+        {
+          "name": "wheel_radius",
+          "type": "f32"
+        },
+        {
+          "name": "axle_z",
+          "type": "f32",
+          "doc": [
+            "вынос колеса от центра: по Z (вперёд) и по X (влево)"
+          ]
+        },
+        {
+          "name": "axle_x",
+          "type": "f32"
+        },
+        {
+          "name": "friction_slip",
+          "type": "f32",
+          "doc": [
+            "--- сцепление ---"
+          ]
+        },
+        {
+          "name": "side_friction_stiffness",
+          "type": "f32"
+        },
+        {
+          "name": "handbrake_side_drop",
+          "type": "f32",
+          "doc": [
+            "во сколько раз ручник роняет боковое сцепление задней оси"
+          ]
+        },
+        {
+          "name": "handbrake_turn_gain",
+          "type": "f32",
+          "doc": [
+            "насколько ручник поднимает просимый доворот (аналог HANDBRAKE_TURN_GAIN)"
+          ]
+        },
+        {
+          "name": "engine_force",
+          "type": "f32",
+          "doc": [
+            "--- двигатель и тормоза ---",
+            "максимальная тяга на ось, Н"
+          ]
+        },
+        {
+          "name": "max_speed",
+          "type": "f32",
+          "doc": [
+            "опорная скорость двигателя, м/с (тяга падает как 1 - v/max_speed)"
+          ]
+        },
+        {
+          "name": "brake_force",
+          "type": "f32"
+        },
+        {
+          "name": "handbrake_force",
+          "type": "f32"
+        },
+        {
+          "name": "reverse_force",
+          "type": "f32"
+        },
+        {
+          "name": "steer_max",
+          "type": "f32",
+          "doc": [
+            "--- руль ---",
+            "максимальный угол поворота колёс, рад"
+          ]
+        },
+        {
+          "name": "steer_rate",
+          "type": "f32",
+          "doc": [
+            "скорость подхода руля к цели, 1/с"
+          ]
+        },
+        {
+          "name": "steer_return",
+          "type": "f32"
+        },
+        {
+          "name": "steer_speed_falloff",
+          "type": "f32",
+          "doc": [
+            "во сколько раз ужимается руль на максимальной скорости"
+          ]
+        },
+        {
+          "name": "yaw_assist",
+          "type": "f32",
+          "doc": [
+            "--- аркадная надстройка ---",
+            "момент доворота по рулю, Н·м на рад невязки"
+          ]
+        },
+        {
+          "name": "yaw_damp",
+          "type": "f32",
+          "doc": [
+            "гашение паразитного рыскания, Н·м·с/рад"
+          ]
+        },
+        {
+          "name": "downforce",
+          "type": "f32",
+          "doc": [
+            "прижим, Н на (м/с)^2"
+          ]
+        },
+        {
+          "name": "lateral_bite",
+          "type": "f32",
+          "doc": [
+            "доля боковой скорости, снимаемая за шаг (аркадное «держит»)"
+          ]
+        },
+        {
+          "name": "air_righting",
+          "type": "f32",
+          "doc": [
+            "момент выравнивания кузова в воздухе, Н·м на рад"
+          ]
+        }
+      ]
+    }
+  ]
+}
