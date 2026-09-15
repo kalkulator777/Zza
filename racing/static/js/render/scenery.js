@@ -412,6 +412,11 @@ const PRECIP_PARTICLE_K = { off: 0, few: 0.55, normal: 1.0, many: 1.3 };
 
 const PRECIP_PARTICLES_KEY = 'racing.gfx.particles';
 
+// Уровень частиц по пресету качества — та же таблица, что в §12.14.
+// Нужен, когда игрок настройку не трогал: ключа в хранилище ещё нет,
+// а осадки обязаны идти по пресету, а не по среднему значению.
+const PRECIP_PRESET_PARTICLES = { low: 'few', medium: 'normal', high: 'many' };
+
 /**
  * Уровень частиц для осадков.
  *
@@ -422,13 +427,13 @@ const PRECIP_PARTICLES_KEY = 'racing.gfx.particles';
  * добавкой в графике без выключателя. Чтение одноразовое, при сборке сцены,
  * и молча переживает недоступное хранилище.
  */
-function precipParticleLevel(opts) {
+function precipParticleLevel(opts, qName) {
     if (opts && PRECIP_PARTICLE_K[opts.particles] !== undefined) return opts.particles;
     try {
         const raw = window.localStorage.getItem(PRECIP_PARTICLES_KEY);
         if (PRECIP_PARTICLE_K[raw] !== undefined) return raw;
-    } catch (e) { /* нет хранилища — живём с умолчанием */ }
-    return 'normal';
+    } catch (e) { /* нет хранилища — живём по пресету */ }
+    return PRECIP_PRESET_PARTICLES[qName] || 'normal';
 }
 
 /**
@@ -736,7 +741,7 @@ export function buildScenery(track, theme, seed, quality, opts) {
     const env = applyWeather(themeEnv[todName] || themeEnv.day, weatherName);
 
     const decorLevel = DECOR_DENSITY[o.decor] !== undefined ? o.decor : null;
-    const precipLevel = precipParticleLevel(o);
+    const precipLevel = precipParticleLevel(o, qName);
     // Нормировка плотности по длине круга снята: отсечение по пирамиде
     // видимости сделало её ненужной (см. шапку файла).
     const density = (decorLevel ? DECOR_DENSITY[decorLevel] : Q.density)

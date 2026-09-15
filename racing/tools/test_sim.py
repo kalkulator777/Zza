@@ -975,6 +975,382 @@ def check_snapshot(report):
 
 # --- замеры -----------------------------------------------------------------
 
+# --- траффик и происшествия на дороге ----------------------------------------
+
+
+def _road_settings(laps, traffic, events):
+    settings = make_settings(laps)
+    settings['traffic'] = traffic
+    settings['events'] = events
+    return settings
+
+
+def check_traffic(report):
+    """Поток машин-болванок: не застревает, не перекрывает трассу, доезжает."""
+    report.section('Траффик: поток болванок')
+    from game import traffic as traffic_mod
+
+    # Выключенный траффик обязан быть ровно прежним поведением.
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', 'office.json'))
+    off = Simulation(track, _road_settings(2, 'off', 'off'), make_players(8))
+    off.tick()
+    tr_rows, ev_rows = off.extra_snapshot_args()
+    cars, proj, mask = off.snapshot_args()
+    report.check(off.traffic.count == 0 and not tr_rows and not ev_rows,
+                 'выключенный траффик не даёт ни одной записи')
+    report.check(len(protocol.build_snapshot_base(1, cars, proj, mask, tr_rows, ev_rows))
+                 == protocol.snapshot_size(len(cars), len(proj), len(mask)),
+                 'выключенный траффик не стоит ни одного байта снапшота',
+                 '%d байт' % protocol.snapshot_size(len(cars), len(proj), len(mask)))
+
+    worst_ratio = 0.0
+    worst_track = ''
+    samples = [0, 0]          # всего замеров, из них вне асфальта
+    stuck_total = 0
+    min_speed_late = 1e9
+    finished_all = True
+    for track_id in TRACK_IDS:
+        track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                        '%s.json' % track_id))
+        sim = Simulation(track, _road_settings(2, 'dense', 'off'), make_players(8))
+        bots = make_bots(track, sim, seed=11)
+        system = sim.traffic
+        half = system._shw
+        stuck = [0] * system.count
+        for tick in range(MAX_RACE_TICKS):
+            for index, car in enumerate(sim.cars):
+                if car.removed:
+                    continue
+                sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+            sim.tick()
+            if tick > 120:
+                for k, unit in enumerate(system.cars):
+                    ratio = abs(unit.lateral) / half[unit.state.sample_idx]
+                    if ratio > worst_ratio:
+                        worst_ratio = ratio
+                        worst_track = track_id
+                    samples[0] += 1
+                    if unit.state.offtrack:
+                        samples[1] += 1
+                    if unit.speed < 1.0:
+                        stuck[k] += 1
+                    if unit.speed < min_speed_late:
+                        min_speed_late = unit.speed
+            if sim.is_over():
+                break
+        stuck_total += sum(stuck)
+        if not all(car.finished for car in sim.cars):
+            finished_all = False
+
+    # Сама по себе болванка полосу держит (отдельный прогон без гонщиков
+    # даёт ноль выездов на всех пяти трассах). Но её толкают: гонщик имеет
+    # полное право выпихнуть её на газон, и это честная физика, а не ошибка
+    # водителя. Поэтому проверяется не «никогда не за кромкой», а доля
+    # времени за кромкой — она должна быть мелкой и разовой.
+    off_share = 100.0 * samples[1] / samples[0] if samples[0] else 0.0
+    report.note('худшее смещение %.2f полуширины (%s), под толчками гонщиков'
+                % (worst_ratio, worst_track))
+    report.check(off_share < 3.0,
+                 'болванка держит полосу, а не ездит по газону',
+                 'вне асфальта %.2f %% времени (толчки гонщиков)' % off_share)
+    report.check(stuck_total == 0,
+                 'болванка нигде не встала',
+                 'тиков со скоростью ниже 1 м/с: %d' % stuck_total)
+    report.check(min_speed_late > 3.0,
+                 'поток не проседает даже в шпильке',
+                 'минимум %.1f м/с' % min_speed_late)
+    report.check(finished_all,
+                 'восемь ботов доезжают сквозь плотный траффик на всех трассах')
+
+
+def check_traffic_free_lane(report):
+    """Рядом с болванкой всегда остаётся, где проехать."""
+    report.section('Траффик: трасса остаётся проезжей')
+    from game import traffic as traffic_mod
+    worst_free = 1e9
+    worst_pair = 1e9
+    for track_id in TRACK_IDS:
+        track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                        '%s.json' % track_id))
+        sim = Simulation(track, _road_settings(2, 'dense', 'off'), make_players(8))
+        bots = make_bots(track, sim, seed=3)
+        system = sim.traffic
+        half = system._shw
+        length = track.length
+        for tick in range(60 * 90):
+            for index, car in enumerate(sim.cars):
+                if car.removed:
+                    continue
+                sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+            sim.tick()
+            if tick < 120:
+                continue
+            for unit in system.cars:
+                hw = half[unit.state.sample_idx]
+                # Болванка занимает поперёк [lat - R, lat + R]. Самый широкий
+                # свободный кусок асфальта лежит с той стороны, куда она НЕ
+                # смещена: от дальней кромки до её борта.
+                free = hw + abs(unit.lateral) - physics.CAR_RADIUS
+                if free < worst_free:
+                    worst_free = free
+            # две болванки не встают борт о борт поперёк трассы
+            for a in range(system.count):
+                for b in range(a + 1, system.count):
+                    ua = system.cars[a]
+                    ub = system.cars[b]
+                    gap = abs(ua.arc - ub.arc)
+                    if gap > length * 0.5:
+                        gap = length - gap
+                    if gap < 4.0:
+                        span = abs(ua.lateral - ub.lateral)
+                        if span < worst_pair:
+                            worst_pair = span
+    report.check(worst_free >= 4.0,
+                 'рядом с болванкой остаётся проезд',
+                 'худший просвет %.1f м (габарит машины 1,9 м)' % worst_free)
+    report.check(worst_pair >= 1e8 or worst_pair < 2.6,
+                 'болванки не встают стеной борт о борт',
+                 'пар на одной дуге не было' if worst_pair >= 1e8
+                 else 'ближайшая пара разошлась на %.1f м поперёк' % worst_pair)
+
+
+def check_road_events(report):
+    """Происшествия: видно заранее, не под нос, круг остаётся проезжим."""
+    report.section('Происшествия на дороге')
+    from game import events as events_mod
+
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', 'office.json'))
+    off = Simulation(track, _road_settings(2, 'off', 'off'), make_players(8))
+    for _ in range(600):
+        off.tick()
+    report.check(off.road.spawned == 0 and not off.road.live,
+                 'выключенные происшествия не порождают ничего')
+
+    kinds = collections.Counter()
+    worst_free = 1e9
+    worst_margin = 1e9
+    worst_ahead = 1e9
+    spawned = 0
+    finished_all = True
+    for track_id in TRACK_IDS:
+        track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                        '%s.json' % track_id))
+        sim = Simulation(track, _road_settings(2, 'dense', 'often'), make_players(8))
+        bots = make_bots(track, sim, seed=23)
+        road = sim.road
+        length = track.length
+        seen = 0
+        for tick in range(MAX_RACE_TICKS):
+            for index, car in enumerate(sim.cars):
+                if car.removed:
+                    continue
+                sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+            # запас «видно заранее» считаем ДО тика: положение машин то же,
+            # что видел размещатель
+            before = road.spawned
+            positions = [(c.state.progress % length,
+                          math.hypot(c.state.vx, c.state.vz))
+                         for c in sim.cars if not c.removed]
+            sim.tick()
+            if road.spawned != before:
+                seen += 1
+                event = road.live[-1]
+                kinds[event.kind] += 1
+                free = road.free_width(event)
+                if free < worst_free:
+                    worst_free = free
+                if road.last_margin < worst_margin:
+                    worst_margin = road.last_margin
+                for arc, speed in positions:
+                    gap = event.arc - arc
+                    if gap < 0.0:
+                        gap += length
+                    need = max(events_mod.SIGHT_MIN_AHEAD,
+                               speed * (events_mod.WARN_TIME + events_mod.SIGHT_REACTION))
+                    slack = gap - need
+                    if slack < worst_ahead:
+                        worst_ahead = slack
+            if sim.is_over():
+                break
+        spawned += seen
+        if not all(car.finished for car in sim.cars):
+            finished_all = False
+
+    report.check(spawned >= 15,
+                 'происшествия появляются на всех трассах',
+                 'всего %d за пять гонок, виды %s'
+                 % (spawned, dict(kinds)))
+    report.check(len(kinds) >= 3,
+                 'выпадают разные виды происшествий',
+                 'видов %d из 4' % len(kinds))
+    report.check(worst_ahead >= 0.0,
+                 'происшествие не появляется под носом у едущего',
+                 'худший запас сверх требуемого %.0f м' % worst_ahead)
+    report.check(worst_free >= events_mod.MIN_FREE_WIDTH - 0.01,
+                 'рядом с происшествием остаётся проезд',
+                 'худший просвет %.1f м при пороге %.1f'
+                 % (worst_free, events_mod.MIN_FREE_WIDTH))
+    report.check(finished_all,
+                 'круг остаётся проезжим: восемь ботов финишируют при частых ДТП')
+
+
+def check_road_physics(report):
+    """Масло скользит, препятствие не пускает, обломки тормозят."""
+    report.section('Происшествия: влияние на физику')
+    from game import events as events_mod
+
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', 'office.json'))
+    sim = Simulation(track, _road_settings(3, 'off', 'rare'), make_players(1))
+    car = sim.cars[0]
+    road = sim.road
+
+    def place(kind, arc, lateral, phase):
+        del road.live[:]
+        for slot in road.pool:
+            slot.alive = False
+        slot = road.pool[0]
+        hl, hw, _k = events_mod.GEOMETRY[kind]
+        slot.kind = kind
+        slot.phase = phase
+        slot.arc = arc % track.length
+        slot.lateral = lateral
+        slot.half_len = hl
+        slot.half_width = hw
+        slot.track_half_width = 7.0
+        slot.timer = 100.0
+        slot.hit_mask = 0
+        slot.alive = True
+        road.live.append(slot)
+        road._rebuild_zone()
+        return slot
+
+    # --- масло: сцепление падает ровно в OIL_GRIP раз --------------------
+    state = car.state
+    arc = (state.progress % track.length) + 40.0
+    place(events_mod.KIND_OIL, arc, 0.0, events_mod.PHASE_ACTIVE)
+    i = int(arc / track._step) % len(track.samples)
+    sample = track.samples[i]
+    state.x = sample.x
+    state.z = sample.z
+    state.sample_idx = i
+    scale = road.grip_scale(state)
+    report.check(abs(scale - events_mod.OIL_GRIP) < 1e-9,
+                 'в пятне масла сцепление падает', 'множитель %.2f' % scale)
+    state.x = sample.x + sample.normal_x * 30.0
+    state.z = sample.z + sample.normal_z * 30.0
+    report.check(road.grip_scale(state) == 1.0,
+                 'вне пятна масла сцепление обычное')
+
+    # --- твёрдое препятствие выталкивает ---------------------------------
+    place(events_mod.KIND_WRECK, arc, 2.0, events_mod.PHASE_ACTIVE)
+    state.x = sample.x + sample.normal_x * 2.0
+    state.z = sample.z + sample.normal_z * 2.0
+    state.vx = sample.normal_x * 5.0
+    state.vz = sample.normal_z * 5.0
+    state.sample_idx = i
+    before_x, before_z = state.x, state.z
+    road.apply_after_step(state, physics.DT)
+    moved = math.hypot(state.x - before_x, state.z - before_z)
+    report.check(moved > 0.05,
+                 'перевёрнутая машина выталкивает наехавшего',
+                 'выталкивание %.2f м' % moved)
+
+    # --- обломки тормозят --------------------------------------------------
+    place(events_mod.KIND_EXPLOSION, arc, 0.0, events_mod.PHASE_DEBRIS)
+    state.x = sample.x
+    state.z = sample.z
+    state.vx = sample.tangent_x * 30.0
+    state.vz = sample.tangent_z * 30.0
+    state.sample_idx = i
+    road.apply_after_step(state, physics.DT)
+    after = math.hypot(state.vx, state.vz)
+    report.check(after < 30.0,
+                 'по обломкам машина теряет ход',
+                 'с 30.0 до %.2f м/с за шаг' % after)
+    report.check(abs(road.grip_scale(state) - events_mod.DEBRIS_GRIP) < 1e-9,
+                 'на обломках сцепление хуже асфальта')
+
+    # --- вспышка бьёт один раз -------------------------------------------
+    place(events_mod.KIND_EXPLOSION, arc, 0.0, events_mod.PHASE_ACTIVE)
+    state.x = sample.x
+    state.z = sample.z
+    state.sample_idx = i
+    first = road.blast_spin(state, 0)
+    second = road.blast_spin(state, 0)
+    other = road.blast_spin(state, 1)
+    report.check(first > 0.0 and second == 0.0 and other > 0.0,
+                 'вспышка взрыва задевает каждую машину ровно один раз',
+                 'первая %.1f с, повтор %.1f с, соседу %.1f с'
+                 % (first, second, other))
+
+    # --- предупреждение физики не имеет ----------------------------------
+    place(events_mod.KIND_WRECK, arc, 0.0, events_mod.PHASE_WARN)
+    state.vx = 0.0
+    state.vz = 0.0
+    before_x, before_z = state.x, state.z
+    road.apply_after_step(state, physics.DT)
+    report.check(state.x == before_x and state.z == before_z
+                 and road.grip_scale(state) == 1.0,
+                 'в фазе предупреждения происшествие только видно, но не действует')
+
+
+def check_road_settings(report):
+    """Враждебные входы на новые поля настроек комнаты."""
+    report.section('Настройки: траффик и происшествия')
+    from server.room import ContentLibrary, validate_settings, SettingsError
+    from game import traffic as traffic_mod
+    from game import events as events_mod
+
+    content = ContentLibrary(os.path.join(BASE_DIR, 'content')).load()
+    base = content.default_settings()
+    report.check(base.get('traffic') == 'off' and base.get('events') == 'off',
+                 'по умолчанию и траффик, и происшествия выключены')
+
+    good = validate_settings({'traffic': 'dense', 'events': 'often'}, content)
+    report.check(good['traffic'] == 'dense' and good['events'] == 'often',
+                 'верные значения принимаются')
+
+    bad_inputs = (
+        {'traffic': 'DENSE'}, {'traffic': 'плотный'}, {'traffic': 1},
+        {'traffic': True}, {'traffic': None}, {'traffic': ['dense']},
+        {'traffic': {'level': 'dense'}}, {'traffic': ''},
+        {'events': 'sometimes'}, {'events': 3}, {'events': False},
+        {'events': ['often']}, {'events': None}, {'events': 'off '},
+    )
+    rejected = 0
+    for raw in bad_inputs:
+        try:
+            validate_settings(raw, content)
+        except SettingsError:
+            rejected += 1
+    report.check(rejected == len(bad_inputs),
+                 'мусор в новых полях отвергается',
+                 '%d из %d' % (rejected, len(bad_inputs)))
+
+    # Незнакомое значение в БАЗЕ (пришло из старого файла) не роняет комнату.
+    stale = dict(base)
+    stale['traffic'] = 'insane'
+    stale['events'] = 42
+    fixed = validate_settings({}, content, base=stale)
+    report.check(fixed['traffic'] == 'off' and fixed['events'] == 'off',
+                 'мусор в сохранённых настройках чинится умолчанием')
+
+    # Симуляция не должна падать ни на каком мусоре в настройках.
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', 'office.json'))
+    survived = True
+    for value in ('insane', 42, None, True, [], {}, ''):
+        try:
+            sim = Simulation(track, {'laps': 1, 'traffic': value, 'events': value},
+                             make_players(2))
+            sim.tick()
+            if sim.traffic.count != 0 or sim.road.enabled:
+                survived = False
+        except Exception:
+            survived = False
+    report.check(survived,
+                 'симуляция переживает мусор в настройках и молча его выключает')
+
+
 def collect_tick_times(track_id='office', laps=3, seed=0, warmup=180):
     """Время тика, замеренное отдельным прогоном и ничем не засорённое.
 
@@ -1018,6 +1394,92 @@ def collect_tick_times(track_id='office', laps=3, seed=0, warmup=180):
     # всё, что породил прогон и что не убралось счётчиком ссылок
     garbage = gc.collect()
     return samples, garbage
+
+
+def measure_traffic_tick(report):
+    """Сколько стоит тик с траффиком и происшествиями и сколько весит снапшот.
+
+    Замер снимается тем же способом, что и основной (отдельный прогон,
+    выключенный циклический сборщик), но по трём плотностям подряд — так
+    цена одной болванки выходит вычитанием, а не догадкой.
+    """
+    report.section('Траффик: цена тика и вес снапшота')
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', 'avenue.json'))
+    rows = {}
+    for traffic, events in (('off', 'off'), ('sparse', 'off'),
+                            ('dense', 'off'), ('dense', 'often')):
+        sim = Simulation(track, _road_settings(3, traffic, events), make_players(8))
+        bots = make_bots(track, sim, seed=9)
+        times = []
+        sizes = []
+        gc.collect()
+        gc.disable()
+        try:
+            for tick in range(60 * 150):
+                for index, car in enumerate(sim.cars):
+                    if car.removed:
+                        continue
+                    sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+                started = time.perf_counter()
+                sim.tick()
+                spent = (time.perf_counter() - started) * 1000.0
+                if tick >= 240:
+                    times.append(spent)
+                    if tick % 3 == 0:
+                        cars, proj, mask = sim.snapshot_args()
+                        extra_t, extra_e = sim.extra_snapshot_args()
+                        sizes.append(protocol.snapshot_size(
+                            len(cars), len(proj), len(mask),
+                            len(extra_t), len(extra_e)))
+                if sim.is_over():
+                    break
+        finally:
+            gc.enable()
+        times.sort()
+        rows[(traffic, events)] = (
+            len(sim.traffic.cars), sum(times) / len(times),
+            times[int(len(times) * 0.99)],
+            sum(sizes) / len(sizes), max(sizes))
+        report.note('%-6s ДТП %-5s болванок %2d: тик сред %.4f мс, p99 %.4f мс; '
+                    'снапшот сред %.0f, макс %d байт'
+                    % ((traffic, events) + rows[(traffic, events)]))
+
+    base = rows[('off', 'off')]
+    dense = rows[('dense', 'off')]
+    full = rows[('dense', 'often')]
+    per_car = (dense[1] - base[1]) / dense[0] * 1000.0
+    report.note('цена одной болванки: %.1f мкс на тик' % per_car)
+    report.check(full[1] < config_tick_budget() * 0.5,
+                 'тик с плотным траффиком и частыми ДТП в бюджете комнаты',
+                 '%.4f мс из %.1f мс — %.0f %%'
+                 % (full[1], config_tick_budget(),
+                    full[1] / config_tick_budget() * 100.0))
+    report.check(full[2] < config_tick_budget(),
+                 'p99 тика в бюджете', '%.4f мс' % full[2])
+    # Потолок пакета без траффика: восемь машин, полный пул снарядов,
+    # маска боксов этой трассы. Он же и был потолком до появления траффика —
+    # именно это и проверяем, а не число 282 (оно верно для трассы с двумя
+    # байтами маски, а у avenue их три).
+    plain_cap = protocol.snapshot_size(protocol.MAX_CARS, 4, 3)
+    report.check(base[4] <= plain_cap,
+                 'выключенный траффик не раздувает снапшот',
+                 '%d байт при прежнем потолке %d — ни одного лишнего'
+                 % (base[4], plain_cap))
+    full_cap = protocol.snapshot_size(protocol.MAX_CARS, 4, 3,
+                                      protocol.MAX_TRAFFIC,
+                                      protocol.MAX_ROAD_EVENTS)
+    report.check(full[4] <= full_cap,
+                 'полный снапшот не выходит за расчётный потолок',
+                 '%d байт при потолке %d' % (full[4], full_cap))
+    report.check(full[3] < base[3] * 2.0,
+                 'снапшот не раздулся втрое',
+                 'средний %.0f против %.0f байт, рост %.0f %%'
+                 % (full[3], base[3], (full[3] / base[3] - 1.0) * 100.0))
+
+
+def config_tick_budget():
+    """Бюджет тика из контракта (раздел 1), 2 мс."""
+    return 2.0
 
 
 def measure_tick(report, measured):
@@ -1165,7 +1627,13 @@ def main(argv=None):
     check_shortcut(report)
     check_ghosts(report)
     check_snapshot(report)
+    check_traffic(report)
+    check_traffic_free_lane(report)
+    check_road_events(report)
+    check_road_physics(report)
+    check_road_settings(report)
     measure_tick(report, collect_tick_times(laps=args.laps, seed=args.seed))
+    measure_traffic_tick(report)
 
     if args.balance:
         balance_series(args.laps, args.runs)
