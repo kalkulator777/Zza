@@ -8,6 +8,7 @@
     python3 run.py --name "Комп Васи"
     python3 run.py --records /srv/racing/records.json   # где хранить рекорды
     python3 run.py --no-records                         # не хранить их вовсе
+    python3 run.py --physics shadow    # рядом с гонкой крутится мир Rapier
 
 Запустивший получает ссылку с токеном хоста; остальные заходят на
 http://<ip-этой-машины>:<порт>. Адреса, которые надо диктовать соседям,
@@ -33,6 +34,7 @@ if BASE_DIR not in sys.path:
 
 import tornado.log
 
+from game import rapier_host
 from server import config
 from server.app import ServerContext, make_app
 from server.discovery import Discovery, local_addresses
@@ -61,11 +63,21 @@ def parse_args(argv=None):
     parser.add_argument('--no-records', action='store_true',
                         help='не хранить рекорды кругов: ничего не читать и '
                              'не писать на диск')
+    # Физика (§12.22). Умолчание — classic: старая арифметика раздела 6,
+    # ни wasmtime, ни модуля физики процесс при ней не касается.
+    parser.add_argument('--physics', choices=rapier_host.BACKENDS,
+                        default=rapier_host.backend(),
+                        help='какая физика считает гонку: classic — прежняя '
+                             '(умолчание), shadow — прежняя плюс мир Rapier '
+                             'рядом, для замеров и сверки хэша')
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error('порт вне диапазона 1..65535')
     if args.name is None:
         args.name = 'Гонки на %s' % socket.gethostname()
+    # Флаг живёт в окружении, а не в аргументах: физика лежит в game/ и про
+    # разбор командной строки знать не должна.
+    os.environ[rapier_host.ENV_VAR] = args.physics
     return args
 
 
@@ -99,6 +111,8 @@ def print_banner(args, host_url, addresses, notes):
     print('  Обнаружение других серверов: UDP %d' % config.DISCOVERY_PORT)
     print('  Рекорды кругов: %s' % (args.records if not args.no_records else 'выключены'))
     print('  Комнату может создать любой, кто зашёл на этот сервер')
+    if args.physics != rapier_host.CLASSIC:
+        print('  Физика: %s — мир Rapier крутится РЯДОМ с гонкой (§12.22)' % args.physics)
     for note in notes:
         print('  ! %s' % note)
     print('')

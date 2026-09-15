@@ -437,6 +437,10 @@ function onRaceInit(msg) {
     audio.startRace();
     audioState.engineOn = true;
 
+    // Полотно теневому миру — из того же объекта трассы, что ушёл рендеру:
+    // квантованная осевая линия и есть вход физики (§12.21).
+    if (rapierHost) rapierHost.buildTrack(net.track || msg.track);
+
     setScreen(SCREEN_RACE);
 }
 
@@ -1128,6 +1132,28 @@ function wsUrl() {
     return proto + '//' + location.host + '/ws';
 }
 
+// --- вторая физика за флагом (§12.22) ---------------------------------------
+//
+// ?physics=shadow подгружает хозяина модуля Rapier и строит им полотно
+// текущей гонки. Кадровый цикл о нём не знает: предсказание своей машины
+// по-прежнему считает static/js/physics.js. Без флага модуль даже не
+// скачивается — ни одного лишнего килобайта и ни одной проверки в кадре.
+let rapierHost = null;
+
+function bootRapier() {
+    const wanted = new URLSearchParams(location.search).get('physics');
+    if (!wanted || wanted === 'classic') return;
+    import('./rapier_host.js').then((mod) => mod.RapierHost.load({})).then((host) => {
+        rapierHost = host;
+        window.__racing.rapier = host;
+        // Гонка могла начаться, пока модуль качался.
+        if (app.raceBuilt && net.track) host.buildTrack(net.track);
+        console.log('Rapier: хозяин загружен, dt=' + host.dt);
+    }).catch((err) => {
+        console.error('Rapier: хозяин не загрузился —', err);
+    });
+}
+
 /** Токен хоста из адресной строки: ?host=<token> (раздел 2). */
 function hostToken() {
     const params = new URLSearchParams(location.search);
@@ -1171,6 +1197,8 @@ function boot() {
         lobby: lobby,
         menu: menu,
     };
+
+    bootRapier();
 }
 
 boot();

@@ -1,0 +1,221 @@
+{
+ "doc": "Выпущено tools/vendor_wasmtime.py. Руками не править.",
+ "files": {
+  "wasmtime-48.0.0.dist-info/METADATA": {
+   "mode": "0644",
+   "sha256": "928283e8400323155ec2c6affb3be30c8d913669556f3acf4a79eb199c03ba32",
+   "size": 5074
+  },
+  "wasmtime-48.0.0.dist-info/RECORD": {
+   "mode": "0644",
+   "sha256": "fd9d0644a86dedfd7c9cdb31b6a509019720ee178d1358007124528532875e20",
+   "size": 3348
+  },
+  "wasmtime-48.0.0.dist-info/WHEEL": {
+   "mode": "0644",
+   "sha256": "84de45bfd3049ac8fe142620d67e60c7b2efebe8653322aac729edec749bfe4e",
+   "size": 105
+  },
+  "wasmtime-48.0.0.dist-info/licenses/LICENSE": {
+   "mode": "0644",
+   "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5",
+   "size": 12243
+  },
+  "wasmtime-48.0.0.dist-info/top_level.txt": {
+   "mode": "0644",
+   "sha256": "1a97fbd7dc8d93022a49d48be1103f424f61db1e66ed4f4aed22eff6dc712e90",
+   "size": 9
+  },
+  "wasmtime/__init__.py": {
+   "mode": "0644",
+   "sha256": "bd4d388a475a422e70f8ddbb93ba628741d5fb359639e1035f0fe2ea032c62ba",
+   "size": 1872
+  },
+  "wasmtime/_bindings.py": {
+   "mode": "0644",
+   "sha256": "178a73b75a60c5a447e66d4468d946a5de08726f4af5c003ed7eefd971995f7e",
+   "size": 313334
+  },
+  "wasmtime/_config.py": {
+   "mode": "0644",
+   "sha256": "7b2986a642245cac33a97d9cc625b62768f4d9258897ad5515f17a75905c98ba",
+   "size": 20753
+  },
+  "wasmtime/_engine.py": {
+   "mode": "0644",
+   "sha256": "02ab2ebf00c03289fffd12e677b4236af17a4bc8ca951ebe651bebb75b48f1ee",
+   "size": 821
+  },
+  "wasmtime/_error.py": {
+   "mode": "0644",
+   "sha256": "2375d3fbafb18a152dd8ec638901b02c0ab3e51fc0375ec8fe44c1bc6934ca76",
+   "size": 2115
+  },
+  "wasmtime/_exportable.py": {
+   "mode": "0644",
+   "sha256": "67ecdfe91601af2ba6533ebd4557ef77dfd2e651eaef6609028ca2289885d15f",
+   "size": 318
+  },
+  "wasmtime/_extern.py": {
+   "mode": "0644",
+   "sha256": "4e3b5e97b67a8502b1d36088adb1f12d300a17798d693fc6191cb87fdb1f5338",
+   "size": 1801
+  },
+  "wasmtime/_ffi.py": {
+   "mode": "0644",
+   "sha256": "40c83ceef08c4d729a019eca3d13dfe82116b28a2c29993e28cafd64f88e8d7e",
+   "size": 7054
+  },
+  "wasmtime/_func.py": {
+   "mode": "0644",
+   "sha256": "d4478c40155f71d47310740be3ee595477ef2eaa5519c84094ba5bc303f13173",
+   "size": 8334
+  },
+  "wasmtime/_globals.py": {
+   "mode": "0644",
+   "sha256": "eec111a68ffb42adb2292bc56861a733d4cd349f3df0b9f0b5c657d2726cc0be",
+   "size": 2257
+  },
+  "wasmtime/_instance.py": {
+   "mode": "0644",
+   "sha256": "3eb3fad12a3ee3936ed7cf9109b8e2eba61041a67ca327b50ea64472fec628dc",
+   "size": 3400
+  },
+  "wasmtime/_instance_pre.py": {
+   "mode": "0644",
+   "sha256": "01b7a31d278c9b798188909654468901b1e1a5a3e65776e2c310a7c8d0105e34",
+   "size": 1912
+  },
+  "wasmtime/_linker.py": {
+   "mode": "0644",
+   "sha256": "5d739e35abd3a3ae51ebb27ef9d66e2b0c8efc7da0a296d46caa2d59eb19c73e",
+   "size": 10873
+  },
+  "wasmtime/_managed.py": {
+   "mode": "0644",
+   "sha256": "eb0355aff974f446c0da3ce35d87aabe53844c77990ec4115edc0cb47e4475b9",
+   "size": 2574
+  },
+  "wasmtime/_memory.py": {
+   "mode": "0644",
+   "sha256": "62d4daaa89aa50541af8b0b61b8321529adc0f2f428bd4980863ec06f2402561",
+   "size": 6115
+  },
+  "wasmtime/_module.py": {
+   "mode": "0644",
+   "sha256": "1fa29ee6a63fccf6b5fd783f149d2a3924e873dc86f92bde11ad791f7f081ad3",
+   "size": 5898
+  },
+  "wasmtime/_sharedmemory.py": {
+   "mode": "0644",
+   "sha256": "1ae2c696fa1e94870830641d0330fce8f0827b23ae6f9ca1462e76d5cc4cded0",
+   "size": 2748
+  },
+  "wasmtime/_slab.py": {
+   "mode": "0644",
+   "sha256": "433da4c51d44aef4f48cbc5fb12b2f6b59f3218515190947e8364b83999db4de",
+   "size": 671
+  },
+  "wasmtime/_store.py": {
+   "mode": "0644",
+   "sha256": "2b0581944597b63a102026ab2efdc610af9114eba76dacefda8a33b1b1271e45",
+   "size": 6021
+  },
+  "wasmtime/_table.py": {
+   "mode": "0644",
+   "sha256": "b3944099df01a2f3e9cc2694b8441419197cb7f36040cc667e961d19b7113ab4",
+   "size": 3850
+  },
+  "wasmtime/_tag.py": {
+   "mode": "0644",
+   "sha256": "abdf17aff4507b430690ed6b13152d65524272c8fa7ee14e8ceccfe88815319a",
+   "size": 1812
+  },
+  "wasmtime/_trap.py": {
+   "mode": "0644",
+   "sha256": "4d59f5726610c9c2336fd37e07ef9dcf7460160a4c5e90b1a962bc72157cb4bf",
+   "size": 12495
+  },
+  "wasmtime/_types.py": {
+   "mode": "0644",
+   "sha256": "72a4a7f54295b77918184707122074d9ea15c246c9790f32f8cf537575381d54",
+   "size": 17626
+  },
+  "wasmtime/_value.py": {
+   "mode": "0644",
+   "sha256": "bda6c04cebe3c6b4ecb8c307a074a4f5380d74ad771fec9e0d3f861fc0670c73",
+   "size": 9509
+  },
+  "wasmtime/_wasi.py": {
+   "mode": "0644",
+   "sha256": "f43f6f86e82512b7cca0cee0921fe154f190ce18e06614f13b54f71dba56deb1",
+   "size": 7382
+  },
+  "wasmtime/_wat2wasm.py": {
+   "mode": "0644",
+   "sha256": "fc25e79eb06f4fd66fdbb659bfc7485c749acb1a48557ae33fe68e02dd741f9d",
+   "size": 1802
+  },
+  "wasmtime/component/__init__.py": {
+   "mode": "0644",
+   "sha256": "9083779d881974fa1cc9cb78561cc128dba8b2d117c62d4e0dd4c3cb11ed8c10",
+   "size": 1303
+  },
+  "wasmtime/component/_component.py": {
+   "mode": "0644",
+   "sha256": "5dec270461e1f2dcc0340cb110b573a3565427c12fccf39700292940a9347b92",
+   "size": 5796
+  },
+  "wasmtime/component/_enter.py": {
+   "mode": "0644",
+   "sha256": "213fd2bb17eebb1a83f86816c719b052ecfbc2eee062ff7eb45feb5b5199d9d7",
+   "size": 1165
+  },
+  "wasmtime/component/_func.py": {
+   "mode": "0644",
+   "sha256": "9cb353d9ef0d9cc79b4c3b9e31ec02098506583f2e3fefc0d317af06c0224132",
+   "size": 2797
+  },
+  "wasmtime/component/_instance.py": {
+   "mode": "0644",
+   "sha256": "8ab4014012c9b59b393586e72f7887228aada13bb2a2b70cda637919a98a4325",
+   "size": 2198
+  },
+  "wasmtime/component/_linker.py": {
+   "mode": "0644",
+   "sha256": "7855091bf9366e41632bb97c93218bdc61cd341a787341abccae882fddf06fb7",
+   "size": 10495
+  },
+  "wasmtime/component/_resource_type.py": {
+   "mode": "0644",
+   "sha256": "5b31131e846cf95f8a7a01da9889b9ab21897812a45c5843ee937036ab112350",
+   "size": 1327
+  },
+  "wasmtime/component/_resources.py": {
+   "mode": "0644",
+   "sha256": "2cd6724f60b6ae7f1dc5a7c3ad5b22c0b1bc816922947dc8e56efa70ce323068",
+   "size": 4568
+  },
+  "wasmtime/component/_types.py": {
+   "mode": "0644",
+   "sha256": "7e54ca888cad3017ac61bbeed8645e47fea7d5534510786961e0c43f39741ea3",
+   "size": 50684
+  },
+  "wasmtime/linux-x86_64/_libwasmtime.so": {
+   "mode": "0755",
+   "sha256": "82d77282a932ab09e4bad32cd3ac082114da981559db04c49b70049f98ae7644",
+   "size": 31283096
+  },
+  "wasmtime/py.typed": {
+   "mode": "0644",
+   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+   "size": 0
+  }
+ },
+ "tops": [
+  "wasmtime",
+  "wasmtime-48.0.0.dist-info"
+ ],
+ "wheel": "wasmtime-48.0.0-py3-none-manylinux1_x86_64.whl",
+ "wheel_sha256": "58544d539053dff7bd4cf30c40d7a540862d683013c0dfa6ba46a063f5b682f7"
+}

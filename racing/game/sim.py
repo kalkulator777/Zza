@@ -47,6 +47,7 @@ import os
 
 from . import physics
 from . import protocol
+from . import rapier_host
 from .items import ItemSystem, ITEM_ID_BY_CODE
 from .events import RoadEvents
 from .traffic import TrafficSystem
@@ -282,6 +283,16 @@ class Simulation(object):
 
         self.items = ItemSystem(track, self.settings)
         self._update_places()
+
+        # --- вторая физика за флагом (§12.22) ------------------------------
+        # При поднятом флаге рядом с гонкой заводится мир Rapier: те же
+        # вводы, тот же темп, но состояние машин по-прежнему считает
+        # game/physics.py. Выбор делается ЗДЕСЬ И ОДИН РАЗ — attach()
+        # подменяет метод шага на экземпляре, поэтому при выключенном флаге
+        # горячий путь тика не получает ни одной лишней проверки.
+        self.rapier = None
+        if rapier_host.enabled():
+            self.rapier = rapier_host.attach(self)
 
     # --- приём ввода ---------------------------------------------------------
 

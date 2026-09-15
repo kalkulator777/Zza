@@ -37,6 +37,7 @@ import gc
 import math
 import os
 import random
+import subprocess
 import sys
 import time
 
@@ -257,6 +258,35 @@ class Autopilot(object):
 
 
 # --- каркас проверок --------------------------------------------------------
+
+def check_generated(report):
+    """Выпущенное генераторами совпадает с тем, что лежит в репозитории.
+
+    Почему здесь, а не в smoke_test.py. Обе проверки — про содержимое
+    репозитория, а не про браузер и не про машину: они не зависят ни от
+    загрузки, ни от Firefox, и их незачем платить временем сквозного теста.
+    А test_sim.py гоняют после каждой правки физики и трасс — то есть ровно
+    тогда, когда раскладка ABI и может разъехаться.
+
+    Первая проверка обязана быть первой в прогоне: если раскладка в
+    native/abi/ разошлась с tools/abi_layout.json, то все остальные числа
+    считаны по неверным смещениям, и разбираться надо с ней, а не с ними.
+    """
+    report.section('Выпущенное генераторами')
+    for args, title in (
+            ([sys.executable, os.path.join(BASE_DIR, 'tools', 'gen_abi.py'), '--check'],
+             'раскладки ABI совпадают с tools/abi_layout.json'),
+            ([sys.executable, os.path.join(BASE_DIR, 'tools', 'vendor_wasmtime.py'), '--check'],
+             'wasmtime в vendor/ цел и совпадает с vendor/wasmtime.lock.json')):
+        done = subprocess.run(args, cwd=BASE_DIR, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        detail = done.stdout.decode('utf-8', 'replace').strip().splitlines()
+        report.check(done.returncode == 0, title,
+                     detail[-1] if detail else 'код возврата %d' % done.returncode)
+        if done.returncode != 0:
+            for line in detail[:10]:
+                report.note(line)
+
 
 class Report(object):
     """Накопитель результатов: печатает по ходу, помнит провалы."""
@@ -1713,6 +1743,7 @@ def main(argv=None):
 
     report = Report()
     started = time.time()
+    check_generated(report)
     check_races(report, args.laps, args.seed)
     check_shield(report)
     check_rocket(report)

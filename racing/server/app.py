@@ -20,6 +20,7 @@ from tornado.ioloop import IOLoop
 from tornado.log import app_log
 
 from game import protocol
+from game import rapier_host
 
 from . import config
 from .player import Player, sanitize_text
@@ -419,6 +420,14 @@ def make_app(ctx):
         (r'/((?:%s)/.*)' % _ASSET_DIRS, StaticHandler, static),
         (r'/([^/]+\.(?:%s))' % _ASSET_EXT, StaticHandler, static),
     ]
+    # Модуль физики и выпущенная раскладка лежат в native/, а не в static/:
+    # это один и тот же файл для сервера и для браузера, копия в static/
+    # была бы вторым его экземпляром. Маршрут появляется ТОЛЬКО при поднятом
+    # флаге --physics: при выключенном сервер отдаёт ровно то же, что до 4b.
+    if rapier_host.enabled():
+        handlers.append((r'/(native/(?:abi|testbed)/.*)', StaticHandler,
+                         {'path': os.path.dirname(os.path.dirname(
+                             os.path.abspath(__file__)))}))
     return tornado.web.Application(
         handlers,
         websocket_ping_interval=config.WS_PING_INTERVAL,
