@@ -28,6 +28,13 @@ import json
 import math
 import os
 
+# Список полей CarTuning. Импортируется из хозяина модуля физики, который
+# ВЫВОДИТ его из выпущенной раскладки (§12.21): пятого описания одной
+# структуры в проекте быть не должно. При битом native/abi/ кортеж пуст —
+# тогда имена полей не проверяются, но каталог всё равно грузится, и сервер
+# поднимается ровно как раньше.
+from .rapier_host import TUNING_FIELDS
+
 # Обязательные характеристики и допустимые пределы. Пределы намеренно широкие:
 # это защита от опечаток и перепутанных полей, а не диктат баланса.
 STAT_LIMITS = {
@@ -52,6 +59,17 @@ TOP_SPEED_LIMITS = (25.0, 70.0)       # м/с, то есть 90..252 км/ч
 # Прежние 55 м/с (198 км/ч) упирались ровно в то, куда балансировщик уже
 # дотянул машины, и мешали двигать потолок дальше.
 
+# Настройки машины для физики Rapier (§12.23): три блока на машину.
+#   body   — кузов: габариты, масса, вынос колёс. Общий для обоих режимов,
+#            потому что машина у режимов одна и та же;
+#   arcade — управляемость в аркадном режиме;
+#   sim    — она же в реалистичном.
+# Значения ложатся ПОВЕРХ пресета режима из native/src/world.rs, поэтому
+# в каталоге лежит только то, чем машина отличается от режима, а не все
+# 32 числа пятью копиями. Имена полей — поля CarTuning, они проверяются.
+TUNING_BLOCKS = ('body', 'arcade', 'sim')
+TUNING_MODES = ('arcade', 'sim')
+
 SHAPE_STYLES = ('hatch', 'muscle', 'buggy', 'van', 'wedge')
 SHAPE_NUMBERS = (
     'length', 'width', 'height', 'wheelbase', 'track_width',
@@ -70,7 +88,7 @@ class CarValidationError(ValueError):
 class CarSpec(object):
     """Одна машина из ``content/cars.json``."""
 
-    __slots__ = ('id', 'name', 'desc', 'stats', 'shape', 'bars',
+    __slots__ = ('id', 'name', 'desc', 'stats', 'shape', 'bars', 'tuning',
                  'top_speed', 'boost_top') + STAT_NAMES
 
     def __init__(self, data):
@@ -80,6 +98,10 @@ class CarSpec(object):
         self.stats = dict(data['stats'])
         self.shape = dict(data['shape'])
         self.bars = dict(data['bars'])
+        # Настройки Rapier: словарь блоков (§12.23). У машины без блока
+        # tuning он пустой — такая машина едет чистым пресетом режима.
+        self.tuning = {name: dict(values) for name, values
+                       in (data.get('tuning') or {}).items()}
         for name in STAT_NAMES:
             setattr(self, name, float(self.stats[name]))
         self.top_speed = solve_top_speed(self.engine_force, self.max_speed,
@@ -102,6 +124,9 @@ class CarSpec(object):
             'bars': dict(self.bars),
             'stats': dict(self.stats),
             'shape': dict(self.shape),
+            # Настройки Rapier едут клиенту вместе со stats и по той же
+            # причине: предсказывать чужими числами нельзя (§12.23).
+            'tuning': {name: dict(values) for name, values in self.tuning.items()},
         }
 
     def __repr__(self):
@@ -272,6 +297,46 @@ def validate(row, index=0) -> None:
         raise CarValidationError('%s: колёсная база длиннее самой машины' % where)
     if shape['track_width'] > shape['width']:
         raise CarValidationError('%s: колея шире кузова' % where)
+
+    tuning = row.get('tuning')
+    if tuning is not None:
+        if not isinstance(tuning, dict):
+            raise CarValidationError('%s: tuning должен быть объектом' % where)
+        extra = set(tuning) - set(TUNING_BLOCKS)
+        if extra:
+            raise CarValidationError('%s: в tuning лишние блоки: %s (ожидались %s)'
+                                     % (where, ', '.join(sorted(extra)),
+                                        ', '.join(TUNING_BLOCKS)))
+        for mode in TUNING_MODES:
+            if mode not in tuning:
+                raise CarValidationError(
+                    '%s: в tuning нет блока %r. Настройка нужна под ОБА режима '
+                    '(§12.23): иначе в одном из них машина поедет пресетом, '
+                    'а не собой' % (where, mode))
+        for block, values in tuning.items():
+            if not isinstance(values, dict):
+                raise CarValidationError('%s: tuning.%s должен быть объектом'
+                                         % (where, block))
+            for name, value in values.items():
+                # TUNING_FIELDS пуст только при битом native/abi/ — тогда
+                # сверять имена не с чем, и проверка честно пропускается.
+                if TUNING_FIELDS and name not in TUNING_FIELDS:
+                    raise CarValidationError(
+                        '%s: tuning.%s.%s — в CarTuning нет такого поля'
+                        % (where, block, name))
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise CarValidationError('%s: tuning.%s.%s не число: %r'
+                                             % (where, block, name, value))
+        # Кузов у режимов один: поле, заданное и в body, и в режиме, — это
+        # две правды об одном числе, и побеждает тихо одна из них.
+        body = set(tuning.get('body') or ())
+        for mode in TUNING_MODES:
+            clash = body & set(tuning.get(mode) or ())
+            if clash:
+                raise CarValidationError(
+                    '%s: поля %s заданы и в tuning.body, и в tuning.%s — '
+                    'кузов у режимов общий, держите число в одном месте'
+                    % (where, ', '.join(sorted(clash)), mode))
 
     bars = row['bars']
     if not isinstance(bars, dict):

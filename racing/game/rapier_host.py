@@ -61,6 +61,29 @@ def enabled() -> bool:
     return backend() != CLASSIC
 
 
+# --- модель управляемости ----------------------------------------------------
+#
+# Настройка комнаты ``physics`` (§12.23) выбирает пресет CarTuning: «аркада»
+# или «симулятор». Номер — это аргумент ``rp_world_reset`` и
+# ``rp_tuning_preset``, порядок задан перечислением ``Preset`` в
+# native/src/world.rs: менять только парой.
+#
+# Список имён повторён в ``server.config.PHYSICS_MODES``: game/ про server/ не
+# знает намеренно — ровно так же живёт WEATHER_GRIP в game/physics.py. Чтобы
+# копии не разъехались молча, ``tools/test_sim.py`` сверяет их одной проверкой.
+PRESET_NAMES = ('arcade', 'sim')
+
+
+def preset_index(name) -> int:
+    """Номер пресета по имени режима. Мусор — это аркада, как и умолчание."""
+    if not isinstance(name, str):
+        return 0
+    try:
+        return PRESET_NAMES.index(name.strip().lower())
+    except ValueError:
+        return 0
+
+
 # --- раскладка и рантайм ------------------------------------------------------
 
 def _load_abi():
@@ -80,17 +103,50 @@ except OSError as _exc:          # native/abi/ не на месте — repo б�
     abi, _ABI_ERROR = None, _exc
 
 # Геометрия полотна, которую хозяин передаёт модулю (§12.21). Модуль игровых
-# констант не знает, поэтому оба хозяина ОБЯЗАНЫ передать одно и то же:
-# WALL_MARGIN берётся из game/track.py, а static/js/rapier_host.js берёт его
-# из static/js/track.js — это одно число контракта, а не два.
-from .track import WALL_MARGIN                        # noqa: E402  (после _load_abi)
-
-WALL_HEIGHT = 2.0      # высота стенки за обочиной, м (§12.21)
-TRACK_FRICTION = 1.1   # трение полотна, как в стенде разведки
+# констант не знает, поэтому оба хозяина ОБЯЗАНЫ передать одно и то же.
+# Объявлены они ОДИН раз, в game/track.py, и уезжают клиенту в race_init.track
+# (§12.23): здесь их не переопределяют, а импортируют, и браузерный хозяин
+# берёт те же числа из присланной записи трассы. На 4b два из них лежали
+# по копии в каждом хозяине — эта копия убрана.
+from .track import (WALL_MARGIN, WALL_HEIGHT,         # noqa: E402  (после _load_abi)
+                    TRACK_FRICTION)
 
 
 class HostError(RuntimeError):
     """Модуль не тот, ABI не тот, рантайма нет — всё сюда."""
+
+
+# Имя поля CarTuning -> его индекс во f32. ВЫВОДИТСЯ из выпущенной раскладки,
+# а не переписывается руками: список полей живёт в tools/abi_layout.json, и
+# четвёртое его описание тут было бы той же болезнью, что и третье (§12.21).
+def _tuning_index() -> dict:
+    if abi is None:
+        return {}
+    skip = ('SIZE', 'FLOATS')
+    return {name.lower(): getattr(abi.CarTuning, name)
+            for name in dir(abi.CarTuning)
+            if name.isupper() and name not in skip}
+
+
+TUNING_INDEX = _tuning_index()
+TUNING_FIELDS = tuple(sorted(TUNING_INDEX))
+
+
+def mesh_params(track) -> tuple:
+    """Три числа сетки полотна: (wall_margin, wall_height, friction).
+
+    Берутся ОТТУДА ЖЕ, откуда их получит клиент, — из записи трассы формата
+    12.1, если она словарь ``Track.to_client()``. Для объекта ``Track``
+    источник тот же: модуль ``game/track.py``, который эти поля и заполняет.
+    """
+    if isinstance(track, dict):
+        try:
+            return (float(track['wall_margin']), float(track['wall_height']),
+                    float(track['friction']))
+        except KeyError as exc:
+            raise HostError('в записи трассы нет поля %s: сетку полотна не из '
+                            'чего строить (§12.23)' % exc)
+    return (WALL_MARGIN, WALL_HEIGHT, TRACK_FRICTION)
 
 
 def load_wasmtime():
@@ -211,10 +267,15 @@ class RapierHost(object):
         self._ex['rp_world_reset'](self._store, int(preset))
         self._sync(force=True)
 
-    def build_track(self, track, wall_margin: float = WALL_MARGIN,
-                    wall_height: float = WALL_HEIGHT,
-                    friction: float = TRACK_FRICTION) -> None:
+    def build_track(self, track, wall_margin: float = None,
+                    wall_height: float = None,
+                    friction: float = None) -> None:
         """Залить осевую линию и попросить модуль построить полотно.
+
+        Три числа сетки по умолчанию берутся из самой записи трассы
+        (``mesh_params``), а не из констант хозяина: у браузера их взять
+        больше неоткуда, и брать их разными способами значило бы вернуть
+        ту самую копию.
 
         ``track`` — либо ``game.track.Track``, либо уже готовый словарь
         ``Track.to_client()``. Числа в обоих случаях одни и те же: сервер
@@ -222,6 +283,14 @@ class RapierHost(object):
         ``round(v, 3)`` и кладёт их в ``Float32Array``. Это и есть общий
         вход физики из §12.21 — не картинка, а данные.
         """
+        if wall_margin is None or wall_height is None or friction is None:
+            margin, height, rub = mesh_params(track)
+            if wall_margin is None:
+                wall_margin = margin
+            if wall_height is None:
+                wall_height = height
+            if friction is None:
+                friction = rub
         data = centerline_bytes(track)
         count = len(data) // (4 * abi.TRACK_COLUMNS)
         store = self._store
@@ -260,6 +329,30 @@ class RapierHost(object):
         """Загрузить пресет в шаблон настроек следующей машины."""
         self._ex['rp_tuning_preset'](self._store, int(preset))
         self._sync()
+
+    def set_tuning(self, values) -> None:
+        """Наложить настройки машины на шаблон: ``{имя поля: число}``.
+
+        Правки ложатся ПОВЕРХ загруженного пресета, поэтому в
+        ``content/cars.json`` лежит только то, чем машина отличается от
+        режима, а не все 32 числа пятью копиями. Следующая ``spawn_car``
+        возьмёт шаблон как есть.
+        """
+        if not values:
+            return
+        self._sync()
+        buf = self.tuning
+        for name, value in values.items():
+            index = TUNING_INDEX.get(name)
+            if index is None:
+                raise HostError('в CarTuning нет поля %r (есть: %s)'
+                                % (name, ', '.join(TUNING_FIELDS)))
+            buf[index] = float(value)
+
+    def tuning_values(self) -> dict:
+        """Шаблон целиком, именами полей. Для замеров и отладки."""
+        self._sync()
+        return {name: self.tuning[index] for name, index in TUNING_INDEX.items()}
 
     # --- шаг ------------------------------------------------------------
 
@@ -347,6 +440,24 @@ from .protocol import (BTN_THROTTLE, BTN_BRAKE, BTN_LEFT,   # noqa: E402
                        BTN_RIGHT, BTN_DRIFT)
 
 
+def car_tuning(stats, mode: str) -> dict:
+    """Правки CarTuning для машины каталога в выбранном режиме (§12.23).
+
+    ``stats`` — ``game.cars.CarSpec`` из ``content/cars.json`` либо
+    ``physics.CarStats`` по умолчанию. У второй настроек нет, и это не
+    ошибка: тогда машина едет чистым пресетом режима.
+
+    Блок ``body`` общий для обоих режимов: кузов у машины один, различаются
+    режимы управляемостью, а не габаритами.
+    """
+    tuning = getattr(stats, 'tuning', None)
+    if not tuning:
+        return {}
+    values = dict(tuning.get('body') or {})
+    values.update(tuning.get(mode) or {})
+    return values
+
+
 class ShadowWorld(object):
     """Мир Rapier, идущий рядом с гонкой на тех же вводах.
 
@@ -357,12 +468,21 @@ class ShadowWorld(object):
 
     def __init__(self, sim, wasm_path: str = WASM_PATH):
         self.sim = sim
-        self.host = RapierHost(wasm_path)
+        # Модель управляемости — настройка комнаты (§12.23). Мир создаётся
+        # сразу нужным пресетом: менять его на ходу нечем и незачем.
+        self.preset = preset_index(sim.settings.get('physics'))
+        self.mode = PRESET_NAMES[self.preset]
+        self.host = RapierHost(wasm_path, self.preset)
         self.host.build_track(sim.track)
         self.host.free_track_mesh()
         self.slots = []
         for car in sim.cars:
             state = car.state
+            # Настройки машины под выбранный режим (§12.23): сперва пресет
+            # в шаблон, потом правки этой машины поверх — и только потом
+            # spawn_car, которая шаблон и читает.
+            self.host.tuning_preset(self.preset)
+            self.host.set_tuning(car_tuning(car.stats, self.mode))
             # Высоты у старого состояния нет: раздел 4 держит гонку в
             # плоскости (x, z), а вертикаль появилась только под прыжки.
             # Поэтому точку постановки берём у полотна и приподнимаем на

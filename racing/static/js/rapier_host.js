@@ -13,19 +13,31 @@
 // пересоздаются в _sync() по смене buffer — перед каждым шагом и после
 // каждой аллокации внутри модуля.
 
-import { WALL_MARGIN } from './track.js';
-
 // Адреса на сервере (см. маршрут /native/... в server/app.py, он появляется
 // только при поднятом флаге --physics).
 export const WASM_URL = '/native/testbed/racing_physics.wasm';
 export const ABI_URL = '/native/abi/abi_layout.js';
 
-// Геометрия полотна, которую хозяин передаёт модулю (§12.21). Модуль игровых
-// констант не знает, и обе стороны обязаны передать одно и то же:
-// WALL_MARGIN импортируется из track.js, как на сервере из game/track.py.
-export const WALL_HEIGHT = 2.0;      // высота стенки за обочиной, м
-export const TRACK_FRICTION = 1.1;   // трение полотна, как в стенде разведки
-export { WALL_MARGIN };
+// Геометрии полотна ЗДЕСЬ НЕТ. Модуль физики игровых констант не знает, и обе
+// стороны обязаны передать ему одно и то же; на 4b ради этого в каждом хозяине
+// лежало по копии WALL_HEIGHT и TRACK_FRICTION. Теперь все три числа объявлены
+// один раз в game/track.py и приезжают в race_init.track (§12.23) — отсюда их
+// и берёт meshParams(). Копии нет, и расходиться нечему.
+
+/**
+ * Три числа сетки полотна из записи трассы: [wallMargin, wallHeight, friction].
+ * Принимает и объект Track (camelCase), и сырой race_init.track (12.1).
+ */
+export function meshParams(track) {
+    const margin = track.wallMargin !== undefined ? track.wallMargin : track.wall_margin;
+    const height = track.wallHeight !== undefined ? track.wallHeight : track.wall_height;
+    const rub = track.friction;
+    if (margin === undefined || height === undefined || rub === undefined) {
+        throw new HostError('в записи трассы нет чисел сетки полотна ' +
+            '(wall_margin, wall_height, friction) — строить её не из чего (§12.23)');
+    }
+    return [margin, height, rub];
+}
 
 // Порядок столбцов залитой осевой линии — 12.1.
 const COLUMNS = ['x', 'y', 'z', 'tx', 'tz', 'nx', 'nz', 'hw', 's'];
@@ -123,8 +135,11 @@ export class RapierHost {
      * _f32(round(v, 3)), клиент кладёт round(v, 3) в Float32Array —
      * это одни и те же биты, и на них обе физики обязаны совпасть.
      */
-    buildTrack(track, wallMargin = WALL_MARGIN, wallHeight = WALL_HEIGHT,
-               friction = TRACK_FRICTION) {
+    buildTrack(track, wallMargin, wallHeight, friction) {
+        const fromTrack = meshParams(track);
+        if (wallMargin === undefined) wallMargin = fromTrack[0];
+        if (wallHeight === undefined) wallHeight = fromTrack[1];
+        if (friction === undefined) friction = fromTrack[2];
         const n = track.count || track.x.length;
         if (n < 3) throw new HostError('осевая линия короче трёх точек');
         const offset = this.x.rp_track_alloc_centerline(n);
@@ -145,7 +160,11 @@ export class RapierHost {
         this._sync(true);
     }
 
-    addGround(halfSize = 300.0, friction = TRACK_FRICTION) {
+    /**
+     * Ровная площадка под испытания. Оба числа задаёт вызывающий: чисел
+     * полотна у хозяина больше нет, они приезжают в записи трассы (§12.23).
+     */
+    addGround(halfSize, friction) {
         this.x.rp_add_ground(halfSize, friction);
         this._sync(true);
     }

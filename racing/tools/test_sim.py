@@ -287,6 +287,29 @@ def check_generated(report):
             for line in detail[:10]:
                 report.note(line)
 
+    # Две копии списка режимов физики (§12.23). game/ про server/ не знает
+    # намеренно, поэтому имена режимов повторены — как WEATHER_GRIP в
+    # game/physics.py. Разъехавшись, они дали бы комнату, которая принимает
+    # значение, а хозяин модуля молча катит на аркаде.
+    from server import config as _config
+    from game import rapier_host as _rh
+    report.check(tuple(_config.PHYSICS_MODES) == tuple(_rh.PRESET_NAMES),
+                 'режимы физики совпадают в server/config.py и game/rapier_host.py',
+                 '%s против %s' % (list(_config.PHYSICS_MODES), list(_rh.PRESET_NAMES)))
+    report.check(_config.DEFAULT_SETTINGS['physics'] == _rh.PRESET_NAMES[0],
+                 'умолчание физики в настройках комнаты — аркада',
+                 _config.DEFAULT_SETTINGS['physics'])
+    # Настройки машин каталога: под оба режима у всех пяти, имена полей —
+    # поля CarTuning выпущенной раскладки (проверяет game/cars.py при загрузке).
+    from game import cars as _cars
+    catalog = _cars.load_cars(os.path.join(BASE_DIR, 'content', 'cars.json'))
+    missing = [spec.id for spec in catalog.list
+               for mode in _rh.PRESET_NAMES if mode not in spec.tuning]
+    report.check(not missing,
+                 'у всех машин каталога есть CarTuning под оба режима',
+                 'нет у: %s' % ', '.join(missing) if missing else
+                 '%d машин x %d режима' % (len(catalog), len(_rh.PRESET_NAMES)))
+
 
 class Report(object):
     """Накопитель результатов: печатает по ходу, помнит провалы."""
