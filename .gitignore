@@ -4,3 +4,5 @@ __pycache__/
 .DS_Store
 racing/records.json
 racing/records.json.corrupt
+racing/native/**/target/
+racing/native/target/

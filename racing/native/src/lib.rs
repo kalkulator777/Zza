@@ -177,25 +177,36 @@ pub extern "C" fn rp_add_box(
     w().add_box(hx, hy, hz, x, y, z, yaw, pitch, friction, mass);
 }
 
+/// Обычный Rust-доступ к буферу вершин. Wasm-ABI ниже — тонкая обёртка
+/// над этим; отдельная функция нужна нативным прогонам, где адрес
+/// не влезает в u32.
+#[allow(static_mut_refs)]
+pub fn track_stage_verts(nv: u32) -> &'static mut [f32] {
+    unsafe {
+        VERT_STAGE = vec![0.0f32; nv as usize * 3];
+        &mut VERT_STAGE
+    }
+}
+
+#[allow(static_mut_refs)]
+pub fn track_stage_tris(nt: u32) -> &'static mut [u32] {
+    unsafe {
+        TRIS_STAGE = vec![0u32; nt as usize * 3];
+        &mut TRIS_STAGE
+    }
+}
+
 /// Выделяет место под сетку полотна и отдаёт адрес буфера вершин
 /// (nv троек f32). Хозяин заливает вершины ОДНИМ куском памяти.
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn rp_track_alloc_verts(nv: u32) -> u32 {
-    unsafe {
-        VERT_STAGE = vec![0.0f32; nv as usize * 3];
-        VERT_STAGE.as_ptr() as u32
-    }
+    track_stage_verts(nv).as_ptr() as u32
 }
 
 /// То же для треугольников (nt троек u32).
 #[no_mangle]
-#[allow(static_mut_refs)]
 pub extern "C" fn rp_track_alloc_tris(nt: u32) -> u32 {
-    unsafe {
-        TRIS_STAGE = vec![0u32; nt as usize * 3];
-        TRIS_STAGE.as_ptr() as u32
-    }
+    track_stage_tris(nt).as_ptr() as u32
 }
 
 /// Строит треугольную сетку из залитых буферов. 0 — успех.

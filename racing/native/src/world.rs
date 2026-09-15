@@ -263,7 +263,7 @@ impl World {
             self.colliders.insert(col);
         } else {
             // Подвижный конус: сбиваем его и он улетает.
-            let rb = RigidBodyBuilder::dynamic().position(pose).build();
+            let rb = RigidBodyBuilder::dynamic().pose(pose).build();
             let h = self.bodies.insert(rb);
             let col = ColliderBuilder::cuboid(hx, hy, hz)
                 .friction(friction)
@@ -304,7 +304,7 @@ impl World {
 
         let pose = Pose::from_parts(Vector::new(x, y, z), Rotation::from_rotation_y(yaw));
         let rb = RigidBodyBuilder::dynamic()
-            .position(pose)
+            .pose(pose)
             // Демпфирование мизерное: гасит численный шум, не мешая езде.
             .linear_damping(0.02)
             .angular_damping(0.35)
