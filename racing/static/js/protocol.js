@@ -45,9 +45,10 @@
 //   off 9   u8    car_count     младшие 7 бит — число машин (0..8),
 //                               бит 7 (SNAPSHOT_FLAG_EXTRA) — есть ли за
 //                               маской боксов секции траффика и происшествий
-//   далее car_count записей по 26 байт:
+//   далее car_count записей по 27 байт:
 //     u8 slot, u8 flags, f32 x, f32 z, f32 yaw, f32 vx, f32 vz,
-//     u8 lap, u8 place, i8 steer_q (-127..127 <-> -1..1), u8 drift_charge (charge*100)
+//     u8 lap, u8 place, i8 steer_q (-127..127 <-> -1..1), u8 drift_charge (charge*100),
+//     u8 height_q (высота над полотном в сантиметрах, 0..2.55 м; 0 — колёса на земле)
 //   u8 proj_count
 //   далее proj_count записей по 15 байт:
 //     u16 id, u8 kind, f32 x, f32 z, f32 yaw
@@ -75,12 +76,13 @@
 // car flags: 0 вне трассы, 1 дрифтует, 2 ускорение, 3 крутит (урон),
 //            4 щит, 5 финишировал, 6 призрак (отключился), 7 тормозит
 //
-// Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len,
+// Размер снапшота = 10 + 27*car_count + 1 + 15*proj_count + 1 + box_mask_len,
 // и ЕСЛИ есть траффик или происшествия, ещё + 1 + 6*traffic_count
 //                                            + 1 + 8*event_count.
 // Для 8 машин, 4 снарядов и маски в 2 байта без траффика и происшествий это
-// ровно прежние 282 байта, байт в байт: выключенная настройка не стоит НИ
-// ОДНОГО лишнего байта, за это и отвечает флаг в car_count. Плотный траффик
+// 290 байт: прежние 282 плюс восемь байт высоты, по одному на машину
+// (без неё чужая машина проезжала бы сквозь трамплин по земле). Выключенные
+// траффик и происшествия не стоят НИ ОДНОГО лишнего байта. Плотный траффик
 // (12 машин) добавляет 1 + 72 = 73 байта, шесть происшествий — ещё 1 + 48 = 49.
 // Потолок наполнения: 404 байта, 8,1 КБ/с против 5,6 КБ/с у пустого.
 // В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
@@ -127,7 +129,7 @@ export const FLAG_BRAKING = 1 << 7;   // тормозит (стоп-сигнал
 
 export const INPUT_SIZE = 7;
 export const SNAPSHOT_HEADER_SIZE = 10;
-export const SNAPSHOT_CAR_SIZE = 26;
+export const SNAPSHOT_CAR_SIZE = 27;
 export const SNAPSHOT_PROJ_SIZE = 15;
 export const SNAPSHOT_TRAFFIC_SIZE = 6;
 export const SNAPSHOT_EVENT_SIZE = 8;
@@ -159,6 +161,7 @@ export const ROAD_PHASE_DEBRIS = 3;    // обломки после взрыва
 
 const STEER_SCALE = 1 / 127;          // -127..127 -> -1..1
 const DRIFT_CHARGE_SCALE = 1 / 100;   // байт -> секунды заряда дрифта
+const HEIGHT_SCALE = 1 / 100;         // байт сантиметров -> метры высоты
 const LATERAL_SCALE = 1 / 10;         // i8 -> метры смещения от оси
 const ANGLE_SCALE = Math.PI / 127;    // i8 -> радианы
 const SPEED_SCALE = 1 / 4;            // u8 -> м/с
@@ -249,6 +252,7 @@ export function snapshotSize(carCount, projCount, boxMaskLen,
  *   carPlace[i]             место 1..8
  *   carSteer[i]             угол руля -1..1 (уже разквантован)
  *   carDriftCharge[i]       заряд дрифта 0..255, в секунды — driftChargeSeconds
+ *   carHeight[i]            высота над полотном, м (0 — колёса на земле)
  *   indexBySlot[slot]       индекс машины в массивах или -1, если слота нет
  *   projCount               сколько снарядов (<= MAX_PROJECTILES)
  *   projId/projKind         идентификатор и вид снаряда (таблица бонусов)
@@ -295,7 +299,11 @@ export function createSnapshotBuffer() {
         carPlace: new Uint8Array(MAX_CARS),
         carSteer: new Float32Array(MAX_CARS),
         carDriftCharge: new Uint8Array(MAX_CARS),
+        carHeight: new Float32Array(MAX_CARS),
         indexBySlot: new Int8Array(MAX_CARS).fill(-1),
+        // Высота на момент ПОКАЗА, по слоту: её считает net.js вместе с
+        // остальной интерполяцией, а читает renderer.applySnapshot.
+        carViewHeight: new Float32Array(MAX_CARS),
 
         projCount: 0,
         projId: new Uint16Array(MAX_PROJECTILES),
@@ -441,6 +449,7 @@ export function decodeSnapshot(data, out) {
         out.carPlace[i] = view.getUint8(offset + 23);
         out.carSteer[i] = view.getInt8(offset + 24) * STEER_SCALE;
         out.carDriftCharge[i] = view.getUint8(offset + 25);
+        out.carHeight[i] = view.getUint8(offset + 26) * HEIGHT_SCALE;
         if (slot < MAX_CARS) indexBySlot[slot] = i;
         offset += SNAPSHOT_CAR_SIZE;
     }

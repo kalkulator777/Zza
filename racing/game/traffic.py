@@ -271,6 +271,7 @@ class TrafficSystem(object):
         self.oiled = physics.CarStats(**TRAFFIC_STATS)
         self._oil_factor = 1.0
 
+        self.grip_mul = 1.0
         self._limit = self._build_speed_limits() if wanted else []
         self._order = []
         self._snap_scratch = []
@@ -278,6 +279,17 @@ class TrafficSystem(object):
         self._effects = None          # ссылка на RoadEvents, ставит Simulation
 
     # --- расстановка ---------------------------------------------------------
+
+    def set_grip_mul(self, value):
+        """Множитель сцепления по погоде (12.16) всем болванкам разом.
+
+        Крюк физики — поле ``grip_mul`` состояния; при перестановке
+        застрявшей болванки ``reset`` его обнуляет в единицу, поэтому
+        значение запоминается и проставляется заново.
+        """
+        self.grip_mul = value
+        for car in self.cars:
+            car.state.grip_mul = value
 
     def attach_events(self, effects):
         """Подключить систему происшествий: поток обязан их объезжать."""
@@ -699,6 +711,7 @@ class TrafficSystem(object):
         side = 1.0 if self.rng.random() < 0.5 else -1.0
         self._place(car, arc, side)
         self.track.init_state(car.state)
+        car.state.grip_mul = self.grip_mul
         car.stuck_time = 0.0
         car.reverse_time = 0.0
         car.buttons = 0

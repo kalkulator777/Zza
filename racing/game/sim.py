@@ -75,6 +75,7 @@ _BTN_BRAKE = protocol.BTN_BRAKE
 _BTN_ITEM = protocol.BTN_ITEM
 _quantize_steer = protocol.quantize_steer
 _quantize_drift_charge = protocol.quantize_drift_charge
+_quantize_height = protocol.quantize_height
 
 # --- каталог машин -----------------------------------------------------------
 # Сервер отдаёт симуляции только ``car_id`` (раздел 12.4), а характеристики
@@ -215,6 +216,13 @@ class Simulation(object):
 
         # Стартовая расстановка: список игроков сортируется по слоту, индекс
         # в списке равен индексу места на решётке (раздел 12.6).
+        # Множитель сцепления по погоде (12.16). Крюк физики — поле
+        # ``grip_mul`` состояния, по умолчанию 1.0; клиент уже пишет его себе
+        # из настроек комнаты, и серверная половина ОБЯЗАНА включиться вместе
+        # с клиентской, иначе сервер считает по сухому, клиент по мокрому,
+        # и реконсиляция будет вечно оттягивать машину в каждом повороте.
+        self.grip_mul = physics.WEATHER_GRIP.get(self.settings.get('weather'), 1.0)
+
         rows = sorted(players, key=lambda item: int(item['slot']))
         catalog = car_catalog()
         grid = track.start_grid
@@ -237,6 +245,7 @@ class Simulation(object):
             car = RaceCar(slot, info.get('name', ''), car_id,
                           info.get('color'), stats, place)
             track.init_state(car.state)
+            car.state.grip_mul = self.grip_mul
             self.cars.append(car)
             self.car_by_slot[slot] = car
 
@@ -252,6 +261,9 @@ class Simulation(object):
         self.traffic = TrafficSystem(track, self.settings)
         self.traffic.attach_events(self.road)
         self.traffic.spawn()
+        # Погода одинакова для всех, кто на дороге: иначе по мокрому асфальту
+        # болванки поехали бы цепче гонщиков.
+        self.traffic.set_grip_mul(self.grip_mul)
 
         # --- преаллоцированные буферы горячего пути ------------------------
         # Буфер столкновений рассчитан на гонщиков И болванок сразу: они
@@ -510,7 +522,8 @@ class Simulation(object):
             out.append((car.slot, flags, state.x, state.z, state.yaw,
                         state.vx, state.vz, lap, place,
                         _quantize_steer(state.steer),
-                        _quantize_drift_charge(state.drift_charge)))
+                        _quantize_drift_charge(state.drift_charge),
+                        _quantize_height(state.height)))
         projectiles = self._snap_proj
         if projectiles:
             del projectiles[:]

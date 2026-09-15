@@ -159,18 +159,24 @@ const ROAD_CAR_SIDE = 0.95;      // м, полуширина машины (CAR_R
 
 // Раскладка кольцевого буфера состояний: один Float64Array со страйдом
 // вместо дюжины отдельных массивов — одна аллокация и одна кэш-линия.
-const SF = 12;
+// Полёт над трамплином (height, vVert, airborne, landStun) несёт состояние
+// между шагами и в снапшот не едет — значит кольцо обязано его хранить
+// наравне с driftDir (12.15). Без этого переигровка после реконсиляции
+// сажает машину посреди прыжка: height начинался бы с нуля.
+// rampH и gripMul в кольцо НЕ идут: первое трасса переписывает каждый шаг,
+// второе за окно переигровки не меняется.
+const SF = 15;
 const SF_X = 0, SF_Z = 1, SF_YAW = 2, SF_VX = 3, SF_VZ = 4, SF_STEER = 5,
       SF_DRIFT = 6, SF_BOOST = 7, SF_SPIN = 8, SF_SHIELD = 9, SF_SLOW = 10,
-      SF_PROGRESS = 11;
+      SF_PROGRESS = 11, SF_HEIGHT = 12, SF_VVERT = 13, SF_LANDSTUN = 14;
 
 const SI = 3;
 const SI_SAMPLE = 0, SI_LAP = 1, SI_CP = 2;
 
-const SB = 3;
+const SB = 4;
 // Сторона заноса (drift_dir, раздел 6.3) хранится со сдвигом +1,
 // потому что массив беззнаковый: -1 -> 0, 0 -> 1, +1 -> 2.
-const SB_DRIFT_ACTIVE = 0, SB_OFFTRACK = 1, SB_DRIFT_DIR = 2;
+const SB_DRIFT_ACTIVE = 0, SB_OFFTRACK = 1, SB_DRIFT_DIR = 2, SB_AIRBORNE = 3;
 
 // Коды бонусов раздела 8: это данные протокола, а не интерфейса, поэтому
 // таблица живёт здесь, а не тянется из ui/.
@@ -286,6 +292,7 @@ export class NetClient {
         this.snapSteer = new Float32Array(cells);
         this.snapFlags = new Uint8Array(cells);
         this.snapDrift = new Uint8Array(cells);
+        this.snapHeight = new Float32Array(cells);
         this.snapLap = new Uint8Array(cells);
         this.snapPlace = new Uint8Array(cells);
         this.snapHead = -1;
@@ -301,6 +308,7 @@ export class NetClient {
         this.viewSteer = new Float32Array(MAX_CARS);
         this.viewFlags = new Uint8Array(MAX_CARS);
         this.viewDrift = new Uint8Array(MAX_CARS);
+        this.viewHeight = new Float32Array(MAX_CARS);
         this.viewLap = new Uint8Array(MAX_CARS);
         this.viewPlace = new Uint8Array(MAX_CARS);
 
@@ -858,6 +866,7 @@ export class NetClient {
             this.snapSteer[k] = snap.carSteer[i];
             this.snapFlags[k] = snap.carFlags[i];
             this.snapDrift[k] = snap.carDriftCharge[i];
+            this.snapHeight[k] = snap.carHeight[i];
             this.snapLap[k] = snap.carLap[i];
             this.snapPlace[k] = snap.carPlace[i];
         }
@@ -1265,6 +1274,9 @@ export class NetClient {
         ring[f + SF_SHIELD] = state.shieldTime;
         ring[f + SF_SLOW] = state.slowTime;
         ring[f + SF_PROGRESS] = state.progress;
+        ring[f + SF_HEIGHT] = state.height;
+        ring[f + SF_VVERT] = state.vVert;
+        ring[f + SF_LANDSTUN] = state.landStun;
 
         const n = i * SI;
         this.ringI[n + SI_SAMPLE] = state.sampleIdx;
@@ -1275,6 +1287,7 @@ export class NetClient {
         this.ringB[b + SB_DRIFT_ACTIVE] = state.driftActive ? 1 : 0;
         this.ringB[b + SB_OFFTRACK] = state.offtrack ? 1 : 0;
         this.ringB[b + SB_DRIFT_DIR] = (state.driftDir | 0) + 1;
+        this.ringB[b + SB_AIRBORNE] = state.airborne ? 1 : 0;
         this.ringValid[i] = 1;
     }
 
@@ -1294,6 +1307,9 @@ export class NetClient {
         state.shieldTime = ring[f + SF_SHIELD];
         state.slowTime = ring[f + SF_SLOW];
         state.progress = ring[f + SF_PROGRESS];
+        state.height = ring[f + SF_HEIGHT];
+        state.vVert = ring[f + SF_VVERT];
+        state.landStun = ring[f + SF_LANDSTUN];
 
         const n = i * SI;
         state.sampleIdx = this.ringI[n + SI_SAMPLE];
@@ -1304,6 +1320,7 @@ export class NetClient {
         state.driftActive = this.ringB[b + SB_DRIFT_ACTIVE] === 1;
         state.offtrack = this.ringB[b + SB_OFFTRACK] === 1;
         state.driftDir = this.ringB[b + SB_DRIFT_DIR] - 1;
+        state.airborne = this.ringB[b + SB_AIRBORNE] === 1;
     }
 
     _resetPrediction() {
@@ -1543,6 +1560,7 @@ export class NetClient {
             if (oldest < 0) oldest += SNAP_HISTORY;
             this._copyFrame(oldest);
             this._trafficFrame(oldest, 0);
+            this._publishHeights();
             return;
         }
         if (ib < 0) {
@@ -1551,13 +1569,19 @@ export class NetClient {
             if (ahead > EXTRAPOLATE_MAX) ahead = EXTRAPOLATE_MAX;
             this._extrapolateFrame(ia, ahead * 0.001);
             this._trafficFrame(ia, ahead * 0.001);
+            this._publishHeights();
             return;
         }
 
         const t0 = times[ia];
         const t1 = times[ib];
         const span = t1 - t0;
-        if (span <= 0) { this._copyFrame(ib); this._trafficFrame(ib, 0); return; }
+        if (span <= 0) {
+            this._copyFrame(ib);
+            this._trafficFrame(ib, 0);
+            this._publishHeights();
+            return;
+        }
 
         const u = (renderTime - t0) / span;
         const hs = span * 0.001;            // длина интервала в секундах
@@ -1607,9 +1631,15 @@ export class NetClient {
             this.viewDrift[s] = this.snapDrift[kb];
             this.viewLap[s] = this.snapLap[kb];
             this.viewPlace[s] = this.snapPlace[kb];
+            // Высота над полотном (прыжок через трамплин) — линейно:
+            // траектория и так параболическая, а между двумя снапшотами
+            // 50 мс, на которых парабола от прямой не отличается.
+            const hgt0 = this.snapHeight[ka];
+            this.viewHeight[s] = hgt0 + (this.snapHeight[kb] - hgt0) * u;
         }
 
         this._trafficPair(ia, ib, u, hs);
+        this._publishHeights();
     }
 
     // =======================================================================
@@ -1749,6 +1779,25 @@ export class NetClient {
         snap.evtViewCount = count;
     }
 
+    /**
+     * Выложить высоты машин в буфер снапшота — оттуда их берёт рендер.
+     *
+     * Своя машина идёт из предсказания, а не из снапшота: она летит по
+     * собственной физике и авторитет догоняет её с задержкой. Чужие — из
+     * интерполяции. Дорога в рендер здесь одна, та же, что у траффика:
+     * main.js принадлежит другому исполнителю, и лишнего параметра в
+     * setCarState добавить нельзя.
+     */
+    _publishHeights() {
+        const out = this.snap.carViewHeight;
+        for (let s = 0; s < MAX_CARS; s++) {
+            out[s] = this.viewPresent[s] ? this.viewHeight[s] : 0;
+        }
+        if (this.localSlot >= 0 && this.localSlot < MAX_CARS) {
+            out[this.localSlot] = this.state.height || 0;
+        }
+    }
+
     /** Кадр истории как есть (заморозка). */
     _copyFrame(i) {
         const base = i * MAX_CARS;
@@ -1778,6 +1827,7 @@ export class NetClient {
     }
 
     _takeFrom(k, s) {
+        this.viewHeight[s] = this.snapHeight[k];
         this.viewX[s] = this.snapX[k];
         this.viewZ[s] = this.snapZ[k];
         this.viewYaw[s] = this.snapYaw[k];

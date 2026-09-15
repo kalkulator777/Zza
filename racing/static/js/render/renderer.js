@@ -400,6 +400,12 @@ const TRAFFIC_LOOKS_TABLE = [
     [1, 0x66707a]    // асфальтовый седан
 ];
 
+// Полёт через трамплин: с какой высоты считаем машину в воздухе и
+// насколько сильно доворачивать кузов по вектору скорости.
+const AIR_MIN_HEIGHT = 0.06;     // м
+const AIR_PITCH_GAIN = 0.85;
+const AIR_PITCH_LERP = 7.0;      // 1/с
+
 const CAM_GROUND_CLEARANCE = 0.75; // м, ниже рельефа камера не опускается
 const NEAR_PLANE = 0.12;
 
@@ -430,6 +436,10 @@ class CarView {
         this.fresh = false;     // состояние пришло в этом кадре
 
         this.x = 0; this.y = 0; this.z = 0; this.yaw = 0;
+        this.height = 0;      // м над полотном: прыжок через трамплин
+        this.prevHeight = 0;
+        this.groundY = 0;     // сама поверхность без высоты полёта
+        this.airPitch = 0;    // наклон кузова в полёте, рад
         this.vx = 0; this.vz = 0;
         this.speed = 0; this.vfwd = 0; this.vlat = 0;
         this.steer = 0; this.flags = 0; this.driftCharge = 0;
@@ -747,10 +757,20 @@ export class RaceRenderer {
      * выключенная тема не стоила ни пикселя разницы.
      */
     resolveWeather() {
-        if (!this.gfx.wetRoad) return 'clear';
+        // Галочка «Мокрый асфальт» — НАСТРОЙКА КАРТИНКИ, а не погоды.
+        // Раньше она первой строкой возвращала 'clear', и на низком пресете
+        // (где она снята) игрок получал штраф к сцеплению без единого намёка
+        // на экране: дождя не видно, а машина скользит. Теперь она гасит
+        // только блик и потемнение полотна — этим занимается wetSurface(),
+        // а сама погода остаётся той, что выбрана в комнате.
         const forced = this.gfx.weather;
         if (forced && forced !== 'auto') return forced;
         return this.environment.weather;
+    }
+
+    /** Показывать ли МОКРЫЙ ВИД полотна: погода плюс галочка картинки. */
+    wetSurface() {
+        return this.gfx.wetRoad && this.weather === 'wet';
     }
 
     /**
@@ -835,13 +855,17 @@ export class RaceRenderer {
             decor: gfx.decor,
             anim: gfx.decorAnim,
             env: { timeOfDay: todName, weather: weather },
-            nightLights: nightLights
+            nightLights: nightLights,
+            // Уровень частиц обязан прийти СНАРУЖИ: иначе scenery.js лезет
+            // за ключом в localStorage сам, и владелец настроек перестаёт
+            // быть один (12.14 закрепил владельца за рендером).
+            particles: gfx.particles
         });
         this.trackMeshes = buildTrackMeshes(this.track, this.theme, quality, {
             ao: gfx.ao,
             timeOfDay: todName,
             weather: weather,
-            wet: gfx.wetRoad,
+            wet: gfx.wetRoad && weather === 'wet',
             marks: gfx.tireMarks,
             // Запекается ТОЛЬКО неинстансная статика. Инстансный декор
             // остаётся Ламбертом: поворот экземпляра вокруг Y в нормаль
@@ -1280,6 +1304,13 @@ export class RaceRenderer {
         this.effects.setBoxMask(snap);
         this.takeTraffic(snap);
         this.effects.setRoadEvents(snap);
+        // Высота машин над полотном (прыжки через трамплины). В setCarState
+        // её передать нельзя — сигнатура принадлежит контракту и main.js,
+        // поэтому net.js кладёт её в тот же буфер снапшота.
+        const heights = snap.carViewHeight;
+        if (heights) {
+            for (let s = 0; s < MAX_CARS; s++) this.views[s].height = heights[s];
+        }
     }
 
     /**
@@ -1398,9 +1429,13 @@ export class RaceRenderer {
             v.mesh.root.visible = true;
 
             // тень: плоское пятно по курсу машины, прижатое к поверхности
+            // Тень остаётся на ЗЕМЛЕ и в полёте съёживается: именно по ней
+            // видно, куда машина приземлится.
+            const lift = v.height > AIR_MIN_HEIGHT ? v.height : 0;
+            const k = lift > 0 ? 1 / (1 + lift * 0.45) : 1;
             writeScaleYaw(shadowArr, shadowN * 16,
-                v.x, v.y + 0.045, v.z, v.yaw,
-                v.shadowSx, 1, v.shadowSz);
+                v.x, v.groundY + 0.045, v.z, v.yaw,
+                v.shadowSx * k, 1, v.shadowSz * k);
             shadowN++;
 
             // пятно фар: лежит перед машиной, тянется по её курсу
@@ -1624,7 +1659,10 @@ export class RaceRenderer {
         v.accel += (rawAccel - v.accel) * Math.min(1, dt * 10);
 
         // --- посадка на поверхность -----------------------------------------
-        v.y = this.heightAt(v.x, v.z, v);
+        // Высота полёта (трамплины) прибавляется к поверхности: без неё
+        // прыжок не видно вообще — машина ехала бы сквозь трамплин по земле.
+        v.groundY = this.heightAt(v.x, v.z, v);
+        v.y = v.groundY + v.height;
         const yFront = this.heightAt(v.x + fx * SLOPE_SAMPLE, v.z + fz * SLOPE_SAMPLE, v);
         const yBack = this.heightAt(v.x - fx * SLOPE_SAMPLE, v.z - fz * SLOPE_SAMPLE, v);
         // подъём (нос выше кормы) — нос задирается, то есть rotation.x < 0
@@ -1646,9 +1684,23 @@ export class RaceRenderer {
         else if (pitch < -PITCH_MAX) pitch = -PITCH_MAX;
         v.bodyPitch += (pitch - v.bodyPitch) * Math.min(1, dt * BODY_LERP);
 
+        // В полёте кузов доворачивается по вектору скорости: вверх на
+        // взлёте, носом вниз на снижении. Чистый визуал, физики не касается.
+        // Вертикальная скорость в снапшот не едет, поэтому берётся из
+        // изменения самой высоты — этого для наклона достаточно.
+        if (v.height > AIR_MIN_HEIGHT || v.airPitch !== 0) {
+            const vVert = dt > 0 ? (v.height - v.prevHeight) / dt : 0;
+            const target = v.height > AIR_MIN_HEIGHT
+                ? -Math.atan2(vVert, Math.max(6, v.speed)) * AIR_PITCH_GAIN
+                : 0;
+            v.airPitch += (target - v.airPitch) * Math.min(1, dt * AIR_PITCH_LERP);
+            if (v.airPitch < 1e-4 && v.airPitch > -1e-4) v.airPitch = 0;
+        }
+        v.prevHeight = v.height;
+
         const root = mesh.root;
         root.position.set(v.x, v.y, v.z);
-        root.rotation.set(v.terrainPitch + v.bodyPitch, v.yaw, v.roll);
+        root.rotation.set(v.terrainPitch + v.bodyPitch + v.airPitch, v.yaw, v.roll);
 
         // --- колёса ----------------------------------------------------------
         v.wheelSpin += (vfwd / v.wheelRadius) * dt;

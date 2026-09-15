@@ -41,7 +41,8 @@
 Это последовательности кортежей строго в порядке полей пакета — никаких
 атрибутов и словарей, чтобы не платить за поиск имён в горячем пути::
 
-    car  = (slot, flags, x, z, yaw, vx, vz, lap, place, steer_q, drift_charge)
+    car  = (slot, flags, x, z, yaw, vx, vz, lap, place, steer_q, drift_charge,
+            height_q)
     proj = (proj_id, kind, x, z, yaw)
     traf = (ident, s_q, lat_q, dyaw_q, spd_q)
     evt  = (event_id, kind, phase, s_q, lat_q, hl_q, hw_q)
@@ -75,9 +76,10 @@ import struct
 #   off 9   u8    car_count     младшие 7 бит — число машин (0..8),
 #                               бит 7 (SNAPSHOT_FLAG_EXTRA) — есть ли за
 #                               маской боксов секции траффика и происшествий
-#   далее car_count записей по 26 байт:
+#   далее car_count записей по 27 байт:
 #     u8 slot, u8 flags, f32 x, f32 z, f32 yaw, f32 vx, f32 vz,
-#     u8 lap, u8 place, i8 steer_q (-127..127 <-> -1..1), u8 drift_charge (charge*100)
+#     u8 lap, u8 place, i8 steer_q (-127..127 <-> -1..1), u8 drift_charge (charge*100),
+#     u8 height_q (высота над полотном в сантиметрах, 0..2.55 м; 0 — колёса на земле)
 #   u8 proj_count
 #   далее proj_count записей по 15 байт:
 #     u16 id, u8 kind, f32 x, f32 z, f32 yaw
@@ -105,12 +107,14 @@ import struct
 # car flags: 0 вне трассы, 1 дрифтует, 2 ускорение, 3 крутит (урон),
 #            4 щит, 5 финишировал, 6 призрак (отключился), 7 тормозит
 #
-# Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len,
+# Размер снапшота = 10 + 27*car_count + 1 + 15*proj_count + 1 + box_mask_len,
 # и ЕСЛИ есть траффик или происшествия, ещё + 1 + 6*traffic_count
 #                                            + 1 + 8*event_count.
 # Для 8 машин, 4 снарядов и маски в 2 байта без траффика и происшествий это
-# ровно прежние 282 байта, байт в байт: выключенная настройка не стоит НИ
-# ОДНОГО лишнего байта, за это и отвечает флаг в car_count. Плотный траффик
+# 290 байт: прежние 282 плюс восемь байт высоты, по одному на машину
+# (высота нужна прыжкам через трамплины — без неё чужая машина проезжала бы
+# сквозь трамплин по земле). Выключенные траффик и происшествия не стоят НИ
+# ОДНОГО лишнего байта, за это отвечает флаг в car_count. Плотный траффик
 # (12 машин) добавляет 1 + 72 = 73 байта, шесть происшествий — ещё 1 + 48 = 49.
 # Потолок наполнения: 404 байта, 8,1 КБ/с против 5,6 КБ/с у пустого.
 # В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
@@ -143,7 +147,7 @@ __all__ = [
     "has_drift", "has_item", "has_look_back",
     "is_off_track", "is_drifting", "is_boosting", "is_spinning",
     "has_shield", "has_finished", "is_ghost", "is_braking",
-    "quantize_steer", "quantize_drift_charge",
+    "quantize_steer", "quantize_drift_charge", "quantize_height",
     "quantize_arc", "quantize_lateral", "quantize_angle",
     "quantize_speed", "quantize_half_length", "quantize_half_width",
     "pack_box_mask", "box_active",
@@ -204,8 +208,9 @@ MAX_ROAD_EVENTS = 6      # одновременных происшествий �
 
 _INPUT = struct.Struct("<BIBB")          # type, seq, buttons, reserved
 _HEADER = struct.Struct("<BIIB")         # type, tick, ack_seq, car_count
-_CAR = struct.Struct("<BBfffffBBbB")     # slot, flags, x, z, yaw, vx, vz,
-                                         # lap, place, steer_q, drift_charge
+_CAR = struct.Struct("<BBfffffBBbBB")    # slot, flags, x, z, yaw, vx, vz,
+                                         # lap, place, steer_q, drift_charge,
+                                         # height_q
 _PROJ = struct.Struct("<HBfff")          # id, kind, x, z, yaw
 _TRAFFIC = struct.Struct("<BHbbB")       # ident, s_q, lat_q, dyaw_q, spd_q
 _EVENT = struct.Struct("<BBBHbBB")       # id, kind, phase, s_q, lat_q, hl_q, hw_q
@@ -333,6 +338,20 @@ def quantize_steer(steer):
     if q < -127:
         return -127
     return q
+
+
+def quantize_height(height):
+    """Высота над полотном в метрах -> байт сантиметров (потолок 2.55 м).
+
+    Прыжок через трамплин выше двух с половиной метров — это уже не прыжок,
+    а полёт, и в аркадной геометрии здешних трасс такого нет. Отдельный бит
+    «в полёте» во флагах не заводится: все восемь заняты (раздел 5.3),
+    а для рендера достаточно самой высоты — ноль означает колёса на земле.
+    """
+    if height <= 0.0:
+        return 0
+    q = int(height * 100.0 + 0.5)
+    return 255 if q > 255 else q
 
 
 def quantize_drift_charge(charge):
