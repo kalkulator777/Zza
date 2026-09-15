@@ -29,6 +29,8 @@
  *   triangles   renderer.info.render.triangles
  *   ping        RTT до сервера, мс
  *   snapshotMs  интервал между двумя последними снапшотами, мс (ожидается 50)
+ *   replayUs    цена одного шага переигровки при реконсиляции, мкс
+ *   replaySteps сколько шагов было в последней переигровке
  *   quality     имя пресета качества
  *   renderScale render scale, 0.5 / 0.75 / 1
  */
@@ -149,6 +151,20 @@ export class PerfOverlay {
         this._setValue(this.snapNode, snap === undefined ? '—' : Math.round(snap) + ' мс',
             snap === undefined ? 0 : (snap <= 70 ? 0 : snap <= 140 ? 1 : 2));
 
+        // Цена реконсиляции: микросекунды на шаг переигровки и сколько
+        // шагов было в последней. Ради этого числа строка и заведена —
+        // wasm-физика в Firefox на порядок дороже, чем в V8 (12.22), и
+        // увидеть это надо на самой машине, а не в отчёте.
+        //
+        // Пороги взяты из веса всплеска в кадре: при пяти шагах переигровки
+        // 200 мкс на шаг дают 1 мс (6 % кадра при 60 Гц), 600 мкс — 3 мс
+        // (18 %). Дальше реконсиляция видна как рывок.
+        const rus = stats && stats.replayUs;
+        const rsteps = stats && stats.replaySteps;
+        this._setValue(this.replayNode,
+            !(rus > 0) ? '—' : Math.round(rus) + ' мкс x' + (rsteps | 0),
+            !(rus > 0) ? 0 : (rus <= 200 ? 0 : rus <= 600 ? 1 : 2));
+
         // Память — только в браузерах, которые её показывают.
         const mem = performance.memory;
         this._setValue(this.memNode,
@@ -238,6 +254,7 @@ export class PerfOverlay {
         this.trisNode = this._addRow(grid, 'тр-ки');
         this.pingNode = this._addRow(grid, 'ping');
         this.snapNode = this._addRow(grid, 'снапшот');
+        this.replayNode = this._addRow(grid, 'переигровка');
         this.memNode = this._addRow(grid, 'память');
         this._addRow(grid, 'лимит').textContent = '60/150k';
         wrap.appendChild(grid);

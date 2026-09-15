@@ -373,6 +373,12 @@ export class NetClient {
         this.reconcileCount = 0;
         this.snapshotCount = 0;
 
+        // Цена переигровки: замеряется вокруг всего цикла, а не каждого
+        // шага — performance.now() на шаг стоил бы дороже самого шага.
+        // Скользящее среднее, потому что реконсиляция идёт не каждый кадр.
+        this.replayUs = 0;
+        this.replaySteps = 0;
+
         // Объект статистики переиспользуется: в кадре не создаётся ничего.
         this.stats = {
             ping: 0,
@@ -381,6 +387,8 @@ export class NetClient {
             reconcileErr: 0,
             reconcileMax: 0,
             reconcileRate: 0,
+            replayUs: 0,
+            replaySteps: 0,
             seq: 0,
             ackSeq: 0,
             tickLead: 0,
@@ -1161,9 +1169,12 @@ export class NetClient {
         const buttons = this.ringButtons;
         const valid = this.ringValid;
         const road = this.roadCount > 0;
+        const replayT0 = performance.now();
+        let replayed = 0;
         for (let s = base + 1; s <= this.seq; s++) {
             const i = s % INPUT_RING;
             if (!valid[i]) continue;
+            replayed++;
             // Переигрывать надо ровно то, что делал stepLocal, вместе
             // с происшествиями: иначе машина, стоящая в масле, каждую
             // реконсиляцию переигрывалась бы по сухому сцеплению и
@@ -1178,6 +1189,12 @@ export class NetClient {
             physicsStep(state, replayStats, buttons[i], DT, track, state.sampleIdx);
             if (road) this.roadAfterStep(state);
             this._recordState(i);
+        }
+        if (replayed > 0) {
+            const us = (performance.now() - replayT0) * 1000 / replayed;
+            this.replayUs = this.replayUs > 0
+                ? this.replayUs * 0.9 + us * 0.1 : us;
+            this.replaySteps = replayed;
         }
 
         // Пункт 5: видимую разницу гасим линейно за RECONCILE_SMOOTH.
@@ -1937,6 +1954,8 @@ export class NetClient {
         s.reconcileMax = this.reconcileMax;
         s.reconcileRate = this.snapshotCount > 0
             ? this.reconcileCount / this.snapshotCount : 0;
+        s.replayUs = this.replayUs;
+        s.replaySteps = this.replaySteps;
         s.seq = this.seq;
         s.ackSeq = this.ackSeq;
         s.tickLead = this.tickLead;

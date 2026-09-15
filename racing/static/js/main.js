@@ -1118,6 +1118,8 @@ function feedPerf() {
     // свой, по подтверждению ввода, показываем, только пока серверного нет.
     perfStats.ping = ns.serverPing > 0 ? ns.serverPing : ns.ping;
     perfStats.snapshotMs = ns.snapshotMs;
+    perfStats.replayUs = ns.replayUs;
+    perfStats.replaySteps = ns.replaySteps;
     perfStats.quality = rs.quality;
     perfStats.renderScale = rs.renderScale;
     perf.update(perfStats);
