@@ -309,6 +309,15 @@ export class RapierHost {
 // (§6.2: resolve_collisions считает только сервер). Толчок от соседа
 // приезжает следующим снапшотом и гасится обычной реконсиляцией.
 
+// Числа награды за занос (6.3) ИМПОРТИРУЮТСЯ из physics.js, а не повторяются
+// здесь: модуль игровых констант не знает (12.21), пресет их не выдумывает,
+// и второго места, где они записаны, быть не должно. Сервер берёт ту же
+// шестёрку из game/physics.py — это их единственная пара объявлений.
+import {
+    DRIFT_CHARGE_L1, DRIFT_CHARGE_L2, DRIFT_CHARGE_L3,
+    DRIFT_BOOST_L1, DRIFT_BOOST_L2, DRIFT_BOOST_L3, BOOST_ACCEL,
+} from './physics.js';
+
 // Те же числа, что на сервере. Расходиться им нельзя: с ними считается
 // первый тик гонки и высота над полотном.
 export const SETTLE_TICKS = 24;
@@ -328,9 +337,22 @@ export function presetIndex(name) {
  * Блок body общий для обоих режимов: кузов у машины один.
  */
 export function carTuning(spec, mode) {
+    // Награда за занос идёт ПЕРВОЙ и одинакова у всех машин: это правила
+    // 6.3, а не свойство кузова. Зеркало car_tuning() из game/rapier_host.py.
+    const stats = (spec && spec.stats) || null;
+    const out = {
+        drift_charge_l1: DRIFT_CHARGE_L1,
+        drift_charge_l2: DRIFT_CHARGE_L2,
+        drift_charge_l3: DRIFT_CHARGE_L3,
+        drift_boost_l1: DRIFT_BOOST_L1,
+        drift_boost_l2: DRIFT_BOOST_L2,
+        drift_boost_l3: DRIFT_BOOST_L3,
+        boost_accel: BOOST_ACCEL,
+        boost_speed: stats ? (stats.boost_speed || 0) : 0,
+    };
     const tuning = spec && spec.tuning;
-    if (!tuning) return null;
-    const out = Object.assign({}, tuning.body || null);
+    if (!tuning) return out;
+    Object.assign(out, tuning.body || null);
     return Object.assign(out, tuning[mode] || null);
 }
 
@@ -365,6 +387,7 @@ export class RapierLocal {
         this.ring = null;         // кольцо состояний тела, параллельное кольцу net.js
         this.ringLen = 0;
         this.grid = null;         // куда поставлена машина на решётке
+        this.level = 0;           // уровень заноса, выплаченный на прошлом шаге
     }
 
     /**
@@ -412,12 +435,15 @@ export class RapierLocal {
     // --- шаг ------------------------------------------------------------
 
     /** Один шаг по битовой маске кнопок протокола. */
-    step(buttons, btn) {
+    step(buttons, btn, offtrack) {
         const host = this.host;
         host._sync();
         const a = this.abi.CarInput;
         const base = this.idx * a.FLOATS;
         const inputs = host.inputs;
+        // Третий барьер 12.15 модулю снаружи: полотна он не знает. Флаг с
+        // прошлого шага — сервер считает его той же surface() по той же позе.
+        inputs[base + a.OFFTRACK] = offtrack ? 1 : 0;
         inputs[base + a.THROTTLE] = (buttons & btn.THROTTLE) ? 1 : 0;
         inputs[base + a.BRAKE] = (buttons & btn.BRAKE) ? 1 : 0;
         let steer = 0;
@@ -450,6 +476,10 @@ export class RapierLocal {
         state.steer = out[base + o.WHEELS + this.abi.WheelOut.STEERING] * this.invSteerMax;
         state.driftCharge = out[base + o.DRIFT_CHARGE];
         state.driftDir = out[base + o.DRIFT_DIR] | 0;
+        state.boostTime = out[base + o.BOOST_TIME];
+        // Уровень, выплаченный НА ЭТОМ шаге; держится один шаг. Событие
+        // drift_boost шлёт сервер — клиенту он нужен для звука и искр.
+        this.level = out[base + o.DRIFT_LEVEL] | 0;
         const grounded = out[base + o.WHEELS_ON_GROUND];
         state.airborne = grounded === 0;
         const slip = Math.abs(out[base + o.SLIP_ANGLE]);

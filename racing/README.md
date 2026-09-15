@@ -160,6 +160,8 @@ python3 tools/preview_track.py office  # сводка по трассе и ри�
 python3 tools/test_sim.py              # прогон гонки с ботами
 python3 tools/smoke_test.py            # сервер плюс браузер, сквозная проверка
 python3 tools/smoke_test.py --physics rapier   # то же, но гонку считает Rapier
+python3 tools/test_wasm_parity.py      # один .wasm — один результат в
+                                       # wasmtime, Node, Chromium и Firefox
 ```
 
 Физика выбирается ключом `run.py --physics`: `classic` (умолчание, прежняя

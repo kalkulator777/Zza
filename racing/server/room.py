@@ -1222,7 +1222,12 @@ class Room(object):
         """Наложить гандикап на победителя прошлой гонки, если он поехал."""
         self._handicap_slot = -1
         self._handicap_factor = 0.0
-        if not self.settings.get('handicap') or not self._last_winner_key:
+        # Настройки берутся У СИМУЛЯЦИИ, а не у комнаты: при physics=rapier
+        # она могла опустить гандикап (§12.24), и накладывать его после
+        # этого значило бы подменить характеристики, которых мир уже не
+        # прочитает, — то есть тихо ничего не сделать.
+        settings = getattr(sim, 'settings', None) or self.settings
+        if not settings.get('handicap') or not self._last_winner_key:
             return
         target = None
         for racer in racers:

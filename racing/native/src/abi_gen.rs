@@ -4,11 +4,16 @@
 // Единственное описание раскладок общей памяти модуля физики.
 // Из него tools/gen_abi.py выпускает native/src/abi_gen.rs, native/abi/abi_layout.py и native/abi/abi_layout.js.
 // Руками правится ТОЛЬКО этот файл; всё остальное — вывод генератора, и `python3 tools/gen_abi.py --check` ловит расхождение.
+// 
+// ПРАВИЛО ВЕРСИИ (§12.24). abi_version поднимается при ЛЮБОМ изменении размера или раскладки любой структуры — даже если это чистое дополнение в хвост и по смыслу полей ничего не сломалось. Совместимость тут не по смыслу, а по байтам: версия отмечает не «формат несовместим», а «хозяин и модуль из разных сборок не должны молча заработать». Сценарий, ради которого поле и существует: браузер держит в кэше старый .wasm, а страница приезжает новая — новый хозяин читает CarOut как 54 f32 из модуля, который пишет 52, и последние два поля оказываются мусором. Искать это будут в физике.
+// Версия 2 — этап 4e: CarInput 4->5 f32 (offtrack), CarOut 52->54 (boost_time, drift_level), CarTuning 32->40 (награда за занос).
 
 use core::mem::{offset_of, size_of};
 
 /// Версия раскладки. Хозяин обязан сверить, иначе молча разъедутся раскладки.
-pub const ABI_VERSION: u32 = 1;
+/// Поднимается при любом изменении размера ЛЮБОЙ структуры, даже дополнении в хвост:
+/// совместимость тут по байтам, а не по смыслу полей (правило в шапке файла).
+pub const ABI_VERSION: u32 = 2;
 
 /// Максимум машин в мире. Восемь по контракту, держим запас.
 pub const MAX_CARS: usize = 16;
@@ -23,7 +28,7 @@ pub const TRACK_COLUMNS: usize = 9;
 pub const TRACK_MESH_COLS: usize = 7;
 
 /// Ввод одной машины.
-/// 4 f32 = 16 байт.
+/// 5 f32 = 20 байт.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CarInput {
@@ -35,19 +40,27 @@ pub struct CarInput {
     pub steer: f32,
     /// ручник, 0..1
     pub handbrake: f32,
+    /// вне полотна: 1 — колёса на траве или у стены, 0 — на асфальте.
+    /// Третий барьер 12.15: за занос ВНЕ трассы заряд не копится.
+    /// Полотна модуль не знает (12.21), поэтому флаг приходит от хозяина
+    /// по позе прошлого шага — одинаково у сервера и у клиента.
+    /// Ноль по умолчанию: хозяин, который поля не знает, получает прежнее
+    /// поведение, а не молча выключенный занос.
+    pub offtrack: f32,
 }
 
 impl CarInput {
     /// Размер записи в байтах.
-    pub const SIZE: usize = 16;
+    pub const SIZE: usize = 20;
     /// Сколько в записи чисел f32.
-    pub const FLOATS: usize = 4;
+    pub const FLOATS: usize = 5;
     /// Запись «всё в нуле» — из неё набиваются общие буферы.
     pub const INIT: Self = CarInput {
         throttle: 0.0,
         brake: 0.0,
         steer: 0.0,
         handbrake: 0.0,
+        offtrack: 0.0,
     };
 }
 
@@ -56,6 +69,7 @@ const _: () = assert!(offset_of!(CarInput, throttle) == 0);
 const _: () = assert!(offset_of!(CarInput, brake) == 4);
 const _: () = assert!(offset_of!(CarInput, steer) == 8);
 const _: () = assert!(offset_of!(CarInput, handbrake) == 12);
+const _: () = assert!(offset_of!(CarInput, offtrack) == 16);
 
 /// Телеметрия одного колеса.
 /// 8 f32 = 32 байт.
@@ -109,7 +123,7 @@ const _: () = assert!(offset_of!(WheelOut, side_impulse) == 24);
 const _: () = assert!(offset_of!(WheelOut, contact) == 28);
 
 /// Состояние одной машины наружу.
-/// 52 f32 = 208 байт.
+/// 54 f32 = 216 байт.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CarOut {
@@ -144,15 +158,20 @@ pub struct CarOut {
     pub drift_charge: f32,
     /// сторона заноса: +1 налево, -1 направо, 0 нет
     pub drift_dir: f32,
+    /// остаток ускорения за занос, с (аналог boost_time из 6.1)
+    pub boost_time: f32,
+    /// уровень заноса, ВЫПЛАЧЕННЫЙ на этом шаге: 0, 1, 2 или 3.
+    /// Держится один шаг — хозяин по нему шлёт race_event drift_boost.
+    pub drift_level: f32,
     /// четыре колеса: FL, FR, RL, RR
     pub wheels: [WheelOut; 4],
 }
 
 impl CarOut {
     /// Размер записи в байтах.
-    pub const SIZE: usize = 208;
+    pub const SIZE: usize = 216;
     /// Сколько в записи чисел f32.
-    pub const FLOATS: usize = 52;
+    pub const FLOATS: usize = 54;
     /// Запись «всё в нуле» — из неё набиваются общие буферы.
     pub const INIT: Self = CarOut {
         px: 0.0,
@@ -175,6 +194,8 @@ impl CarOut {
         wheels_on_ground: 0.0,
         drift_charge: 0.0,
         drift_dir: 0.0,
+        boost_time: 0.0,
+        drift_level: 0.0,
         wheels: [WheelOut::INIT; 4],
     };
 }
@@ -200,7 +221,9 @@ const _: () = assert!(offset_of!(CarOut, engine_rpm) == 64);
 const _: () = assert!(offset_of!(CarOut, wheels_on_ground) == 68);
 const _: () = assert!(offset_of!(CarOut, drift_charge) == 72);
 const _: () = assert!(offset_of!(CarOut, drift_dir) == 76);
-const _: () = assert!(offset_of!(CarOut, wheels) == 80);
+const _: () = assert!(offset_of!(CarOut, boost_time) == 80);
+const _: () = assert!(offset_of!(CarOut, drift_level) == 84);
+const _: () = assert!(offset_of!(CarOut, wheels) == 88);
 
 /// Неизменные размеры машины: рендеру — поставить колёса, хозяину — не дублировать константы из Rust.
 /// 8 f32 = 32 байт.
@@ -318,7 +341,10 @@ pub struct CarSave {
     pub drift_dir: f32,
     /// углы проворота колёс — только для картинки
     pub wheel_rot: [f32; 4],
-    pub _pad: [f32; 3],
+    /// остаток ускорения: без него откат отдавал бы заново
+    /// уже потраченный буст
+    pub boost_time: f32,
+    pub _pad: [f32; 2],
 }
 
 impl CarSave {
@@ -346,7 +372,8 @@ impl CarSave {
         drift_charge: 0.0,
         drift_dir: 0.0,
         wheel_rot: [0.0; 4],
-        _pad: [0.0; 3],
+        boost_time: 0.0,
+        _pad: [0.0; 2],
     };
 }
 
@@ -369,10 +396,11 @@ const _: () = assert!(offset_of!(CarSave, steer_angle) == 56);
 const _: () = assert!(offset_of!(CarSave, drift_charge) == 60);
 const _: () = assert!(offset_of!(CarSave, drift_dir) == 64);
 const _: () = assert!(offset_of!(CarSave, wheel_rot) == 68);
-const _: () = assert!(offset_of!(CarSave, _pad) == 84);
+const _: () = assert!(offset_of!(CarSave, boost_time) == 84);
+const _: () = assert!(offset_of!(CarSave, _pad) == 88);
 
 /// Шаблон настроек машины. Хозяин правит поля напрямую в общей памяти, следующая rp_car_spawn берёт их отсюда.
-/// 32 f32 = 128 байт.
+/// 40 f32 = 160 байт.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CarTuning {
@@ -430,13 +458,30 @@ pub struct CarTuning {
     pub lateral_bite: f32,
     /// момент выравнивания кузова в воздухе, Н·м на рад
     pub air_righting: f32,
+    /// --- награда за занос (6.3), числа приходят от хозяина ---
+    /// Заряд в секундах на уровень 1, 2 и 3. Ноль — уровня нет:
+    /// модуль игровых констант не знает (12.21), и пресет их не
+    /// выдумывает. Хозяин кладёт сюда DRIFT_CHARGE_L* из
+    /// game/physics.py и static/js/physics.js — те же числа 6.3.
+    pub drift_charge_l1: f32,
+    pub drift_charge_l2: f32,
+    pub drift_charge_l3: f32,
+    /// Сколько секунд ускорения даёт уровень 1, 2 и 3.
+    pub drift_boost_l1: f32,
+    pub drift_boost_l2: f32,
+    pub drift_boost_l3: f32,
+    /// к какой продольной скорости тянет ускорение, м/с.
+    /// У каждой машины своя: stats.boost_speed из cars.json.
+    pub boost_speed: f32,
+    /// с каким ускорением тянет, м/с² (BOOST_ACCEL из 6.4).
+    pub boost_accel: f32,
 }
 
 impl CarTuning {
     /// Размер записи в байтах.
-    pub const SIZE: usize = 128;
+    pub const SIZE: usize = 160;
     /// Сколько в записи чисел f32.
-    pub const FLOATS: usize = 32;
+    pub const FLOATS: usize = 40;
     /// Запись «всё в нуле» — из неё набиваются общие буферы.
     pub const INIT: Self = CarTuning {
         half_length: 0.0,
@@ -471,6 +516,14 @@ impl CarTuning {
         downforce: 0.0,
         lateral_bite: 0.0,
         air_righting: 0.0,
+        drift_charge_l1: 0.0,
+        drift_charge_l2: 0.0,
+        drift_charge_l3: 0.0,
+        drift_boost_l1: 0.0,
+        drift_boost_l2: 0.0,
+        drift_boost_l3: 0.0,
+        boost_speed: 0.0,
+        boost_accel: 0.0,
     };
 }
 
@@ -507,6 +560,14 @@ const _: () = assert!(offset_of!(CarTuning, yaw_damp) == 112);
 const _: () = assert!(offset_of!(CarTuning, downforce) == 116);
 const _: () = assert!(offset_of!(CarTuning, lateral_bite) == 120);
 const _: () = assert!(offset_of!(CarTuning, air_righting) == 124);
+const _: () = assert!(offset_of!(CarTuning, drift_charge_l1) == 128);
+const _: () = assert!(offset_of!(CarTuning, drift_charge_l2) == 132);
+const _: () = assert!(offset_of!(CarTuning, drift_charge_l3) == 136);
+const _: () = assert!(offset_of!(CarTuning, drift_boost_l1) == 140);
+const _: () = assert!(offset_of!(CarTuning, drift_boost_l2) == 144);
+const _: () = assert!(offset_of!(CarTuning, drift_boost_l3) == 148);
+const _: () = assert!(offset_of!(CarTuning, boost_speed) == 152);
+const _: () = assert!(offset_of!(CarTuning, boost_accel) == 156);
 
 // --- общие буферы -----------------------------------------------------------
 

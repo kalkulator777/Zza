@@ -69,6 +69,20 @@ impl CarTuning {
         downforce: 3.0,
         lateral_bite: 0.0,
         air_righting: 1200.0,
+
+        // Награда за занос (6.3) в пресете НУЛЕВАЯ, и это не забывчивость.
+        // Пороги и длительности — игровые константы раздела 6, а модуль
+        // игровых констант не знает (12.21): их кладёт хозяин из
+        // game/physics.py и static/js/physics.js. Ноль значит «уровня нет»,
+        // поэтому модуль без хозяйских чисел просто не платит.
+        drift_charge_l1: 0.0,
+        drift_charge_l2: 0.0,
+        drift_charge_l3: 0.0,
+        drift_boost_l1: 0.0,
+        drift_boost_l2: 0.0,
+        drift_boost_l3: 0.0,
+        boost_speed: 0.0,
+        boost_accel: 0.0,
     };
 
     /// «Аркада»: жёсткая подвеска, цепкая резина, доворот по рулю.
@@ -117,6 +131,10 @@ pub struct Car {
     pub drift_charge: f32,
     /// сторона заноса
     pub drift_dir: f32,
+    /// остаток ускорения за занос, с
+    pub boost_time: f32,
+    /// уровень, выплаченный на этом шаге (0..3); живёт один шаг
+    pub drift_level: f32,
 }
 
 pub struct World {
@@ -324,6 +342,8 @@ impl World {
             steer_angle: 0.0,
             drift_charge: 0.0,
             drift_dir: 0.0,
+            boost_time: 0.0,
+            drift_level: 0.0,
         });
         idx
     }
@@ -356,8 +376,9 @@ impl World {
             steer_angle: car.steer_angle,
             drift_charge: car.drift_charge,
             drift_dir: car.drift_dir,
+            boost_time: car.boost_time,
             wheel_rot: [0.0; 4],
-            _pad: [0.0; 3],
+            _pad: [0.0; 2],
         };
         for (i, w) in car.controller.wheels().iter().enumerate() {
             s.wheel_rot[i] = w.rotation;
@@ -379,6 +400,10 @@ impl World {
         car.steer_angle = s.steer_angle;
         car.drift_charge = s.drift_charge;
         car.drift_dir = s.drift_dir;
+        car.boost_time = s.boost_time;
+        // Выплата держится один шаг и в слот не пишется: переигранный шаг
+        // выставит её заново там же, где она случилась в первый раз.
+        car.drift_level = 0.0;
         for (i, w) in car.controller.wheels_mut().iter_mut().enumerate() {
             w.rotation = s.wheel_rot[i];
         }
@@ -520,6 +545,31 @@ impl World {
             let v_fwd = linvel.dot(fwd);
             let v_lat = linvel.dot(left);
 
+            // Ускорение за занос — шаг 7 раздела 6.2, слово в слово: тянем
+            // продольную скорость к boost_speed с ускорением boost_accel,
+            // с ОБЕИХ сторон (буст и придерживает того, кто уже быстрее).
+            // В воздухе не тянет — колёса не на земле, — но таймер тикает:
+            // иначе прыжок стал бы способом придержать буст до удобного
+            // места, дыра ровно того сорта, что закрыта в 12.15.
+            if car.boost_time > 0.0 {
+                if on_ground > 0 && t.boost_accel > 0.0 {
+                    let delta = t.boost_speed - v_fwd;
+                    let step = t.boost_accel * DT;
+                    let dv = if delta > step {
+                        step
+                    } else if delta < -step {
+                        -step
+                    } else {
+                        delta
+                    };
+                    body.apply_impulse(fwd * (dv * body.mass()), true);
+                }
+                car.boost_time -= DT;
+                if car.boost_time < 0.0 {
+                    car.boost_time = 0.0;
+                }
+            }
+
             if on_ground > 0 {
                 // Прижим: держит машину на трамплине и в быстрых дугах.
                 let sp2 = linvel.length_squared();
@@ -611,15 +661,57 @@ impl World {
                 0.0
             };
             let hb = inputs[i].handbrake > 0.5;
-            if hb && v_fwd > 7.0 && slip.abs() > 0.12 {
-                let dir = if slip > 0.0 { 1.0 } else { -1.0 };
-                if car.drift_dir != 0.0 && dir != car.drift_dir && slip.abs() > 0.06 {
-                    car.drift_charge = 0.0;
+            // Третий барьер 12.15: за занос ВНЕ полотна заряд не копится.
+            // Полотна модуль не знает, флаг приходит от хозяина (CarInput).
+            let offtrack = inputs[i].offtrack > 0.5;
+            let wheels_down = car
+                .controller
+                .wheels()
+                .iter()
+                .any(|w| w.raycast_info().is_in_contact);
+            car.drift_level = 0.0;
+            // Три ветки — те же, что в шаге 15 раздела 6.2, и в том же
+            // порядке: сбит, копим, выплачиваем.
+            if !wheels_down {
+                // Оторвало от земли — занос сбит, копилка сгорает БЕЗ
+                // награды. Четвёртый барьер из 12.15: иначе трамплин стал бы
+                // способом обналичить заряд там, где за занос не платят.
+                car.drift_dir = 0.0;
+                car.drift_charge = 0.0;
+            } else if hb && v_fwd > 7.0 {
+                if slip.abs() > 0.12 {
+                    let dir = if slip > 0.0 { 1.0 } else { -1.0 };
+                    if car.drift_dir != 0.0 && dir != car.drift_dir && slip.abs() > 0.06 {
+                        car.drift_charge = 0.0;
+                    }
+                    car.drift_dir = dir;
+                    // Вне полотна заряд не копится, но и не сгорает —
+                    // ровно как в классике: там это один флаг в условии.
+                    if !offtrack {
+                        let k = ((v_fwd - 7.0) / (16.0 - 7.0)).clamp(0.0, 1.0);
+                        car.drift_charge += k * k * DT;
+                    }
                 }
-                car.drift_dir = dir;
-                let k = ((v_fwd - 7.0) / (16.0 - 7.0)).clamp(0.0, 1.0);
-                car.drift_charge += k * k * DT;
-            } else if !hb {
+            } else {
+                // Ручник отпущен или скорость потеряна — копилка
+                // выплачивается. Пороги и длительности приходят от хозяина;
+                // ноль порога значит «такого уровня нет».
+                let t = car.tuning;
+                let charge = car.drift_charge;
+                let (level, reward) = if t.drift_charge_l3 > 0.0 && charge >= t.drift_charge_l3 {
+                    (3.0, t.drift_boost_l3)
+                } else if t.drift_charge_l2 > 0.0 && charge >= t.drift_charge_l2 {
+                    (2.0, t.drift_boost_l2)
+                } else if t.drift_charge_l1 > 0.0 && charge >= t.drift_charge_l1 {
+                    (1.0, t.drift_boost_l1)
+                } else {
+                    (0.0, 0.0)
+                };
+                // Новый буст не укорачивает уже идущий — как в 6.3.
+                if reward > car.boost_time {
+                    car.boost_time = reward;
+                }
+                car.drift_level = level;
                 car.drift_dir = 0.0;
                 car.drift_charge = 0.0;
             }
@@ -653,6 +745,8 @@ impl World {
             o.engine_rpm = rpm.clamp(800.0, 8000.0);
             o.drift_charge = car.drift_charge;
             o.drift_dir = car.drift_dir;
+            o.boost_time = car.boost_time;
+            o.drift_level = car.drift_level;
 
             let mut grounded = 0.0;
             for (wi, w) in car.controller.wheels().iter().enumerate() {

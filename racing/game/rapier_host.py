@@ -92,6 +92,11 @@ RESTRICTED = (
     ('traffic', 'off', 'поток машин выключен'),
     ('events', 'off', 'происшествия выключены'),
     ('collisions', True, 'столкновения включены всегда'),
+    # Гандикап подменяет ХАРАКТЕРИСТИКИ машины уже после того, как мир
+    # создан и тела расставлены, а перенастроить живую машину модуль не
+    # умеет: настройки читаются один раз, в spawn_car. Оставить галочку
+    # включённой значило бы обещать замедление победителя и не делать его.
+    ('handicap', False, 'гандикап выключен'),
 )
 
 
@@ -491,6 +496,15 @@ def centerline_bytes(track) -> bytes:
 from .protocol import (BTN_THROTTLE, BTN_BRAKE, BTN_LEFT,   # noqa: E402
                        BTN_RIGHT, BTN_DRIFT)
 
+# Числа награды за занос (6.3). ИМПОРТИРУЮТСЯ, а не повторяются: модуль
+# игровых констант не знает (12.21), пресет их не выдумывает, и второго
+# места, где они записаны, в проекте быть не должно. Браузерный хозяин
+# берёт те же шесть чисел из static/js/physics.js — это и есть их
+# единственная пара объявлений, ровно как у WEATHER_GRIP.
+from .physics import (DRIFT_CHARGE_L1, DRIFT_CHARGE_L2,   # noqa: E402
+                      DRIFT_CHARGE_L3, DRIFT_BOOST_L1,
+                      DRIFT_BOOST_L2, DRIFT_BOOST_L3, BOOST_ACCEL)
+
 
 def car_tuning(stats, mode: str) -> dict:
     """Правки CarTuning для машины каталога в выбранном режиме (§12.23).
@@ -502,10 +516,25 @@ def car_tuning(stats, mode: str) -> dict:
     Блок ``body`` общий для обоих режимов: кузов у машины один, различаются
     режимы управляемостью, а не габаритами.
     """
+    # Награда за занос идёт ПЕРВОЙ и одинакова у всех машин: это правила
+    # раздела 6.3, а не свойство кузова. Каталог может лечь поверх, но в
+    # content/cars.json этих полей нет и заводить их там незачем.
+    values = {
+        'drift_charge_l1': DRIFT_CHARGE_L1,
+        'drift_charge_l2': DRIFT_CHARGE_L2,
+        'drift_charge_l3': DRIFT_CHARGE_L3,
+        'drift_boost_l1': DRIFT_BOOST_L1,
+        'drift_boost_l2': DRIFT_BOOST_L2,
+        'drift_boost_l3': DRIFT_BOOST_L3,
+        'boost_accel': BOOST_ACCEL,
+        # Потолок буста у каждой машины свой — stats.boost_speed из
+        # cars.json, уже с гандикапом, если он на неё наложен.
+        'boost_speed': float(getattr(stats, 'boost_speed', 0.0) or 0.0),
+    }
     tuning = getattr(stats, 'tuning', None)
     if not tuning:
-        return {}
-    values = dict(tuning.get('body') or {})
+        return values
+    values.update(tuning.get('body') or {})
     values.update(tuning.get(mode) or {})
     return values
 
@@ -755,13 +784,17 @@ class RapierRace(object):
                 steer -= 1.0
             inputs[base + abi.CarInput.STEER] = steer
             inputs[base + abi.CarInput.HANDBRAKE] = 1.0 if buttons & BTN_DRIFT else 0.0
+            # Третий барьер 12.15 модулю снаружи: полотна он не знает.
+            # Флаг взят с прошлого шага — у клиента он ровно такой же,
+            # потому что считается той же surface() по той же позе.
+            inputs[base + abi.CarInput.OFFTRACK] = 1.0 if car.state.offtrack else 0.0
         started = time.perf_counter()
         host._f_step(host._store, 1)
         self.micros.append((time.perf_counter() - started) * 1e6)
         self.ticks += 1
-        self._read_all()
+        self._read_all(events)
 
-    def _read_all(self):
+    def _read_all(self, events=None):
         """Поза из модуля -> CarState, затем шаг 16 из game/track.py."""
         host = self.host
         out = host.outputs
@@ -788,6 +821,13 @@ class RapierRace(object):
             state.steer = out[base + wheel_steer] * entry[5]
             state.drift_charge = out[base + o.DRIFT_CHARGE]
             state.drift_dir = int(out[base + o.DRIFT_DIR])
+            state.boost_time = out[base + o.BOOST_TIME]
+            # Выплата за занос (шаг 15): модуль держит уровень один шаг,
+            # хозяину остаётся отправить то же событие, что и у классики.
+            level = int(out[base + o.DRIFT_LEVEL])
+            if level and events is not None:
+                events.append({'t': 'race_event', 'kind': 'drift_boost',
+                               'slot': car.slot, 'level': level})
             grounded = out[base + o.WHEELS_ON_GROUND]
             state.airborne = grounded == 0.0
             slip = out[base + o.SLIP_ANGLE]

@@ -1270,7 +1270,7 @@ export class NetClient {
             // реконсиляцию переигрывалась бы по сухому сцеплению и
             // расхождение не гасло бы, а копилось.
             if (rapier !== null) {
-                rapier.step(buttons[i], BTN_MASK);
+                rapier.step(buttons[i], BTN_MASK, state.offtrack);
                 rapier.readInto(state, track);
                 this._recordState(i);
                 rapier.saveRing(i);
@@ -1555,7 +1555,7 @@ export class NetClient {
             // Пока мир не построен, предсказывать нечем: ввод всё равно
             // уходит, а машину ведёт авторитет сервера.
             if (!rapier.ready) return this._sendInput(buttons);
-            rapier.step(buttons, BTN_MASK);
+            rapier.step(buttons, BTN_MASK, state.offtrack);
             rapier.readInto(state, this.track);
         } else {
             // step() включает шаги 14 (границы) и 16 (progress) — им передан track.

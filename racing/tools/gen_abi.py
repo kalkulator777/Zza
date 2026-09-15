@@ -123,6 +123,10 @@ def gen_rust(spec, table):
     o.append('\nuse core::mem::{offset_of, size_of};\n')
     o.append('\n/// Версия раскладки. Хозяин обязан сверить, иначе молча '
              'разъедутся раскладки.\n')
+    o.append('/// Поднимается при любом изменении размера ЛЮБОЙ структуры, '
+             'даже дополнении в хвост:\n')
+    o.append('/// совместимость тут по байтам, а не по смыслу полей '
+             '(правило в шапке файла).\n')
     o.append('pub const ABI_VERSION: u32 = %d;\n' % spec['abi_version'])
     for c in spec['consts']:
         o.append('\n')
