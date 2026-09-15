@@ -200,6 +200,42 @@ const KERB_WIDTH = 0.62; // ширина бордюра, м
 const MARK_LIFT = 0.015; // подъём разметки над полотном, м
 
 // ---------------------------------------------------------------------------
+// Трамплины
+// ---------------------------------------------------------------------------
+//
+// Геометрия строится по полю `ramps` формата 12.1 — по тем же числам, по
+// которым считает физика (game/track.py, RAMP_*), поэтому картинка и шаг 14б
+// не могут разъехаться: профиль высоты здесь буквально тот же, что в
+// Track.ramp_height.
+//
+// ГЛАВНОЕ ТРЕБОВАНИЕ К ВИДУ — трамплин обязан читаться ЗАРАНЕЕ. Улететь
+// случайно и потом выяснить, что это было, игрок не простит. Поэтому въезд
+// не просто наклонная плоскость:
+//
+//   * от него на RAMP_APPROACH метров назад тянется полосатый коридор —
+//     он виден задолго до самого въезда и сразу показывает ширину трамплина
+//     и то, с какой стороны его можно объехать;
+//   * коридор и въезд обрамлены поднятыми бордюрными рейками в цвете
+//     поребриков темы: это объём, он читается на дистанции, где плоская
+//     разметка уже сливается;
+//   * само полотно въезда размечено поперечными предупреждающими полосами,
+//     так что уклон виден как уклон, а не как пятно на асфальте;
+//   * за кромкой вылета стоит тёмная вертикальная стенка — силуэт классического
+//     трамплина, а не «дорога вдруг оборвалась».
+//
+// Всё это ОДИН меш на все трамплины трассы: он маленький (сотни треугольников),
+// живёт на общем материале полотна и стоит один вызов отрисовки.
+const RAMP_EDGE_W = 1.0;      // м бокового скоса — зеркало RAMP_EDGE из game/track.py
+const RAMP_APPROACH = 16.0;   // м полосатого коридора перед въездом
+const RAMP_APRON_LIFT = 0.03; // м подъёма коридора над полотном (без z-fighting)
+const RAMP_BAND = 1.6;        // м, шаг предупреждающих полос
+const RAMP_RAIL_W = 0.42;     // м, ширина бордюрной рейки по краю трамплина
+const RAMP_RAIL_H = 0.26;     // м, высота рейки над полотном
+const RAMP_RAIL_BAND = 1.1;   // м, шаг чередования цветов рейки
+const RAMP_DECK_STEP = 0.7;   // м, шаг разбиения въезда вдоль дуги
+const RAMP_APRON_STEP = 1.6;  // м, шаг разбиения коридора вдоль дуги
+
+// ---------------------------------------------------------------------------
 // Карта следов в параметризации ленты
 // ---------------------------------------------------------------------------
 //
@@ -789,7 +825,8 @@ export function readTrack(track) {
             nz: track.nz,
             hw: track.hw,
             s: track.s,
-            startGrid: track.start_grid || track.startGrid || null
+            startGrid: track.start_grid || track.startGrid || null,
+            ramps: track.ramps || []
         };
     }
 
@@ -813,7 +850,8 @@ export function readTrack(track) {
             nz: track.cnz,
             hw: track.chw,
             s: track.cs,
-            startGrid: track.startGrid || null
+            startGrid: track.startGrid || null,
+            ramps: track.ramps || []
         };
     }
 
@@ -835,7 +873,8 @@ export function readTrack(track) {
             nz: new Float32Array(n),
             hw: new Float32Array(n),
             s: new Float32Array(n),
-            startGrid: track.start_grid || null
+            startGrid: track.start_grid || null,
+            ramps: track.ramps || []
         };
         for (let i = 0; i < n; i++) {
             const p = track.samples[i];
@@ -1009,6 +1048,9 @@ export function buildTrackMeshes(track, theme, quality, opts) {
     const markings = buildMarkings(T, P, colors, markMat, ao, plan, uvOn);
     const ground = buildGround(T, colors, groundY, surfaceMat, uvOn);
     const arch = buildStartArch(T, P, colors, surfaceMat, ao, uvOn);
+    // Трамплины: один меш на все, и только если они на трассе есть. На карте
+    // без трамплинов не появляется ни вызова отрисовки, ни треугольника.
+    const ramps = buildRamps(T, colors, pal, surfaceMat, ao, uvOn, wx);
 
     if (light) {
         // Порядок важен: затенение уже лежит в цветах, свет домножается сверху,
@@ -1017,11 +1059,13 @@ export function buildTrackMeshes(track, theme, quality, opts) {
         bakeVertexLight(markings.mesh.geometry, light, { emissive: lineEmissive });
         bakeVertexLight(ground.geometry, light);
         bakeVertexLight(arch.geometry, light);
+        if (ramps) bakeVertexLight(ramps.geometry, light);
     }
 
     // Сегментные поверхности: отсекаются посегментно каждый кадр.
     const segmented = [surface, markings];
     group.add(ground, surface.mesh, markings.mesh, arch);
+    if (ramps) group.add(ramps);
 
     const api = {
         group: group,
@@ -1032,6 +1076,8 @@ export function buildTrackMeshes(track, theme, quality, opts) {
         terrain: surface.mesh,
         ground: ground,
         arch: arch,
+        /** Меш трамплинов или null, если их на трассе нет. */
+        ramps: ramps,
         segments: plan.count,
         materials: { surface: surfaceMat, markings: markMat },
         bounds: { minY: minY, maxY: maxY, groundY: groundY },
@@ -1170,6 +1216,230 @@ function roadWriter(T, P, colors, ao, uvOn, wx) {
             uv: uvOn ? uv : null
         });
     };
+}
+
+// ---------------------------------------------------------------------------
+// Трамплины
+// ---------------------------------------------------------------------------
+
+/**
+ * Точка осевой линии на произвольной дуге s: индекс дробный, соседние выборки
+ * смешиваются. Без этого въезд длиной 6 м лёг бы на три узла сетки и получил
+ * бы ступеньки там, где физика считает гладкий уклон.
+ * Заполняет out = [x, y, z, nx, nz] и возвращает его.
+ */
+function rampFrame(T, s, out) {
+    const n = T.count;
+    const total = T.length;
+    let ss = s % total;
+    if (ss < 0) ss += total;
+    const f = ss / T.step;
+    let i0 = Math.floor(f);
+    const t = f - i0;
+    i0 = ((i0 % n) + n) % n;
+    const i1 = i0 + 1 < n ? i0 + 1 : 0;
+    const nx = T.nx[i0] + (T.nx[i1] - T.nx[i0]) * t;
+    const nz = T.nz[i0] + (T.nz[i1] - T.nz[i0]) * t;
+    const len = Math.sqrt(nx * nx + nz * nz) || 1;
+    out[0] = T.x[i0] + (T.x[i1] - T.x[i0]) * t;
+    out[1] = T.y[i0] + (T.y[i1] - T.y[i0]) * t;
+    out[2] = T.z[i0] + (T.z[i1] - T.z[i0]) * t;
+    out[3] = nx / len;
+    out[4] = nz / len;
+    out[5] = T.hw[i0] + (T.hw[i1] - T.hw[i0]) * t;
+    return out;
+}
+
+/** Высота полотна трамплина: зеркало Track.ramp_height, но по дуге и смещению. */
+function rampDeckHeight(ramp, ds, u) {
+    if (ds <= 0 || ds > ramp.length) return 0;
+    let du = u - ramp.offset;
+    if (du < 0) du = -du;
+    const edge = ramp.half_width - du;
+    if (edge <= 0) return 0;
+    let h = ramp.slope * ds;
+    if (edge < RAMP_EDGE_W) h *= edge / RAMP_EDGE_W;
+    return h;
+}
+
+/**
+ * Один меш на все трамплины трассы: полосатый коридор подхода, полотно
+ * въезда, бордюрные рейки по краям и тёмная стенка за кромкой вылета.
+ * Возвращает null, если трамплинов на трассе нет, — тогда и лишнего вызова
+ * отрисовки не появляется.
+ */
+function buildRamps(T, colors, pal, material, ao, uvOn, wx) {
+    const ramps = T.ramps;
+    if (!ramps || !ramps.length) return null;
+
+    const b = new MeshBuilder();
+    if (uvOn) b.enableUV();
+
+    const warnA = toColor(pal.archTrim);      // предупреждающая полоса
+    const warnB = toColor(pal.asphaltDark);   // тёмная полоса между ними
+    todShadeLike(warnA, colors);
+    const railA = colors.kerbA;
+    const railB = colors.kerbB;
+    const railSide = colors.kerbSide;
+    const lipFace = colors.dark;
+
+    const fa = [0, 0, 0, 0, 0, 0];
+    const fb = [0, 0, 0, 0, 0, 0];
+    const pa = [0, 0, 0];
+    const pb = [0, 0, 0];
+    const pc = [0, 0, 0];
+    const pd = [0, 0, 0];
+    const uva = [0, 0];
+    const uvb = [0, 0];
+    const uvc = [0, 0];
+    const uvd = [0, 0];
+
+    // uv ленты — та же параметризация, что у полотна: карта следов шин
+    // продолжается по трамплину, иначе колея обрывалась бы на въезде
+    function setUV(out, s, u, hw) {
+        out[0] = 0.5 + (0.5 * u) / (hw * MARK_EXTENT);
+        out[1] = (s / T.length) % 1;
+    }
+
+    function put(sA, sB, uA, uB, hA0, hA1, hB0, hB1, lift, color) {
+        rampFrame(T, sA, fa);
+        rampFrame(T, sB, fb);
+        pa[0] = fa[0] + fa[3] * uA; pa[1] = fa[1] + hA0 + lift; pa[2] = fa[2] + fa[4] * uA;
+        pb[0] = fb[0] + fb[3] * uA; pb[1] = fb[1] + hB0 + lift; pb[2] = fb[2] + fb[4] * uA;
+        pc[0] = fb[0] + fb[3] * uB; pc[1] = fb[1] + hB1 + lift; pc[2] = fb[2] + fb[4] * uB;
+        pd[0] = fa[0] + fa[3] * uB; pd[1] = fa[1] + hA1 + lift; pd[2] = fa[2] + fa[4] * uB;
+        if (uvOn) {
+            setUV(uva, sA, uA, fa[5]);
+            setUV(uvb, sB, uA, fb[5]);
+            setUV(uvc, sB, uB, fb[5]);
+            setUV(uvd, sA, uB, fa[5]);
+            b.quadVC(pa, pb, pc, pd, color, color, color, color, uva, uvb, uvc, uvd);
+        } else {
+            b.quad(pa, pb, pc, pd, color);
+        }
+    }
+
+    // вертикальная грань поперёк трассы, лицом ВПЕРЁД по ходу движения
+    function wall(s, uA, uB, y0, y1, color) {
+        rampFrame(T, s, fa);
+        pa[0] = fa[0] + fa[3] * uB; pa[1] = fa[1] + y0; pa[2] = fa[2] + fa[4] * uB;
+        pb[0] = fa[0] + fa[3] * uB; pb[1] = fa[1] + y1; pb[2] = fa[2] + fa[4] * uB;
+        pc[0] = fa[0] + fa[3] * uA; pc[1] = fa[1] + y1; pc[2] = fa[2] + fa[4] * uA;
+        pd[0] = fa[0] + fa[3] * uA; pd[1] = fa[1] + y0; pd[2] = fa[2] + fa[4] * uA;
+        if (uvOn) {
+            setUV(uva, s, uB, fa[5]);
+            setUV(uvb, s, uB, fa[5]);
+            setUV(uvc, s, uA, fa[5]);
+            setUV(uvd, s, uA, fa[5]);
+            b.quadVC(pa, pb, pc, pd, color, color, color, color, uva, uvb, uvc, uvd);
+        } else {
+            b.quad(pa, pb, pc, pd, color);
+        }
+    }
+
+    const tint = new THREE.Color();
+
+    for (let k = 0; k < ramps.length; k++) {
+        const r = ramps[k];
+        const s0 = r.s0;
+        const sLip = r.s0 + r.length;
+        const uL = r.offset - r.half_width;
+        const uR = r.offset + r.half_width;
+
+        // --- 1. коридор подхода: полосы поперёк, видны издалека
+        const aSteps = Math.max(2, Math.round(RAMP_APPROACH / RAMP_APRON_STEP));
+        for (let i = 0; i < aSteps; i++) {
+            const sA = s0 - RAMP_APPROACH + (RAMP_APPROACH * i) / aSteps;
+            const sB = s0 - RAMP_APPROACH + (RAMP_APPROACH * (i + 1)) / aSteps;
+            // чем ближе к въезду, тем плотнее тёмные полосы — «внимание»
+            const near = (i + 1) / aSteps;
+            mixColor(tint, warnB, warnA, i % 2 ? 0.85 : 0.1 + 0.25 * near);
+            put(sA, sB, uL, uR, 0, 0, 0, 0, RAMP_APRON_LIFT, tint);
+        }
+
+        // --- 2. полотно въезда. Высота берётся тем же профилем, что в физике,
+        //        включая боковой скос RAMP_EDGE_W: колесо и картинка живут
+        //        на одной поверхности.
+        const dSteps = Math.max(3, Math.round(r.length / RAMP_DECK_STEP));
+        const cols = 6;
+        for (let i = 0; i < dSteps; i++) {
+            const sA = s0 + (r.length * i) / dSteps;
+            const sB = s0 + (r.length * (i + 1)) / dSteps;
+            const dsA = sA - s0;
+            const dsB = sB - s0;
+            const band = Math.floor(dsA / (RAMP_BAND * 0.35)) % 2;
+            for (let j = 0; j < cols; j++) {
+                const uA = uL + ((uR - uL) * j) / cols;
+                const uB = uL + ((uR - uL) * (j + 1)) / cols;
+                mixColor(tint, warnB, warnA, band ? 0.9 : 0.12);
+                put(sA, sB, uA, uB,
+                    rampDeckHeight(r, dsA, uA), rampDeckHeight(r, dsA, uB),
+                    rampDeckHeight(r, dsB, uA), rampDeckHeight(r, dsB, uB),
+                    0, tint);
+            }
+        }
+
+        // --- 3. стенка за кромкой вылета: силуэт трамплина, а не обрыв дороги
+        wall(sLip, uL, uR, 0, r.rise, lipFace);
+
+        // --- 4. бордюрные рейки по обеим кромкам, от начала коридора до
+        //        кромки вылета. Это объём: он читается там, где плоская
+        //        разметка уже сливается с асфальтом.
+        const railSteps = Math.max(
+            4, Math.round((RAMP_APPROACH + r.length) / RAMP_RAIL_BAND));
+        for (let side = 0; side < 2; side++) {
+            const inner = side ? uR : uL;
+            const outer = side ? uR + RAMP_RAIL_W : uL - RAMP_RAIL_W;
+            for (let i = 0; i < railSteps; i++) {
+                const sA = s0 - RAMP_APPROACH
+                    + ((RAMP_APPROACH + r.length) * i) / railSteps;
+                const sB = s0 - RAMP_APPROACH
+                    + ((RAMP_APPROACH + r.length) * (i + 1)) / railSteps;
+                const baseA = Math.max(0, rampDeckHeight(r, sA - s0, inner));
+                const baseB = Math.max(0, rampDeckHeight(r, sB - s0, inner));
+                const col = i % 2 ? railA : railB;
+                // верх рейки
+                put(sA, sB, inner, outer,
+                    baseA + RAMP_RAIL_H, baseA + RAMP_RAIL_H,
+                    baseB + RAMP_RAIL_H, baseB + RAMP_RAIL_H, 0, col);
+                // внутренняя и внешняя щёки: без них рейка «просвечивает»
+                railSide2(b, T, sA, sB, inner, baseA, baseB, RAMP_RAIL_H,
+                          railSide, side === 0);
+                railSide2(b, T, sA, sB, outer, baseA, baseB, RAMP_RAIL_H,
+                          railSide, side === 1);
+            }
+        }
+    }
+
+    const geom = b.build();
+    const mesh = new THREE.Mesh(geom, material);
+    mesh.name = 'trackRamps';
+    mesh.frustumCulled = true;
+    return mesh;
+}
+
+/** Вертикальная щека рейки вдоль трассы на смещении u. */
+function railSide2(b, T, sA, sB, u, hA, hB, height, color, flip) {
+    const fa = rampFrame(T, sA, [0, 0, 0, 0, 0, 0]);
+    const ax = fa[0] + fa[3] * u, ay = fa[1], az = fa[2] + fa[4] * u;
+    const fb = rampFrame(T, sB, [0, 0, 0, 0, 0, 0]);
+    const bx = fb[0] + fb[3] * u, by = fb[1], bz = fb[2] + fb[4] * u;
+    const p0 = [ax, ay + hA, az];
+    const p1 = [ax, ay + hA + height, az];
+    const p2 = [bx, by + hB + height, bz];
+    const p3 = [bx, by + hB, bz];
+    if (flip) b.quad(p0, p1, p2, p3, color);
+    else b.quad(p3, p2, p1, p0, color);
+}
+
+/** Приглушить цвет под уже посчитанную палитру (время суток уже в colors). */
+function todShadeLike(color, colors) {
+    // colors.asphalt уже прошёл time-of-day и погоду; берём из него общий
+    // коэффициент яркости и применяем к предупреждающему цвету, чтобы
+    // трамплин ночью не светился неоном посреди тёмной трассы
+    const k = (colors.asphalt.r + colors.asphalt.g + colors.asphalt.b) / 0.72;
+    const m = Math.min(1.0, Math.max(0.35, k));
+    color.setRGB(color.r * m, color.g * m, color.b * m);
 }
 
 function segmentSpheres(geom, starts, counts) {

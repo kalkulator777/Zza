@@ -398,15 +398,38 @@ const PRECIP = {
 };
 
 /** Доля частиц от пресета качества. Низкий пресет осадки не отменяет. */
-const PRECIP_QUALITY = { low: 0.34, medium: 0.7, high: 1.0 };
+const PRECIP_QUALITY = { low: 0.5, medium: 0.8, high: 1.0 };
 
 /**
- * Плотность декора правит и осадки: это одна и та же жалоба игрока
- * («слишком много всего») и один и тот же переключатель в меню.
- * Разброс тут мягче, чем у декора: осадки в полтора раза гуще уже мешают
- * видеть трассу, а это запрещено.
+ * Осадки — это частицы, поэтому ими правит УЖЕ СУЩЕСТВУЮЩАЯ настройка
+ * «Частицы» (`racing.gfx.particles`, §12.14), а не новая галочка. Значение
+ * `off` снимает осадки целиком: ни меша, ни вызова отрисовки, ни
+ * треугольников — требование заказчика «всё новое в графике обязано
+ * отключаться» выполняется тем же переключателем, которым игрок и так
+ * гасит дым и искры.
  */
-const PRECIP_DECOR_K = { sparse: 0.62, normal: 1.0, dense: 1.3 };
+const PRECIP_PARTICLE_K = { off: 0, few: 0.55, normal: 1.0, many: 1.3 };
+
+const PRECIP_PARTICLES_KEY = 'racing.gfx.particles';
+
+/**
+ * Уровень частиц для осадков.
+ *
+ * Владелец значений настроек графики — renderer.js (§12.14), и правильный
+ * путь — получить уровень в `opts.particles`. Пока renderer.js его не
+ * передаёт (одна строка в вызове buildScenery), значение читается напрямую
+ * из того же ключа localStorage — иначе осадки оказались бы единственной
+ * добавкой в графике без выключателя. Чтение одноразовое, при сборке сцены,
+ * и молча переживает недоступное хранилище.
+ */
+function precipParticleLevel(opts) {
+    if (opts && PRECIP_PARTICLE_K[opts.particles] !== undefined) return opts.particles;
+    try {
+        const raw = window.localStorage.getItem(PRECIP_PARTICLES_KEY);
+        if (PRECIP_PARTICLE_K[raw] !== undefined) return raw;
+    } catch (e) { /* нет хранилища — живём с умолчанием */ }
+    return 'normal';
+}
 
 /**
  * Снос ветром: ровный фон плюс встречный поток от скорости машины.
@@ -431,16 +454,19 @@ function clamp(v, lo, hi) {
  *
  * @param {string} weather ключ PRECIP
  * @param {string} qName   пресет качества
- * @param {string} decor   выбранная плотность декора или null
+ * @param {string} particles уровень настройки «Частицы» (off снимает осадки)
  * @param {object} timeUniform общий {value} времени (его двигает updateAnim)
  * @param {Rng} rng детерминированная расстановка
  */
-function buildPrecipitation(weather, qName, decor, timeUniform, rng) {
+function buildPrecipitation(weather, qName, particles, timeUniform, rng) {
     const P = PRECIP[weather];
     if (!P) return null;
+    const pk = PRECIP_PARTICLE_K[particles] === undefined ? 1 : PRECIP_PARTICLE_K[particles];
+    // Частицы выключены — осадков нет совсем, а не «мало»: ноль вызовов
+    // отрисовки и ноль треугольников.
+    if (pk <= 0) return null;
     const qk = PRECIP_QUALITY[qName] === undefined ? 1 : PRECIP_QUALITY[qName];
-    const dk = PRECIP_DECOR_K[decor] === undefined ? 1 : PRECIP_DECOR_K[decor];
-    const count = Math.max(40, Math.round(P.count * qk * dk));
+    const count = Math.max(40, Math.round(P.count * qk * pk));
 
     const half = P.box * 0.5;
     const hole2 = P.hole * P.hole;
@@ -681,7 +707,10 @@ const THEME_ENV = {
  * @param {object} [opts]  отдельные настройки графики, добавлены после
  *                         контракта и НЕОБЯЗАТЕЛЬНЫ:
  *                         { ao, decor: sparse|normal|dense, anim,
- *                           env: {timeOfDay, weather}, nightLights: 0..1.5 }
+ *                           env: {timeOfDay, weather}, nightLights: 0..1.5,
+ *                           particles: off|few|normal|many — плотность
+ *                           осадков; `off` снимает их целиком. Если поля нет,
+ *                           уровень читается из racing.gfx.particles }
  */
 export function buildScenery(track, theme, seed, quality, opts) {
     const T = readTrack(track);
@@ -707,6 +736,7 @@ export function buildScenery(track, theme, seed, quality, opts) {
     const env = applyWeather(themeEnv[todName] || themeEnv.day, weatherName);
 
     const decorLevel = DECOR_DENSITY[o.decor] !== undefined ? o.decor : null;
+    const precipLevel = precipParticleLevel(o);
     // Нормировка плотности по длине круга снята: отсечение по пирамиде
     // видимости сделало её ненужной (см. шапку файла).
     const density = (decorLevel ? DECOR_DENSITY[decorLevel] : Q.density)
@@ -792,9 +822,9 @@ export function buildScenery(track, theme, seed, quality, opts) {
     group.add(skyGroup);
 
     // Осадки: один меш, один вызов отрисовки, движение в вершинном шейдере.
-    // Плотность — от пресета качества и от той же настройки «плотность
-    // декора», которой игрок и так убавляет всё лишнее в кадре.
-    const precip = buildPrecipitation(weatherName, qName, decorLevel,
+    // Плотность — от пресета качества и от настройки «Частицы»; она же
+    // значением `off` выключает осадки целиком.
+    const precip = buildPrecipitation(weatherName, qName, precipLevel,
         timeUniform, new Rng(baseSeed ^ 0x9a1f));
     if (precip) {
         group.add(precip.group);

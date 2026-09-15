@@ -414,6 +414,10 @@ def run_python(plan):
         inject.setdefault(step_idx, []).append((field, value))
 
     state = CarState(0.0, 0.0, 0.0)
+    # Множитель сцепления от покрытия: в основном плане его нет, и тогда
+    # работает умолчание 1.0. Ключ нужен проверке «единица не меняет ни бита».
+    if "grip_mul" in plan:
+        state.grip_mul = plan["grip_mul"]
     stats = CarStats(**plan["stats"])
     track = StubTrack()
     dt = plan["dt"]
@@ -629,6 +633,9 @@ for (const row of plan.inject) {
 }
 
 const state = createCarState(0.0, 0.0, 0.0);
+if (plan.grip_mul !== undefined) {
+    state.gripMul = plan.grip_mul;
+}
 const stats = createCarStats(plan.stats);
 const track = new StubTrack();
 const n = buttons.length;
@@ -1686,6 +1693,96 @@ def report_jump():
     return ok
 
 
+# ---------------------------------------------------------------------------
+# Крюк под покрытие: множитель сцепления (state.grip_mul)
+# ---------------------------------------------------------------------------
+# Погоду делает другой исполнитель, физика знает только множитель. Проверяем
+# ровно три обещания: единица не меняет НИЧЕГО, число меняет предел
+# поперечного ускорения ровно во столько же раз, и мусор снаружи не способен
+# вывернуть шаг 10 наизнанку.
+
+def _steady_corner(grip_mul, seconds=10.0, entry=30.0):
+    """Установившийся вираж на полном локе: (скорость, темп, поперечное a)."""
+    stats = CarStats(**HATCH_STATS)
+    track = NullTrack()
+    state = CarState(0.0, 0.0, 0.0)
+    state.grip_mul = grip_mul
+    state.vz = entry
+    n = int(seconds / physics.DT + 0.5)
+    for _ in range(n):
+        physics.step(state, stats, GAS | LEFT, physics.DT, track, 0)
+    yaw0 = state.yaw
+    for _ in range(60):
+        physics.step(state, stats, GAS | LEFT, physics.DT, track, 0)
+    rate = state.yaw - yaw0            # рад/с: мерили ровно секунду
+    speed = hypot(state.vx, state.vz)
+    return speed, rate, speed * rate
+
+
+def report_grip():
+    """Множитель сцепления от покрытия. False — крюк сломан."""
+    base_lat = HATCH_STATS["grip_step"] * physics.GRIP_LAT_ACCEL
+    print("  крюк под покрытие (state.grip_mul, предел поперечного "
+          "ускорения при единице %.2f м/с²):" % base_lat)
+    ok = True
+
+    def check(mark, name, extra=""):
+        nonlocal ok
+        if not mark:
+            ok = False
+        print("    [%s] %-46s %s" % ("ок" if mark else "ПРОВАЛ", name, extra))
+
+    # 1. Единица не меняет ничего. Сверяем в лоб: весь основной сценарий,
+    #    прогнанный с явно выставленной единицей, обязан совпасть с прогоном
+    #    по умолчанию ПОБИТОВО — иначе «крюк по умолчанию ничего не меняет»
+    #    было бы обещанием на словах.
+    plan = build_plan()
+    ref = run_python(plan)
+    plan_one = build_plan()
+    plan_one["grip_mul"] = 1.0
+    one = run_python(plan_one)
+    same = all(ref["x"][i] == one["x"][i] and ref["z"][i] == one["z"][i]
+               and ref["yaw"][i] == one["yaw"][i]
+               for i in range(len(ref["x"])))
+    check(same, "grip_mul = 1.0 не меняет ни бита",
+          "%d шагов сценария совпали побитово" % len(ref["x"]))
+
+    # 2. Множитель двигает предел поперечного ускорения ровно во столько раз.
+    #    Скорость в дуге ЗАДАННОГО радиуса при этом падает как корень из него
+    #    (v = sqrt(a_lat * R)) — это та же величина, которой 12.7 меряет
+    #    разницу между машинами, поэтому её и печатаем.
+    ref_radius = 30.0
+    _dry_v, _dry_rate, dry_lat = _steady_corner(1.0)
+    dry_arc = (dry_lat * ref_radius) ** 0.5
+    for name, mul in sorted(physics.WEATHER_GRIP.items()):
+        _v, _rate, lat = _steady_corner(mul)
+        want = dry_lat * mul
+        rel = abs(lat - want) / want
+        arc = (lat * ref_radius) ** 0.5
+        check(rel < 0.02, "погода %-6s множитель %.2f" % (name, mul),
+              "поперечное %.2f м/с² (ждали %.2f), в дуге R=%.0f м "
+              "%.1f -> %.1f м/с, минус %.1f %%"
+              % (lat, want, ref_radius, dry_arc, arc,
+                 (1.0 - arc / dry_arc) * 100.0))
+
+    # 3. Мусор снаружи не ломает шаг 10. При grip_mul сильно больше единицы
+    #    множитель (1 - grip_step * grip_mul) ушёл бы в минус, и боковая
+    #    скорость начала бы менять знак каждый шаг. Рамки это закрывают.
+    _v_lo, _r_lo, lat_lo = _steady_corner(0.0)
+    _v_hi, _r_hi, lat_hi = _steady_corner(50.0)
+    want_lo = dry_lat * physics.GRIP_MUL_MIN
+    want_hi = dry_lat * physics.GRIP_MUL_MAX
+    check(abs(lat_lo - want_lo) / want_lo < 0.05
+          and abs(lat_hi - want_hi) / want_hi < 0.05,
+          "значение вне рамок зажимается, а не ломает шаг",
+          "0.0 -> %.2f м/с² (потолок снизу %.2f), 50.0 -> %.2f м/с² "
+          "(потолок сверху %.2f)" % (lat_lo, want_lo, lat_hi, want_hi))
+
+    if not ok:
+        print("  ОШИБКА: крюк под покрытие ведёт себя не так, как обещано")
+    return ok
+
+
 def main():
     print("Проверка совпадения физики Python и JS")
     print("  шагов в сценарии: %d (%.1f с игрового времени)"
@@ -1735,6 +1832,10 @@ def main():
 
     print()
     if not report_jump():
+        ok = False
+
+    print()
+    if not report_grip():
         ok = False
 
     print()

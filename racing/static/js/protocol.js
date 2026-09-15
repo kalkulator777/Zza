@@ -42,7 +42,9 @@
 //   off 0   u8    type = 0x10 (MSG_SNAPSHOT)
 //   off 1   u32   tick          номер тика сервера
 //   off 5   u32   ack_seq       ACK_OFFSET: единственное поле, зависящее от клиента
-//   off 9   u8    car_count
+//   off 9   u8    car_count     младшие 7 бит — число машин (0..8),
+//                               бит 7 (SNAPSHOT_FLAG_EXTRA) — есть ли за
+//                               маской боксов секции траффика и происшествий
 //   далее car_count записей по 26 байт:
 //     u8 slot, u8 flags, f32 x, f32 z, f32 yaw, f32 vx, f32 vz,
 //     u8 lap, u8 place, i8 steer_q (-127..127 <-> -1..1), u8 drift_charge (charge*100)
@@ -52,6 +54,7 @@
 //   u8 box_mask_len
 //   box_mask_len байт маски активных боксов:
 //     бокс i -> байт i >> 3, бит i & 7 (младший бит — первый бокс)
+//   --- дальше только если в car_count поднят бит 7 (FLAG_EXTRA) ---
 //   u8 traffic_count
 //   далее traffic_count записей по 6 байт (машины-болванки):
 //     u8 ident   младшие 4 бита — id в пуле, старшие 4 — вид (силуэт и цвет)
@@ -72,12 +75,14 @@
 // car flags: 0 вне трассы, 1 дрифтует, 2 ускорение, 3 крутит (урон),
 //            4 щит, 5 финишировал, 6 призрак (отключился), 7 тормозит
 //
-// Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len
-//                      + 1 + 6*traffic_count + 1 + 8*event_count.
-// Для 8 машин, 4 снарядов и маски в 2 байта это 284 байта (5,7 КБ/с на клиента
-// при 20 Гц): два байта против прежних 282 — это счётчики пустых траффика
-// и событий. Плотный траффик (12 машин) добавляет 72 байта, шесть
-// происшествий — ещё 48. Потолок наполнения: 404 байта, 8,1 КБ/с.
+// Размер снапшота = 10 + 26*car_count + 1 + 15*proj_count + 1 + box_mask_len,
+// и ЕСЛИ есть траффик или происшествия, ещё + 1 + 6*traffic_count
+//                                            + 1 + 8*event_count.
+// Для 8 машин, 4 снарядов и маски в 2 байта без траффика и происшествий это
+// ровно прежние 282 байта, байт в байт: выключенная настройка не стоит НИ
+// ОДНОГО лишнего байта, за это и отвечает флаг в car_count. Плотный траффик
+// (12 машин) добавляет 1 + 72 = 73 байта, шесть происшествий — ещё 1 + 48 = 49.
+// Потолок наполнения: 404 байта, 8,1 КБ/с против 5,6 КБ/с у пустого.
 // В DESIGN.md §5.3 в итоговой сумме стоит 265 — та сумма не сходится
 // с собственным списком полей: в ней снаряд посчитан как 11 байт (потерян f32 yaw)
 // и не учтён байт box_mask_len. Здесь реализован список полей, он первичен.
@@ -131,6 +136,12 @@ export const ACK_OFFSET = 5;
 export const MAX_CARS = 8;            // мест в гонке
 export const MAX_PROJECTILES = 32;    // потолок буфера снарядов
 export const MAX_BOX_MASK_LEN = 32;   // 32 байта маски = до 256 боксов
+// Бит 7 поля car_count: за маской боксов идут секции траффика и происшествий.
+// Нужен ради обратной совместимости по байтам — комната с выключенными
+// траффиком и происшествиями шлёт ровно тот же пакет, что и раньше.
+export const SNAPSHOT_FLAG_EXTRA = 0x80;
+export const SNAPSHOT_CAR_COUNT_MASK = 0x7F;
+
 export const MAX_TRAFFIC = 12;        // машин-болванок в снапшоте
 export const TRAFFIC_LOOKS = 12;      // видов болванки (силуэт + цвет)
 export const MAX_ROAD_EVENTS = 6;     // одновременных происшествий
@@ -208,12 +219,16 @@ export function isBoxActive(out, boxId) {
 /** Размер снапшота в байтах при заданном наполнении. */
 export function snapshotSize(carCount, projCount, boxMaskLen,
                              trafficCount, eventCount) {
-    return SNAPSHOT_HEADER_SIZE
+    let size = SNAPSHOT_HEADER_SIZE
         + carCount * SNAPSHOT_CAR_SIZE
         + 1 + projCount * SNAPSHOT_PROJ_SIZE
-        + 1 + boxMaskLen
-        + 1 + (trafficCount || 0) * SNAPSHOT_TRAFFIC_SIZE
-        + 1 + (eventCount || 0) * SNAPSHOT_EVENT_SIZE;
+        + 1 + boxMaskLen;
+    const traf = trafficCount || 0;
+    const evt = eventCount || 0;
+    if (traf || evt) {
+        size += 1 + traf * SNAPSHOT_TRAFFIC_SIZE + 1 + evt * SNAPSHOT_EVENT_SIZE;
+    }
+    return size;
 }
 
 // --- снапшот: сервер -> клиент ---------------------------------------------
@@ -361,7 +376,9 @@ export function decodeSnapshot(data, out) {
         return false;
     }
 
-    const carCount = view.getUint8(9);
+    const header = view.getUint8(9);
+    const carCount = header & SNAPSHOT_CAR_COUNT_MASK;
+    const hasExtra = (header & SNAPSHOT_FLAG_EXTRA) !== 0;
     if (carCount > MAX_CARS) { out.valid = false; return false; }
 
     let need = SNAPSHOT_HEADER_SIZE + carCount * SNAPSHOT_CAR_SIZE + 1;
@@ -376,20 +393,28 @@ export function decodeSnapshot(data, out) {
     const maskLen = view.getUint8(need - 1);
     if (maskLen > MAX_BOX_MASK_LEN) { out.valid = false; return false; }
 
-    need += maskLen + 1;
+    need += maskLen;
     if (total < need) { out.valid = false; return false; }
 
-    const trafCount = view.getUint8(need - 1);
-    if (trafCount > MAX_TRAFFIC) { out.valid = false; return false; }
+    // Секции траффика и происшествий есть только если поднят флаг: пакет
+    // комнаты без них обязан разбираться ровно как прежде.
+    let trafCount = 0;
+    let evtCount = 0;
+    if (hasExtra) {
+        need += 1;
+        if (total < need) { out.valid = false; return false; }
+        trafCount = view.getUint8(need - 1);
+        if (trafCount > MAX_TRAFFIC) { out.valid = false; return false; }
 
-    need += trafCount * SNAPSHOT_TRAFFIC_SIZE + 1;
-    if (total < need) { out.valid = false; return false; }
+        need += trafCount * SNAPSHOT_TRAFFIC_SIZE + 1;
+        if (total < need) { out.valid = false; return false; }
 
-    const evtCount = view.getUint8(need - 1);
-    if (evtCount > MAX_ROAD_EVENTS) { out.valid = false; return false; }
+        evtCount = view.getUint8(need - 1);
+        if (evtCount > MAX_ROAD_EVENTS) { out.valid = false; return false; }
 
-    need += evtCount * SNAPSHOT_EVENT_SIZE;
-    if (total < need) { out.valid = false; return false; }
+        need += evtCount * SNAPSHOT_EVENT_SIZE;
+        if (total < need) { out.valid = false; return false; }
+    }
 
     out.tick = view.getUint32(1, true);
     out.ackSeq = view.getUint32(ACK_OFFSET, true);
@@ -435,6 +460,10 @@ export function decodeSnapshot(data, out) {
     for (let i = 0; i < maskLen; i++) boxMask[i] = view.getUint8(offset + i);
     for (let i = maskLen; i < MAX_BOX_MASK_LEN; i++) boxMask[i] = 0;
     offset += maskLen;
+    if (!hasExtra) {
+        out.valid = true;
+        return true;
+    }
 
     offset += 1; // байт traffic_count уже прочитан
     for (let i = 0; i < trafCount; i++) {

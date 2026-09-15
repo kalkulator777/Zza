@@ -373,6 +373,17 @@ const MARK_MIN_SPEED = 3.0; // м/с, ниже неё след не пишетс
 
 const TRAFFIC_STYLES = ['van', 'muscle'];
 
+const TRAFFIC_SHADOW_W = 3.4;     // м, пятно тени болванки (как у гонщика)
+const TRAFFIC_SHADOW_L = 5.8;
+const TRAFFIC_BEACON_Y = 1.85;    // м над землёй: проблесковый маяк на крыше
+const TRAFFIC_BEACON_SIZE = 0.62;
+const WRECK_COLOR = 0x7e6a58;     // перевёрнутая машина: пыльно-бурая
+const WRECK_LIFT = 1.35;          // м: перевёрнутый кузов стоит на крыше
+
+// Счётчик инстансов на каждый силуэт. Модульный массив, а не литерал
+// в кадре: кадровый цикл не аллоцирует (раздел 1).
+const _trafficCounts = [0, 0, 0, 0];
+
 // [индекс силуэта, цвет]
 const TRAFFIC_LOOKS_TABLE = [
     [0, 0xd7dae0],   // белый фургон
@@ -1037,7 +1048,9 @@ export class RaceRenderer {
             fog: true
         });
         mat.name = 'carShadow';
-        const mesh = new THREE.InstancedMesh(geom, mat, MAX_CARS);
+        // Места хватает и на болванок: тень у них такая же, и рисуется тем
+        // же мешем — лишних вызовов отрисовки ноль.
+        const mesh = new THREE.InstancedMesh(geom, mat, MAX_CARS + MAX_TRAFFIC);
         mesh.name = 'carShadows';
         mesh.frustumCulled = false;
         mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -1998,6 +2011,16 @@ export class RaceRenderer {
             disposeObject(this.boxMesh);
             this.boxMesh = null;
         }
+        if (this.trafficMeshes) {
+            for (let i = 0; i < this.trafficMeshes.length; i++) {
+                this.scene.remove(this.trafficMeshes[i]);
+                disposeObject(this.trafficMeshes[i]);
+            }
+            this.trafficMeshes = null;
+            this.trafficGeoms = null;
+            this.trafficMats = null;
+        }
+        this.trafficCount = 0;
         this.boxCount = 0;
         this.boxX = null;
         this.boxY = null;
@@ -2152,6 +2175,30 @@ function buildSteeringWheelGeometry(detail) {
  * в mergeGeometries как матрицы частей, поэтому колесо оказывается там же,
  * где оно у гонщика, — под аркой, а не в начале координат.
  */
+/** Инстансный цвет из hex прямо в буфер: без THREE.Color и без аллокаций. */
+function writeInstanceColor(a, o, hex) {
+    a[o] = ((hex >> 16) & 255) / 255;
+    a[o + 1] = ((hex >> 8) & 255) / 255;
+    a[o + 2] = (hex & 255) / 255;
+}
+
+/**
+ * Матрица «машина на крыше»: поворот на yaw вокруг Y плюс переворот на 180
+ * градусов вокруг продольной оси. Пишется числами прямо в буфер инстансов,
+ * как writeScaleYaw из effects.js, — в кадре ноль объектов.
+ *
+ * Поворот вокруг Y на yaw: колонки (cos, 0, -sin) и (sin, 0, cos).
+ * Переворот вокруг оси «вперёд» меняет знак у Y и у поперечной оси.
+ */
+function writeUpsideDown(a, o, x, y, z, yaw) {
+    const s = Math.sin(yaw);
+    const c = Math.cos(yaw);
+    a[o] = -c;     a[o + 1] = 0;  a[o + 2] = s;   a[o + 3] = 0;
+    a[o + 4] = 0;  a[o + 5] = -1; a[o + 6] = 0;   a[o + 7] = 0;
+    a[o + 8] = s;  a[o + 9] = 0;  a[o + 10] = c;  a[o + 11] = 0;
+    a[o + 12] = x; a[o + 13] = y + WRECK_LIFT; a[o + 14] = z; a[o + 15] = 1;
+}
+
 function buildTrafficGeometry(shape, ao) {
     const built = buildCarMesh(shape, '#ffffff', 'low', { ao: ao !== false });
     const geoms = [];

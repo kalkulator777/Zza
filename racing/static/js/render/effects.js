@@ -17,6 +17,18 @@
  *   rocketMesh  1   летящие ракеты (снаряды kind = 2)
  *   mineMesh    1   лежащие мины (снаряды kind = 3)
  *   shieldMesh  1   купол щита вокруг машины
+ *   hazardMesh  1   ВСЁ предметное у происшествий на дороге: предупреждающие
+ *                   маяки, конусы перекрытия, обломки после взрыва
+ *   patchMesh   1   ВСЁ плоское у происшествий: пятно масла, копоть, круг
+ *                   предупреждения на полотне
+ *
+ * Два меша на все происшествия сразу, а не два на каждое: конус и лежащий
+ * круг — единственные две формы, которые им нужны, а разницу несёт
+ * инстансный цвет и масштаб. Перевёрнутая машина рисуется вообще бесплатно —
+ * лишним экземпляром в инстансном меше траффика (renderer.js).
+ *
+ * Пока происшествий нет, оба меша прячутся и в renderer.info.render.calls
+ * не попадают.
  *
  * Меш с нулём активных инстансов прячется (visible = false) и в
  * renderer.info.render.calls не попадает вовсе. Боксы с бонусами — меш
@@ -46,6 +58,16 @@
 import * as THREE from 'three';
 import { MeshBuilder, solidify, mergeGeometries, toColor, disposeObject, fadeAdditiveFog } from './geomutil.js';
 import {
+    MAX_TRAFFIC,
+    MAX_ROAD_EVENTS,
+    ROAD_EXPLOSION,
+    ROAD_OIL,
+    ROAD_WRECK,
+    ROAD_BLOCKADE,
+    ROAD_PHASE_WARN,
+    ROAD_PHASE_ACTIVE,
+    ROAD_PHASE_CLEARING,
+    ROAD_PHASE_DEBRIS,
     FLAG_OFFTRACK,
     FLAG_DRIFTING,
     FLAG_BOOST,
@@ -106,7 +128,32 @@ export const PARTICLE_LEVELS = { off: 'off', few: 'low', normal: 'medium', many:
 // смешиванием. Все они лежат в ОДНОМ InstancedMesh: один draw call на всё
 // свечение сцены, а при выключенной галочке меш просто прячется.
 
-const LAMP_CAP = MAX_CARS * 8 + MAX_PROJECTILES * 2 + 16;
+// Плюс по одному проблесковому маяку на болванку и по паре мигалок
+// на происшествие: всё это тот же единственный меш свечения.
+const LAMP_CAP = MAX_CARS * 8 + MAX_PROJECTILES * 2 + MAX_TRAFFIC
+    + MAX_ROAD_EVENTS * 4 + 16;
+
+// ---------------------------------------------------------------------------
+// Происшествия на дороге
+// ---------------------------------------------------------------------------
+//
+// Форм ровно две: стоячий конус и лежащий круг. Из них собирается всё —
+// предупреждающие маяки, конусы перекрытия, обломки взрыва, пятно масла,
+// копоть и предупреждающая разметка. Поэтому мешей тоже два, а не по два
+// на каждый вид происшествия.
+
+const HAZARD_CAP = MAX_ROAD_EVENTS * 18;   // конусов и обломков на всё сразу
+const PATCH_CAP = MAX_ROAD_EVENTS * 3;     // лежащих кругов
+
+const WARN_BLINK = 3.6;        // Гц мигания предупреждающих маяков
+const HAZARD_LIFT = 0.04;      // м над полотном, чтобы не мерцало z-буфером
+
+// Цвета: жёлто-чёрное предупреждение, серые обломки, тёмное масло.
+const WARN_R = 1.0, WARN_G = 0.72, WARN_B = 0.08;
+const CONE_R = 0.95, CONE_G = 0.35, CONE_B = 0.05;
+const DEBRIS_R = 0.34, DEBRIS_G = 0.33, DEBRIS_B = 0.31;
+const OIL_R = 0.10, OIL_G = 0.10, OIL_B = 0.13;
+const SOOT_R = 0.16, SOOT_G = 0.15, SOOT_B = 0.14;
 const FLASH_CAP = 16;
 
 const LAMP_HEAD_R = 1.0, LAMP_HEAD_G = 0.93, LAMP_HEAD_B = 0.74;
@@ -434,6 +481,40 @@ function buildMineGeometry() {
  *   x, y, z, yaw, speed, vfwd, vlat, steer, flags, driftCharge, slot,
  *   halfWidth, halfLength, wheelRadius, rearZ, rearY.
  */
+/**
+ * Конус-универсал для происшествий: дорожный конус с белой полосой.
+ * Он же служит обломком (мельче, серее) и стойкой предупреждающего маяка.
+ * Одна геометрия на все три роли — это один InstancedMesh и один вызов.
+ */
+function buildHazardGeometry() {
+    const body = toColor('#ffffff');
+    const geoms = [];
+    const mats = [];
+    // Конус единичной высоты с основанием радиуса 0.5: инстансный масштаб
+    // растягивает его во что угодно, а инстансный цвет красит.
+    geoms.push(solidify(new THREE.ConeGeometry(0.5, 1.0, 6), body,
+        function (x, y, z, i, c) {
+            // светлая полоса по середине: конус читается как дорожный
+            const t = y > -0.06 && y < 0.14 ? 1.0 : 0.55;
+            c.setRGB(t, t, t);
+        }));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 0.5, 0));
+    // плоская подошва, чтобы снизу не просвечивало
+    geoms.push(solidify(new THREE.CylinderGeometry(0.5, 0.5, 0.06, 6), body));
+    mats.push(new THREE.Matrix4().makeTranslation(0, 0.03, 0));
+    const merged = mergeGeometries(geoms, mats);
+    for (let i = 0; i < geoms.length; i++) geoms[i].dispose();
+    return merged;
+}
+
+/** Лежащий круг единичного радиуса: пятно масла, копоть, разметка. */
+function buildPatchGeometry() {
+    const geom = new THREE.CircleGeometry(1.0, 20);
+    geom.rotateX(-Math.PI * 0.5);
+    return solidify(geom, toColor('#ffffff'));
+}
+
+
 export class Effects {
     /**
      * @param {object} opts { quality, particles, glow, fogColor, heightAt, night }
@@ -614,6 +695,61 @@ export class Effects {
             forceSinglePass: true
         });
         this.shieldMat.name = 'fxShield';
+        // --- происшествия на дороге -----------------------------------------
+        this.hazardGeom = buildHazardGeometry();
+        this.hazardMat = new THREE.MeshLambertMaterial({
+            vertexColors: true,
+            flatShading: true
+        });
+        this.hazardMat.name = 'fxHazard';
+        this.hazardMesh = makeInstanced(this.hazardGeom, this.hazardMat,
+            HAZARD_CAP, 'fxHazardMesh');
+        this.group.add(this.hazardMesh);
+
+        this.patchGeom = buildPatchGeometry();
+        this.patchMat = new THREE.MeshBasicMaterial({
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.82,
+            depthWrite: false,
+            fog: true,
+            side: THREE.FrontSide,
+            forceSinglePass: true,
+            // лежит в четырёх сантиметрах над полотном: без смещения
+            // полигонов на дистанции замерцает (та же беда, что у мин)
+            polygonOffset: true,
+            polygonOffsetFactor: -3,
+            polygonOffsetUnits: -6
+        });
+        this.patchMat.name = 'fxPatch';
+        this.patchMesh = makeInstanced(this.patchGeom, this.patchMat,
+            PATCH_CAP, 'fxPatchMesh');
+        this.patchMesh.renderOrder = 2;
+        this.group.add(this.patchMesh);
+
+        // Список происшествий этого кадра: заполняет setRoadEvents.
+        this.roadCount = 0;
+        this.roadKind = new Uint8Array(MAX_ROAD_EVENTS);
+        this.roadPhase = new Uint8Array(MAX_ROAD_EVENTS);
+        this.roadX = new Float32Array(MAX_ROAD_EVENTS);
+        this.roadY = new Float32Array(MAX_ROAD_EVENTS);
+        this.roadZ = new Float32Array(MAX_ROAD_EVENTS);
+        this.roadYaw = new Float32Array(MAX_ROAD_EVENTS);
+        this.roadHalfLen = new Float32Array(MAX_ROAD_EVENTS);
+        this.roadHalfWidth = new Float32Array(MAX_ROAD_EVENTS);
+        // Фаза, в которой происшествие видели в прошлый раз: по переходу
+        // 0 -> 1 у взрыва запускается разовая вспышка.
+        this.roadSeenPhase = new Int8Array(MAX_ROAD_EVENTS).fill(-1);
+        this.roadSeenAt = new Float32Array(MAX_ROAD_EVENTS);
+
+        // Перевёрнутые машины: их рисует renderer.js своим мешем траффика,
+        // здесь только список точек.
+        this.wreckCount = 0;
+        this.wreckX = new Float32Array(MAX_ROAD_EVENTS);
+        this.wreckY = new Float32Array(MAX_ROAD_EVENTS);
+        this.wreckZ = new Float32Array(MAX_ROAD_EVENTS);
+        this.wreckYaw = new Float32Array(MAX_ROAD_EVENTS);
+
         this.shieldMesh = new THREE.InstancedMesh(this.shieldGeom, this.shieldMat, MAX_CARS);
         this.shieldMesh.name = 'fxShields';
         this.shieldMesh.frustumCulled = false;
@@ -1255,6 +1391,195 @@ export class Effects {
         this.projSeenN = n;
     }
 
+    /**
+     * Происшествия на дороге из буфера снапшота: мировые точки уже посчитал
+     * net.js. Здесь только запоминаем список и ловим переход фаз, чтобы
+     * взрыв рванул ровно один раз.
+     */
+    setRoadEvents(snap) {
+        this.wreckCount = 0;
+        if (!snap || !snap.valid) { this.roadCount = 0; return; }
+        let n = snap.evtViewCount || 0;
+        if (n > MAX_ROAD_EVENTS) n = MAX_ROAD_EVENTS;
+        this.roadCount = n;
+        for (let i = 0; i < n; i++) {
+            const id = snap.evtViewId[i] % MAX_ROAD_EVENTS;
+            const kind = snap.evtViewKind[i];
+            const phase = snap.evtViewPhase[i];
+            const x = snap.evtViewX[i];
+            const y = snap.evtViewY[i];
+            const z = snap.evtViewZ[i];
+            this.roadKind[i] = kind;
+            this.roadPhase[i] = phase;
+            this.roadX[i] = x;
+            this.roadY[i] = y;
+            this.roadZ[i] = z;
+            this.roadYaw[i] = snap.evtViewYaw[i];
+            this.roadHalfLen[i] = snap.evtViewHalfLen[i];
+            this.roadHalfWidth[i] = snap.evtViewHalfWidth[i];
+
+            // Разовая вспышка: только на переходе «предупреждение -> взрыв».
+            if (this.roadSeenPhase[id] !== phase) {
+                if (kind === ROAD_EXPLOSION && phase === ROAD_PHASE_ACTIVE) {
+                    this.explosion(x, y, z, 1.6);
+                }
+                this.roadSeenPhase[id] = phase;
+                this.roadSeenAt[id] = this.time;
+            }
+
+            // Перевёрнутая машина отдаётся рендеру: он подставит её лишним
+            // экземпляром в инстансный меш траффика — ноль вызовов отрисовки.
+            if (kind === ROAD_WRECK && phase !== ROAD_PHASE_WARN) {
+                const w = this.wreckCount;
+                this.wreckX[w] = x;
+                this.wreckY[w] = y;
+                this.wreckZ[w] = z;
+                this.wreckYaw[w] = snap.evtViewYaw[i] + 0.42;
+                this.wreckCount = w + 1;
+            }
+        }
+    }
+
+    /**
+     * Отрисовка происшествий: конусы и обломки в hazardMesh, плоские пятна
+     * в patchMesh, мигалки — в общий меш свечения.
+     *
+     * Всё считается по мировой точке центра и по курсу трассы в ней, поэтому
+     * прямоугольник происшествия ложится вдоль полотна, а не поперёк.
+     */
+    drawRoadEvents() {
+        const n = this.roadCount;
+        const hazardArr = this.hazardMesh.instanceMatrix.array;
+        const hazardCol = this.hazardMesh.instanceColor.array;
+        const patchArr = this.patchMesh.instanceMatrix.array;
+        const patchCol = this.patchMesh.instanceColor.array;
+        let hz = 0;
+        let pt = 0;
+        // Мигание общее на все происшествия: одна синусоида на кадр.
+        const blink = Math.sin(this.time * WARN_BLINK * Math.PI * 2) > 0 ? 1 : 0;
+
+        for (let i = 0; i < n; i++) {
+            const kind = this.roadKind[i];
+            const phase = this.roadPhase[i];
+            const x = this.roadX[i];
+            const y = this.roadY[i] + HAZARD_LIFT;
+            const z = this.roadZ[i];
+            const yaw = this.roadYaw[i];
+            const hl = this.roadHalfLen[i];
+            const hw = this.roadHalfWidth[i];
+            const fx = Math.sin(yaw), fz = Math.cos(yaw);
+            const lx = Math.cos(yaw), lz = -Math.sin(yaw);
+
+            if (phase === ROAD_PHASE_WARN) {
+                // --- предупреждение: четыре мигающих маяка по углам --------
+                // Это и есть «видно заранее»: физики ещё нет, а место уже
+                // размечено, и разметка мигает.
+                for (let k = 0; k < 4; k++) {
+                    const sl = (k & 1) ? 1 : -1;
+                    const sf = (k & 2) ? 1 : -1;
+                    const ox = fx * hl * sf + lx * hw * sl;
+                    const oz = fz * hl * sf + lz * hw * sl;
+                    if (hz < HAZARD_CAP) {
+                        writeScaleYaw(hazardArr, hz * 16, x + ox, y, z + oz, yaw,
+                            0.7, 1.0, 0.7);
+                        writeCol(hazardCol, hz * 3, WARN_R, WARN_G, WARN_B);
+                        hz++;
+                    }
+                    if (blink) {
+                        this.lamp(x + ox, y + 1.05, z + oz, 0.85,
+                            WARN_R, WARN_G, WARN_B);
+                    }
+                }
+                if (pt < PATCH_CAP) {
+                    // круг разметки на полотне: мигает вместе с маяками
+                    const k = blink ? 0.9 : 0.35;
+                    writeScaleYaw(patchArr, pt * 16, x, this.roadY[i] + 0.035, z, yaw,
+                        hw, 1, hl);
+                    writeCol(patchCol, pt * 3, WARN_R * k, WARN_G * k, WARN_B * k);
+                    pt++;
+                }
+                continue;
+            }
+            if (phase === ROAD_PHASE_CLEARING) continue;
+
+            if (kind === ROAD_OIL) {
+                if (pt < PATCH_CAP) {
+                    writeScaleYaw(patchArr, pt * 16, x, this.roadY[i] + 0.03, z, yaw,
+                        hw, 1, hl);
+                    writeCol(patchCol, pt * 3, OIL_R, OIL_G, OIL_B);
+                    pt++;
+                }
+            } else if (kind === ROAD_BLOCKADE) {
+                // --- ряд конусов поперёк перекрытой части полотна ----------
+                const count = 5;
+                for (let k = 0; k < count; k++) {
+                    const t = count > 1 ? (k / (count - 1)) * 2 - 1 : 0;
+                    const ox = lx * hw * t;
+                    const oz = lz * hw * t;
+                    if (hz < HAZARD_CAP) {
+                        writeScaleYaw(hazardArr, hz * 16, x + ox, y, z + oz, yaw,
+                            0.62, 0.86, 0.62);
+                        writeCol(hazardCol, hz * 3, CONE_R, CONE_G, CONE_B);
+                        hz++;
+                    }
+                }
+                if (blink) this.lamp(x, y + 1.2, z, 1.0, WARN_R, WARN_G, WARN_B);
+            } else if (kind === ROAD_EXPLOSION && phase === ROAD_PHASE_DEBRIS) {
+                // --- поле обломков: копоть плюс разбросанные куски ---------
+                if (pt < PATCH_CAP) {
+                    writeScaleYaw(patchArr, pt * 16, x, this.roadY[i] + 0.028, z, yaw,
+                        hw, 1, hl);
+                    writeCol(patchCol, pt * 3, SOOT_R, SOOT_G, SOOT_B);
+                    pt++;
+                }
+                // Разброс детерминированный: положение куска считается от
+                // его номера, поэтому обломки не дрожат от кадра к кадру
+                // и ни одного Math.random в кадровом цикле нет.
+                const pieces = 9;
+                for (let k = 0; k < pieces; k++) {
+                    const a = k * 2.399963;            // золотой угол
+                    const r = 0.22 + 0.78 * (k / pieces);
+                    const ox = fx * hl * r * Math.cos(a) + lx * hw * r * Math.sin(a);
+                    const oz = fz * hl * r * Math.cos(a) + lz * hw * r * Math.sin(a);
+                    if (hz < HAZARD_CAP) {
+                        const s = 0.22 + 0.16 * ((k * 7) % 5) / 4;
+                        writeScaleYaw(hazardArr, hz * 16, x + ox, y, z + oz,
+                            yaw + a, s, s * 1.3, s);
+                        writeCol(hazardCol, hz * 3, DEBRIS_R, DEBRIS_G, DEBRIS_B);
+                        hz++;
+                    }
+                }
+            } else if (kind === ROAD_WRECK) {
+                // Кузов рисует renderer.js; здесь — два конуса позади него
+                // и мигалка: без них перевёрнутая машина ночью не читается.
+                for (let k = -1; k <= 1; k += 2) {
+                    const ox = -fx * (hl + 2.2) + lx * hw * k;
+                    const oz = -fz * (hl + 2.2) + lz * hw * k;
+                    if (hz < HAZARD_CAP) {
+                        writeScaleYaw(hazardArr, hz * 16, x + ox, y, z + oz, yaw,
+                            0.6, 0.8, 0.6);
+                        writeCol(hazardCol, hz * 3, CONE_R, CONE_G, CONE_B);
+                        hz++;
+                    }
+                }
+                if (blink) this.lamp(x, y + 1.4, z, 1.1, WARN_R, WARN_G, WARN_B);
+            }
+        }
+
+        this.hazardMesh.count = hz;
+        this.hazardMesh.visible = hz > 0;
+        if (hz > 0) {
+            this.hazardMesh.instanceMatrix.needsUpdate = true;
+            this.hazardMesh.instanceColor.needsUpdate = true;
+        }
+        this.patchMesh.count = pt;
+        this.patchMesh.visible = pt > 0;
+        if (pt > 0) {
+            this.patchMesh.instanceMatrix.needsUpdate = true;
+            this.patchMesh.instanceColor.needsUpdate = true;
+        }
+    }
+
     /** Маска активных боксов из снапшота (12.3). Ссылка на массив, не копия. */
     setBoxMask(snap) {
         if (!snap || !snap.valid) return;
@@ -1270,6 +1595,13 @@ export class Effects {
      */
     update(dt, camera, localSpeed) {
         this.time += dt;
+        // Происшествия рисуются до разворота ореолов к камере: их мигалки
+        // складываются в тот же накопитель, что и фары машин.
+        if (this.roadCount > 0) this.drawRoadEvents();
+        else {
+            if (this.hazardMesh.visible) { this.hazardMesh.count = 0; this.hazardMesh.visible = false; }
+            if (this.patchMesh.visible) { this.patchMesh.count = 0; this.patchMesh.visible = false; }
+        }
 
         const e = camera.matrixWorld.elements;
         const rx = e[0], ry = e[1], rz = e[2];
@@ -1694,6 +2026,13 @@ function writeBillboard(a, o, px, py, pz, size, rot, rx, ry, rz, ux, uy, uz, bx,
  * Матрица «поворот вокруг Y + масштаб + перенос» прямо в массив инстансов.
  * Столбцы: (cos*sx, 0, -sin*sx), (0, sy, 0), (sin*sz, 0, cos*sz).
  */
+/** Инстансный цвет прямо в буфер: без THREE.Color и без аллокаций. */
+function writeCol(a, o, r, g, b) {
+    a[o] = r;
+    a[o + 1] = g;
+    a[o + 2] = b;
+}
+
 export function writeScaleYaw(a, o, x, y, z, yaw, sx, sy, sz) {
     const c = Math.cos(yaw);
     const s = Math.sin(yaw);
