@@ -46,6 +46,12 @@ import {
     ROOM_TOD_LABELS,
     ROOM_WEATHERS,
     ROOM_WEATHER_LABELS,
+    trafficIconSvg,
+    roadEventIconSvg,
+    ROOM_TRAFFIC,
+    ROOM_TRAFFIC_LABELS,
+    ROOM_EVENTS,
+    ROOM_EVENT_LABELS,
     ROOM_MODES,
     ROOM_MODE_LABELS,
     CHAMP_PHASE_LABELS,
@@ -596,6 +602,22 @@ export class LobbyScreen {
         this.weatherButtons = weather.buttons;
         this.weatherHint = weather.hint;
 
+        // Поток машин и происшествия на дороге. Это настройки комнаты, и
+        // меняет их владелец в лобби — так же, как время суток и погоду.
+        // Умолчания от карты у них нет (поток и ДТП — режим игры, а не
+        // свойство места), поэтому строка подсказки всегда пустая.
+        const traffic = this._buildEnvRow(body, 'Поток машин', ROOM_TRAFFIC,
+            ROOM_TRAFFIC_LABELS, trafficIconSvg,
+            (id) => this._pushSettings({ traffic: id }));
+        this.trafficButtons = traffic.buttons;
+        this.trafficHint = traffic.hint;
+
+        const events = this._buildEnvRow(body, 'Происшествия', ROOM_EVENTS,
+            ROOM_EVENT_LABELS, roadEventIconSvg,
+            (id) => this._pushSettings({ events: id }));
+        this.eventButtons = events.buttons;
+        this.eventHint = events.hint;
+
         // Круги и игроки
         const lapsRow = el('div', 'set-row');
         lapsRow.appendChild(el('div', 'k', 'Кругов'));
@@ -1068,6 +1090,12 @@ export class LobbyScreen {
             this._trackTimeOfDay(settings.track), ROOM_TOD_LABELS);
         this._syncEnvRow(this.weatherButtons, this.weatherHint, settings.weather,
             this._trackWeather(settings.track), ROOM_WEATHER_LABELS);
+        // Предложение карты совпадает с выбранным намеренно: подсказки
+        // «карта предлагает» у этих двух полей быть не должно.
+        this._syncEnvRow(this.trafficButtons, this.trafficHint,
+            settings.traffic, settings.traffic, ROOM_TRAFFIC_LABELS);
+        this._syncEnvRow(this.eventButtons, this.eventHint,
+            settings.events, settings.events, ROOM_EVENT_LABELS);
     }
 
     _syncEnvRow(buttons, hint, chosen, proposed, labels) {
@@ -1126,6 +1154,8 @@ export class LobbyScreen {
         // Оба ряда окружения: владелец меняет, остальные видят только чтение.
         this._setEnvRowEditable(this.todButtons, editable);
         this._setEnvRowEditable(this.weatherButtons, editable);
+        this._setEnvRowEditable(this.trafficButtons, editable);
+        this._setEnvRowEditable(this.eventButtons, editable);
         for (let i = 0; i < this.itemButtons.length; i++) {
             this.itemButtons[i].node.disabled = !editable || !this.itemsEnabledInput.checked;
         }

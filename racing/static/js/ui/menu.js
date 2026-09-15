@@ -334,6 +334,84 @@ const STATE_LABELS = {
     RESULTS: ['Итоги', 'pill-results'],
 };
 
+// --- траффик и происшествия на дороге ---------------------------------------
+//
+// Зеркало game/traffic.py:TRAFFIC_LEVELS и game/events.py:EVENT_LEVELS.
+// Сервер всё равно проверяет оба поля сам (коды ошибок bad_traffic
+// и bad_events), здесь это только форма и подписи.
+//
+// Порядок значений тот же, что в модулях: первое — умолчание, то есть
+// «выключено». Комната без этих полей обязана вести себя как прежде.
+//
+// У обоих полей, в отличие от времени суток и погоды, НЕТ умолчания
+// от карты: поток и происшествия — это режим игры, а не свойство места.
+// Поэтому строка «Карта предлагает...» у них всегда пустая.
+
+export const ROOM_TRAFFIC = ['off', 'sparse', 'dense'];
+
+export const ROOM_TRAFFIC_LABELS = {
+    off: 'Нет', sparse: 'Редкий', dense: 'Плотный',
+};
+
+const ROOM_TRAFFIC_DESC = {
+    off: 'Трасса пустая, только гонщики',
+    sparse: 'Редкие машины, обгон изредка',
+    dense: 'Поток машин, обгон постоянно',
+};
+
+// Тот же приём, что у TOD_ART: контур из штрихов, обводится дважды.
+// Смысл рисунка — сколько машин на полотне: пусто, одна, три.
+const TRAFFIC_ART = {
+    off: '<path d="M14 46h40M22 12v24M46 12v24"/>'
+        + '<path d="M26 20l16 16M42 20l-16 16"/>',
+    sparse: '<path d="M14 46h40M22 12v24M46 12v24"/>'
+        + '<rect x="28" y="22" width="12" height="16" rx="3"/>',
+    dense: '<path d="M14 46h40M22 10v28M46 10v28"/>'
+        + '<rect x="26" y="12" width="10" height="13" rx="3"/>'
+        + '<rect x="26" y="30" width="10" height="13" rx="3"/>'
+        + '<rect x="38" y="21" width="10" height="13" rx="3"/>',
+};
+
+const TRAFFIC_COLORS = { off: '#7e8794', sparse: '#57c07a', dense: '#ffb224' };
+
+/** Иконка плотности траффика в том же кадре 68x56, что и силуэт трассы. */
+export function trafficIconSvg(level, size) {
+    const art = TRAFFIC_ART[level] || TRAFFIC_ART.off;
+    const color = TRAFFIC_COLORS[level] || TRAFFIC_COLORS.off;
+    return envIconSvg(art, color, size);
+}
+
+export const ROOM_EVENTS = ['off', 'rare', 'often'];
+
+export const ROOM_EVENT_LABELS = {
+    off: 'Нет', rare: 'Редко', often: 'Часто',
+};
+
+// Пояснение говорит, что происшествия ВИДНО заранее: это не лотерея,
+// а проверка реакции, и игрок должен понимать это до старта.
+const ROOM_EVENT_DESC = {
+    off: 'Дорога без сюрпризов',
+    rare: 'Изредка, маяки предупреждают',
+    often: 'Регулярно, маяки предупреждают',
+};
+
+// Предупреждающий треугольник: пусто, один, три.
+const EVENT_ART = {
+    off: '<path d="M34 14L52 44H16z"/><path d="M26 24l16 14M42 24l-16 14"/>',
+    rare: '<path d="M34 12L54 46H14z"/><path d="M34 24v10M34 39v.01"/>',
+    often: '<path d="M24 12L42 42H6z"/><path d="M24 22v8M24 35v.01"/>'
+        + '<path d="M46 24L60 47H32z"/><path d="M46 32v6M46 42v.01"/>',
+};
+
+const EVENT_COLORS = { off: '#7e8794', rare: '#ffb224', often: '#ff6b57' };
+
+/** Иконка частоты происшествий на дороге. */
+export function roadEventIconSvg(level, size) {
+    const art = EVENT_ART[level] || EVENT_ART.off;
+    const color = EVENT_COLORS[level] || EVENT_COLORS.off;
+    return envIconSvg(art, color, size);
+}
+
 // Настройки комнаты по умолчанию — ровно схема из раздела 9.
 // time_of_day и weather здесь только заглушки: настоящее умолчание приходит
 // из описания выбранной карты (welcome.content.tracks[] несёт оба поля —
@@ -349,6 +427,10 @@ function defaultRoomSettings() {
         items: ['boost', 'rocket', 'mine', 'shield', 'storm'],
         collisions: true,
         mirror: false,
+        // Поток машин и происшествия на дороге: по умолчанию выключены,
+        // то есть новая комната ведёт себя ровно как до их появления.
+        traffic: ROOM_TRAFFIC[0],
+        events: ROOM_EVENTS[0],
         mode: ROOM_MODES[0],
         stages: STAGES_DEFAULT,
         // Обе доработки — за галочками и по умолчанию выключены.
@@ -781,6 +863,19 @@ export class MenuScreen {
         this.weatherButtons = weather.buttons;
         this.weatherHint = weather.hint;
 
+        // Поток машин и происшествия на дороге. Стоят следом за окружением
+        // и строятся тем же кодом: для игрока это такие же три кнопки,
+        // и учиться новому элементу управления не приходится.
+        const traffic = this._buildEnvField(grid, 'Поток машин', ROOM_TRAFFIC,
+            ROOM_TRAFFIC_LABELS, ROOM_TRAFFIC_DESC, trafficIconSvg,
+            (id) => this._selectTraffic(id));
+        this.trafficButtons = traffic.buttons;
+
+        const events = this._buildEnvField(grid, 'Происшествия на дороге',
+            ROOM_EVENTS, ROOM_EVENT_LABELS, ROOM_EVENT_DESC, roadEventIconSvg,
+            (id) => this._selectRoadEvents(id));
+        this.eventButtons = events.buttons;
+
         // Круги
         const lapsField = el('div', 'field');
         lapsField.appendChild(el('div', 'label', 'Кругов'));
@@ -1067,6 +1162,32 @@ export class MenuScreen {
         this._syncEnvironment();
     }
 
+    _selectTraffic(level) {
+        this.draft.traffic = level;
+        this._syncRoadRows();
+    }
+
+    _selectRoadEvents(level) {
+        this.draft.events = level;
+        this._syncRoadRows();
+    }
+
+    /** Подсветка выбранного в рядах потока и происшествий. */
+    _syncRoadRows() {
+        const rows = [
+            [this.trafficButtons, this.draft.traffic],
+            [this.eventButtons, this.draft.events],
+        ];
+        for (let r = 0; r < rows.length; r++) {
+            const buttons = rows[r][0];
+            if (!buttons) continue;
+            for (let i = 0; i < buttons.length; i++) {
+                buttons[i].node.classList.toggle('is-active',
+                    buttons[i].id === rows[r][1]);
+            }
+        }
+    }
+
     _selectMode(mode) {
         this.draft.mode = mode;
         this._syncMode();
@@ -1101,6 +1222,7 @@ export class MenuScreen {
     _syncEnvironment() {
         this._syncEnvRow(this.todButtons, this.todHint, this.draft.time_of_day,
             this._trackTimeOfDay(this.draft.track), ROOM_TOD_LABELS);
+        this._syncRoadRows();
         this._syncEnvRow(this.weatherButtons, this.weatherHint, this.draft.weather,
             this._trackWeather(this.draft.track), ROOM_WEATHER_LABELS);
     }
@@ -1189,6 +1311,8 @@ export class MenuScreen {
             items: this.draft.items.slice(),
             collisions: this.draft.collisions,
             mirror: this.draft.mirror,
+            traffic: this.draft.traffic,
+            events: this.draft.events,
             mode: this.draft.mode,
             stages: this.draft.stages,
             handicap: this.draft.handicap,
