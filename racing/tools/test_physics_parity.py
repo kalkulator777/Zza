@@ -33,6 +33,8 @@
    сцепления (угол за 0,75 с, потеря скорости, время возврата) и контакт
    тяжёлой машины с лёгкой.
 7. Проверяет защиту награды за занос от абуза (``report_drift_guard``).
+   Те же барьеры на физике Rapier проверяет ``tools/test_rapier_guard.py``,
+   который зовётся отсюда же в конце прогона.
    Заказчик на плейтесте нашёл дыру: «зажать ручник и просто нажимать A/D —
    едем не быстро, но очки бонуса дрифта набираются и дают скорость».
    Здесь это ловится навсегда: виляние рулём под зажатым ручником обязано
@@ -64,7 +66,10 @@ from math import atan2, cos, degrees, floor, hypot, sin
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import test_rapier_guard                                  # noqa: E402
 from game import physics                                  # noqa: E402
 from game.physics import (CarState, CarStats, WALL_BOUNCE,  # noqa: E402
                           CAR_RADIUS, CAR_AXIS_HALF)
@@ -1836,6 +1841,13 @@ def main():
 
     print()
     if not report_grip():
+        ok = False
+
+    # Те же барьеры на физике Rapier плюс откат, перенастройки §12.24 и
+    # сверка модуля в двух движках. Классику это не трогает: вся проверка
+    # лежит в tools/test_rapier_guard.py и зовётся отсюда, чтобы постоянные
+    # проверки жили в одном прогоне, а не в команде, которую надо помнить.
+    if test_rapier_guard.main([]) != 0:
         ok = False
 
     print()
