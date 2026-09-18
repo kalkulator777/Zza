@@ -372,6 +372,17 @@ export function boot() {
     // тумана. Нужен, чтобы проверка тумана умела покраснеть.
     setFog: (v) => { app.world.fogOn = !!v; return app.world.fogOn; },
     getFog: () => app.world.fogOn,
+
+    // --- свет факела (tests/client_light.py) --------------------------
+    // Свет живёт в маске тумана, а маска перерисовывается только по дельте
+    // (7.2) — поэтому выключатель обязан сбросить её ключ, иначе кадр
+    // останется старым до первого шага игрока.
+    setTorch: (v) => {
+      app.render.torch = !!v;
+      app.render.fogKey = '';
+      return app.render.torch;
+    },
+    getTorch: () => app.render.torch,
     fog: () => {
       const L = app.world.level, f = app.world.fog;
       if (!L || !f) return null;
@@ -394,18 +405,56 @@ export function boot() {
       h = Math.max(1, Math.min(c.height - y, Math.round(h || c.height)));
       const d = g.getImageData(x, y, w, h).data;
       const t = thresh === undefined ? 10 : thresh;
-      let dark = 0, maxCh = 0, maxR = 0, sum = 0;
+      let dark = 0, maxCh = 0, maxR = 0, sum = 0, lum = 0, bright = 0;
       for (let i = 0; i < d.length; i += 4) {
         const r = d[i], gg = d[i + 1], b = d[i + 2];
         const m = r > gg ? (r > b ? r : b) : (gg > b ? gg : b);
         if (m <= t) dark++;
+        if (m > t) bright++;
         if (m > maxCh) maxCh = m;
         if (r > maxR) maxR = r;
         sum += m;
+        // Rec.709: настоящая ЯРКОСТЬ. mean выше — среднее по МАКСИМАЛЬНОМУ
+        // каналу, и это детектор черноты, а не яркость: у холодного пола
+        // максимальный канал синий, и тёплый свет его почти не двигает.
+        lum += 0.2126 * r + 0.7152 * gg + 0.0722 * b;
       }
       const n = d.length / 4;
-      return { n: n, dark: dark, frac: dark / n, maxCh: maxCh, maxR: maxR,
-               mean: sum / n, box: [x, y, w, h], hash: frameHash(d) };
+      return { n: n, dark: dark, frac: dark / n, bright: bright,
+               maxCh: maxCh, maxR: maxR,
+               mean: sum / n, lum: lum / n, box: [x, y, w, h],
+               hash: frameHash(d) };
+    },
+
+    // Пачка коробок за ОДИН заход в браузер. Замер света читает пиксели
+    // сотен клеток; по одному вызову на клетку это сотни переходов границы
+    // процесса и десятки секунд на ровном месте.
+    boxesMean: (list, thresh) => {
+      const c = $('c');
+      const g = c.getContext('2d');
+      const t = thresh === undefined ? 10 : thresh;
+      const out = [];
+      for (let k = 0; k < list.length; k++) {
+        const q = list[k];
+        const x = Math.max(0, Math.min(c.width - 1, Math.round(q[0])));
+        const y = Math.max(0, Math.min(c.height - 1, Math.round(q[1])));
+        const w = Math.max(1, Math.min(c.width - x, Math.round(q[2])));
+        const h = Math.max(1, Math.min(c.height - y, Math.round(q[3])));
+        const d = g.getImageData(x, y, w, h).data;
+        let sum = 0, lum = 0, dark = 0, bright = 0, maxCh = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const r = d[i], gg = d[i + 1], b = d[i + 2];
+          const m = r > gg ? (r > b ? r : b) : (gg > b ? gg : b);
+          if (m <= t) dark++; else bright++;
+          if (m > maxCh) maxCh = m;
+          sum += m;
+          lum += 0.2126 * r + 0.7152 * gg + 0.0722 * b;
+        }
+        const n = d.length / 4;
+        out.push({ n: n, mean: sum / n, lum: lum / n, dark: dark,
+                   bright: bright, maxCh: maxCh });
+      }
+      return out;
     },
 
     // Подать сообщение тем же путём, каким его подаёт провод: net._onMessage

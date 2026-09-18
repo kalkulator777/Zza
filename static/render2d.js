@@ -16,7 +16,8 @@
 // Объём подделывается: тень эллипсом под объектом, у стен — вертикальный
 // выступ вверх (рисуется в статическом слое, то есть бесплатно).
 
-import { K_PLAYER, K_ENEMY, K_PROP, K_SHOT, F_DEAD, F_OFFLINE,
+import { K_PLAYER, K_ENEMY, K_ENEMY_RANGED, K_PROP, K_SHOT,
+         F_DEAD, F_OFFLINE,
          F_WINDUP, F_DASH, FX_HIT, FX_DIE, FX_SHOT, FX_BOOM,
          TILE_WALL, TILE_STAIRS, VIS_DARK, VIS_LIT }
   from './state.js';
@@ -71,6 +72,54 @@ const FOG_RISE = Math.max(1, Math.round(WALL_RISE * FOG_PX));
 // стену в памяти надо видеть, иначе это уже не память, а темнота.
 const FOG_SEEN_RGBA = [8, 13, 30, 158];    // 158/255 = 0.62
 
+// --- СВЕТ ФАКЕЛА (DESIGN.md 4.1) -----------------------------------------
+//
+// ПОЧЕМУ СВЕТ ЖИВЁТ В МАСКЕ ТУМАНА, А НЕ В ВИНЬЕТКЕ. Виньетка блитится
+// ПОСЛЕ маски и про туман не знает ничего: тёплое пятно в ней осветлило бы
+// заодно и неразведанную черноту, а она обязана оставаться ровным нулём
+// (5.2; tests/client_fog.py меряет это порогом 10 по максимальному каналу и
+// требует в коробке 17x17 ровно 100% чёрных пикселей). Маска, наоборот,
+// знает про каждую клетку, светится она сейчас или только помнится, —
+// поэтому свет ставится ровно туда: VIS_LIT получает тёплую подсветку,
+// VIS_SEEN и VIS_DARK не получают ничего. Цена в кадре — НОЛЬ: это тот же
+// один блит маски (7.2), в нём просто другие пиксели.
+//
+// Форма: плато радиусом TORCH_R_IN у ног и спад до TORCH_A_OUT к
+// TORCH_R_OUT. Числа привязаны к обзору (4.1: радиус 10 клеток):
+//   * плато 3 клетки — комната под ногами освещена ровно, без пятна-нашлёпки;
+//   * спад кончается на 11 клетках, то есть на клетку дальше обзора: у
+//     кромки света альфа ещё не ноль, и «видно сейчас» не сливается с
+//     «помню» (иначе туман перестаёт читаться ровно там, где он и нужен);
+//   * TORCH_A_OUT остаётся и ЗА пределом: туман общий на группу (4.4), и
+//     клетки, которые светит напарник на том конце этажа, обязаны быть
+//     светлее памяти, а не темнее.
+//
+// ПОТОЛОК ЯРКОСТИ ЗАДАН НЕ ВКУСОМ. tests/client_combat.py считает «ярким»
+// пиксель с максимальным каналом выше 90 и ловит замах по ПРИБАВКЕ таких
+// пикселей в коробке вокруг бойца. Освещённый пол обязан остаться НИЖЕ 90,
+// иначе прибавке неоткуда взяться и проверка замаха краснеет на исправном
+// клиенте. Самый светлый пол — #262d40, максимальный канал 64; при
+// TORCH_A_IN = 0.18 и TORCH_RGB он становится
+//   r = 38*0.82 + 255*0.18 = 77.1,  b = 64*0.82 + 150*0.18 = 79.5,
+// то есть 79.5 при потолке 90 — запас 1.13 раза. Это и есть предел, до
+// которого свет в этом клиенте можно поднимать вообще; дальше — только
+// вместе с правкой палитры пола, и это вынесено в отчёт.
+const TORCH_RGB = [255, 206, 150];   // тёплый белый, не оранжевый фильтр
+const TORCH_A_IN = 0.18;
+const TORCH_A_OUT = 0.045;
+const TORCH_R_IN = 3.0;
+const TORCH_R_OUT = 11.0;
+// Шаг квантования центра света, в клетках. Маска перерисовывается только по
+// дельте (7.2), а свет обязан ехать за игроком — значит перерисовка теперь
+// случается ещё и когда игрок уехал на полклетки. ВЫВОД ЧИСЛА: при беге
+// 5 кл/с (4.2) это 10 перерисовок в секунду на игрока сверх пяти на дельте
+// vis; при замеренных 0.2-0.5 мс на перерисовку — доли процента секунды.
+// Полклетки не видно: на спаде света альфа меняется на
+// (0.18-0.045)/8 = 0.017 на клетку, то есть 0.008 на шаг — меньше одного
+// уровня из 255. И главное: у СТОЯЩЕГО клиента кадр от этого остаётся
+// детерминированным до пикселя, а на этом стоят две чужие проверки.
+const TORCH_Q = 2;
+
 const COL = {
   bg: '#05070c',
   floor: '#23293a',
@@ -117,12 +166,44 @@ const COL = {
 // а не когда всё уже решено.
 const HURT_AT = 0.5;
 
+// --- таблица видов (4.2, 4.3) --------------------------------------------
+//
+// Поведение вида задаётся ПОЛЯМИ ТАБЛИЦЫ, а не сравнениями `kind === ...`
+// по телу рисовалки. Причина прямая: видов стало больше, чем два, и каждое
+// такое сравнение пришлось бы искать и править при появлении следующего.
+//   arrow — тело рисуется наконечником стрелы по facing, а не кружком;
+//   aim   — рисуется отдельная чёрточка направления взгляда (наконечнику
+//           она не нужна: он сам и есть направление);
+//   bar   — над головой рисуется полоска здоровья.
+//
+// РУБАКА И СТРЕЛОК ОБЯЗАНЫ РАЗЛИЧАТЬСЯ С ОДНОГО ВЗГЛЯДА (4.2): один прёт в
+// упор, другой держит 5-9 клеток и стреляет, а до этой работы оба были
+// одинаковым красным кружком. Различие сделано ФОРМОЙ, а не только цветом:
+// круг против наконечника читается и в темноте, и у того, кто не различает
+// красный с зелёным. Красный канал у обоих одинаковый (209) намеренно —
+// «красное = враг» остаётся правдой, и проверки, которые ищут врага по
+// самому красному пикселю кадра, не замечают разницы.
 const KIND = {};
-KIND[K_PLAYER] = { r: 0.35, css: '#7fd18a', ring: '#dff3e2' };
-KIND[K_ENEMY] = { r: 0.35, css: '#d16a6a', ring: '#f5cccc' };
+KIND[K_PLAYER] = { r: 0.35, css: '#7fd18a', ring: '#dff3e2', aim: 1, bar: 1 };
+KIND[K_ENEMY] = { r: 0.35, css: '#d16a6a', ring: '#f5cccc', aim: 1, bar: 1 };
+KIND[K_ENEMY_RANGED] = { r: 0.35, css: '#d1568c', ring: '#f6c3d6',
+                         arrow: 1, bar: 1 };
 KIND[K_PROP] = { r: 0.30, css: '#8b7f5a', ring: '#cfc49c' };
 KIND[K_SHOT] = { r: 0.12, css: '#ffe27a', ring: '#fff6cf' };
+// Незнакомый kind не имеет права ронять клиент: сервер может начать слать
+// новое значение раньше, чем клиент про него узнает (и наоборот). Такая
+// сущность рисуется серым кружком — видно, что что-то есть, и видно, что
+// клиент этого вида не знает.
 const KIND_DEF = { r: 0.30, css: '#8b93a1', ring: '#d8dde5' };
+
+// Наконечник стрелка: остриё вперёд на ARROW_TIP радиусов, два задних угла
+// под ARROW_BACK радиан от направления взгляда на ARROW_REAR радиусах.
+// Площадь такого треугольника = 1.21 r^2 против 3.14 r^2 у круга рубаки,
+// то есть силуэты различаются по заполнению в 2.6 раза — это и есть
+// «видно с одного взгляда», выраженное числом (tests/client_light.py).
+const ARROW_TIP = 1.25;
+const ARROW_REAR = 0.95;
+const ARROW_BACK = 140 * Math.PI / 180;
 
 // --- кэш текста (7.2): строка рисуется в свою канву один раз -------------
 const textCache = new Map();
@@ -184,6 +265,11 @@ export function createRenderer() {
     // маска тумана: FOG_PX пикселей на клетку, окно то же, что у карты
     fog: null, fogCtx: null, fogImg: null, fogKey: '', fogOn: false,
     fogRepaints: 0,
+    // Выключатель света — затем же, зачем setFog и setCombat: чтобы
+    // tests/client_light.py умела ПОКРАСНЕТЬ и чтобы «до и после» мерилось
+    // на ОДНОЙ сцене спина к спине, а не на двух разных прогонах.
+    torch: true,
+    _lights: [],
 
     camX: 0, camY: 0,
     _drawCalls: 0, _ents: 0, _ms: 0, _hidden: 0, _fx: 0,
@@ -386,16 +472,43 @@ export function createRenderer() {
         this.fogImg = null;
         this.fogKey = '';
       }
+      const lights = this._torchLights(view);
       const key = this.stKey + '|' + this.stTx + ',' + this.stTy +
-                  '|' + view.fogVersion;
+                  '|' + view.fogVersion + '|' + lights.join(',');
       if (key === this.fogKey) return true;
       this.fogKey = key;
-      this._paintFog(level, arr);
+      this._paintFog(level, arr, lights);
       this.fogRepaints++;
       return true;
     },
 
-    _paintFog(level, arr) {
+    /**
+     * Где сейчас стоят факелы. Источник — ЖИВЫЕ игроки, и это не вольность:
+     * 4.4 уже говорит, что мёртвый игрок туман не светит (обзор считается по
+     * живым). Дух не несёт и огня — иначе труп в коридоре освещал бы комнату,
+     * которую группа не видит.
+     *
+     * Координаты квантуются шагом 1/TORCH_Q клетки: маска перерисовывается
+     * только когда ключ изменился, а без квантования ключ менялся бы каждый
+     * кадр — то есть маска считалась бы каждый кадр, ровно то, что запрещает
+     * 7.2.
+     */
+    _torchLights(view) {
+      const out = this._lights;
+      out.length = 0;
+      if (!this.torch) return out;
+      const ents = view.ents;
+      if (!ents) return out;
+      for (let i = 0; i < ents.length; i++) {
+        const e = ents[i];
+        if (e.kind !== K_PLAYER || (e.flags & F_DEAD)) continue;
+        out.push(Math.round(e.dx * TORCH_Q) / TORCH_Q,
+                 Math.round(e.dy * TORCH_Q) / TORCH_Q);
+      }
+      return out;
+    },
+
+    _paintFog(level, arr, lights) {
       const cw = this.fog.width, ch = this.fog.height;
       let img = this.fogImg;
       if (!img || img.width !== cw || img.height !== ch) {
@@ -407,6 +520,15 @@ export function createRenderer() {
       const W = level.w, H = level.h, tiles = level.tiles;
       const sr = FOG_SEEN_RGBA[0], sg = FOG_SEEN_RGBA[1];
       const sb = FOG_SEEN_RGBA[2], sa = FOG_SEEN_RGBA[3];
+      const nL = lights ? lights.length : 0;
+      const tr = TORCH_RGB[0], tg = TORCH_RGB[1], tb = TORCH_RGB[2];
+      // Альфа плато и спад на клетку — считаются один раз на перерисовку.
+      const aIn = TORCH_A_IN * 255, aOut = TORCH_A_OUT * 255;
+      const slope = (aIn - aOut) / (TORCH_R_OUT - TORCH_R_IN);
+      // За этим расстоянием свет ровный (TORCH_A_OUT) — там не нужен ни
+      // корень, ни поиск ближайшего факела: клетка заливается одним числом.
+      const farQ = (TORCH_R_OUT + 1.5) * (TORCH_R_OUT + 1.5);
+      const aFar = nL ? (aOut | 0) : 0;
 
       for (let y = 0; y < th; y++) {
         const wy = ty0 + y;
@@ -420,7 +542,52 @@ export function createRenderer() {
             v = arr[i];
             wall = tiles[i] === TILE_WALL;
           }
-          if (v === VIS_LIT) continue;
+          if (v === VIS_LIT) {
+            // Освещено сейчас — сюда и ложится свет факела. Без факелов
+            // (this.torch === false, или в кадре нет живых игроков) клетка
+            // остаётся полностью прозрачной, ровно как было до этой работы.
+            if (!nL) continue;
+            const x0 = x * FOG_PX, y0l = y * FOG_PX;
+            // Сначала грубо: далеко ли клетка от всех факелов.
+            let cq = 1e9;
+            const ccx = wx + 0.5, ccy = wy + 0.5;
+            for (let li = 0; li < nL; li += 2) {
+              const ddx = ccx - lights[li], ddy = ccy - lights[li + 1];
+              const q = ddx * ddx + ddy * ddy;
+              if (q < cq) cq = q;
+            }
+            if (cq > farQ) {
+              if (aFar === 0) continue;
+              for (let py = y0l; py < y0l + FOG_PX; py++) {
+                let o = (py * cw + x0) * 4;
+                for (let px = 0; px < FOG_PX; px++) {
+                  d[o] = tr; d[o + 1] = tg; d[o + 2] = tb; d[o + 3] = aFar;
+                  o += 4;
+                }
+              }
+              continue;
+            }
+            for (let py = y0l; py < y0l + FOG_PX; py++) {
+              const pwy = ty0 + (py + 0.5) / FOG_PX;
+              let o = (py * cw + x0) * 4;
+              for (let px = 0; px < FOG_PX; px++) {
+                const pwx = tx0 + (x0 + px + 0.5) / FOG_PX;
+                let best = 1e9;
+                for (let li = 0; li < nL; li += 2) {
+                  const ddx = pwx - lights[li], ddy = pwy - lights[li + 1];
+                  const q = ddx * ddx + ddy * ddy;
+                  if (q < best) best = q;
+                }
+                const dist = Math.sqrt(best);
+                let a2 = dist <= TORCH_R_IN ? aIn
+                       : (dist >= TORCH_R_OUT ? aOut
+                          : aIn - (dist - TORCH_R_IN) * slope);
+                d[o] = tr; d[o + 1] = tg; d[o + 2] = tb; d[o + 3] = a2 | 0;
+                o += 4;
+              }
+            }
+            continue;
+          }
           let r, g, b, a;
           let y0 = y * FOG_PX;
           const y1 = y0 + FOG_PX;
@@ -593,10 +760,29 @@ export function createRenderer() {
       ctx.globalAlpha = alpha;
 
       ctx.fillStyle = dead ? '#9fc8ff' : (offline ? '#6b7280' : (isSelf ? '#ffe27a' : k.css));
-      ctx.beginPath();
-      ctx.arc(sx, sy, r, 0, Math.PI * 2);
-      ctx.fill();
-      this._drawCalls++;
+      if (k.arrow) {
+        // Стрелок: наконечник по facing. Ни градиента, ни composite (7.2) —
+        // три линии и заливка.
+        const f = e.dfacing;
+        ctx.beginPath();
+        ctx.moveTo(sx + Math.cos(f) * r * ARROW_TIP,
+                   sy + Math.sin(f) * r * ARROW_TIP);
+        ctx.lineTo(sx + Math.cos(f + ARROW_BACK) * r * ARROW_REAR,
+                   sy + Math.sin(f + ARROW_BACK) * r * ARROW_REAR);
+        ctx.lineTo(sx + Math.cos(f - ARROW_BACK) * r * ARROW_REAR,
+                   sy + Math.sin(f - ARROW_BACK) * r * ARROW_REAR);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = dead ? 'rgba(200,225,255,0.7)' : k.ring;
+        ctx.lineWidth = Math.max(1.5, r * 0.16);
+        ctx.stroke();
+        this._drawCalls += 2;
+      } else {
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fill();
+        this._drawCalls++;
+      }
 
       if (isSelf) {
         ctx.strokeStyle = '#fff6cf';
@@ -607,8 +793,9 @@ export function createRenderer() {
         this._drawCalls++;
       }
 
-      // Направление взгляда (facing в радианах, 4.3)
-      if (e.kind === K_PLAYER || e.kind === K_ENEMY) {
+      // Направление взгляда (facing в радианах, 4.3). У наконечника его
+      // рисовать нечем: он сам и есть направление.
+      if (k.aim) {
         ctx.strokeStyle = dead ? 'rgba(200,225,255,0.7)' : k.ring;
         ctx.lineWidth = Math.max(1.5, r * 0.20);
         ctx.beginPath();
@@ -623,8 +810,7 @@ export function createRenderer() {
       // Берётся ТОЛЬКО из снапшота: событие hit может потеряться (5.2), и
       // полоска, собранная из событий, показала бы ложь ровно в тот момент,
       // когда сеть просела.
-      if (!dead && e.hpMax > 0 && e.hp < e.hpMax &&
-          (e.kind === K_PLAYER || e.kind === K_ENEMY)) {
+      if (!dead && e.hpMax > 0 && e.hp < e.hpMax && k.bar) {
         const f = Math.max(0, Math.min(1, e.hp / e.hpMax));
         const bw = tpx * HPBAR_W, bh = Math.max(3, tpx * 0.09);
         const bx = sx - bw / 2, by = sy - r - bh * 2.2;

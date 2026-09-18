@@ -141,6 +141,12 @@ WALK_BUDGET = 160.0
 F_DEAD, F_OFFLINE, F_WINDUP, F_DASH = 1, 2, 4, 8
 FX_HIT, FX_DIE, FX_SHOT, FX_BOOM = 1, 2, 3, 4
 K_PLAYER, K_ENEMY, K_SHOT = 1, 2, 4
+# 4.2: виды врага различаются ЗНАЧЕНИЕМ kind, а не битом в flags. Стрелок
+# уехал на пятое значение, и искать врага по одному kind == 2 нельзя: цель
+# для удара нашлась бы только среди рубак, а строка «врагов в мире» врала бы
+# в меньшую сторону ровно на число стрелков.
+K_ENEMY_RANGED = 5
+ENEMY_KINDS = (K_ENEMY, K_ENEMY_RANGED)
 # 5.1: маска кнопок. Дальний бой — бит 8, предмет — 16.
 BTN_ATTACK, BTN_DASH, BTN_USE, BTN_SHOOT, BTN_ITEM = 1, 2, 4, 8, 16
 
@@ -410,7 +416,7 @@ def nearest_enemy(tab):
     m = me(tab)
     best = None
     for o in tab.js("window.__zza.others()"):
-        if o["kind"] != K_ENEMY or (o["flags"] & F_DEAD):
+        if o["kind"] not in ENEMY_KINDS or (o["flags"] & F_DEAD):
             continue
         d = math.hypot(o["x"] - m["x"], o["y"] - m["y"])
         if best is None or d < best[0]:
@@ -801,7 +807,10 @@ def main():
         # Сцена строится ОДИН РАЗ и не меняется между замерами: вокруг игрока
         # восемь врагов (двое на замахе, двое в рывке, четверо раненые),
         # шесть снарядов в воздухе и дюжина вспышек. Это заметно гуще, чем
-        # бывает в комнате, — замер нарочно недобрый.
+        # бывает в комнате, — замер нарочно недобрый. Половина врагов —
+        # СТРЕЛКИ (4.2): их тело рисуется наконечником с обводкой, то есть
+        # на один вызов дороже кружка рубаки, и сцена без них занижала бы
+        # стоимость кадра ровно на эту разницу.
         m5 = me(t)
         ents = [ent_row(m5["id"], K_PLAYER, m5["x"], m5["y"], hp=70,
                         hp_max=100, flags=F_WINDUP, facing=m5["facing"])]
@@ -811,7 +820,8 @@ def main():
             eid = 910000 + i
             rm.append(eid)
             fl = F_WINDUP if i < 2 else (F_DASH if i < 4 else 0)
-            ents.append(ent_row(eid, K_ENEMY, m5["x"] + math.cos(a) * 1.7,
+            ek = K_ENEMY if (i % 2) == 0 else K_ENEMY_RANGED
+            ents.append(ent_row(eid, ek, m5["x"] + math.cos(a) * 1.7,
                                 m5["y"] + math.sin(a) * 1.7,
                                 vx=math.cos(a) * 14, vy=math.sin(a) * 14,
                                 hp=40 + i * 5, hp_max=100, flags=fl,
@@ -936,13 +946,13 @@ def main():
         note("боевой мир", "комната %s, этаж %d, своя сущность id %d; врагов "
              "в мире %d" % (room2, level["floor"], mm["id"],
                             len([o for o in t.js("window.__zza.others()")
-                                 if o["kind"] == K_ENEMY])))
+                                 if o["kind"] in ENEMY_KINDS])))
         note("здоровье перед дракой", "hp %d/%d, flags %d"
              % (mm["hp"], mm["hpMax"], mm["flags"]))
         near = nearest_enemy(t)
         if near is None:
             check(False, "в боевом мире нашёлся враг, по которому можно ударить",
-                  "сущностей kind=2 в мире нет")
+                  "сущностей kind %s в мире нет" % (ENEMY_KINDS,))
         else:
             d0, foe0 = near
             note("ближайший враг", "id %d на (%.1f, %.1f), до него %.1f клетки"
@@ -971,7 +981,7 @@ def main():
                 foe = None
                 best = None
                 for o in t.js("window.__zza.others()"):
-                    if o["kind"] != K_ENEMY or (o["flags"] & F_DEAD):
+                    if o["kind"] not in ENEMY_KINDS or (o["flags"] & F_DEAD):
                         continue
                     dd = math.hypot(o["x"] - mnow["x"], o["y"] - mnow["y"])
                     if best is None or dd < best:
