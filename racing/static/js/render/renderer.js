@@ -816,7 +816,12 @@ export class RaceRenderer {
         if (!sc) return;
         const k = VIEW_DISTANCE_K[this.gfx.viewDistance] || 1;
         const far = sc.fog.far * k;
-        this.fog.near = far * 0.35;
+        // Доля ближней границы — обычно общая (0.35), но у погоды «туман»
+        // buildScenery отдаёт свою (sc.fog.nearK, см. 12.16/12.19): иначе
+        // сама дорога перед камерой оставалась чистой, а туман был виден
+        // только у горизонта.
+        const nearK = sc.fog.nearK !== undefined ? sc.fog.nearK : 0.35;
+        this.fog.near = far * nearK;
         this.fog.far = far;
         // запас в 12 м: на самой границе тумана объект ещё виден на пиксель
         this.cullDistance = far + 12;

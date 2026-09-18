@@ -270,6 +270,35 @@ function makeDusk(day, night) {
 }
 
 /**
+ * Осветлить ночную таблицу освещения (жалоба «сделать ночь чуть светлее»,
+ * плейтест 12.14). Трогает ТОЛЬКО ambient/directional intensity — то, что
+ * bakeVertexLight запекает в вершинный цвет всей статики, включая полотно
+ * (trackmesh.js): именно это было основным источником того, что ночь
+ * читалась как чёрная яма за пределами конуса фар, а не цвет неба/тумана.
+ * zenith/horizon/fog/cloud и цвета света не трогаются — ночь остаётся
+ * холодной ночью, светлеет только освещение объектов.
+ *
+ * ПРИМЕНЯЕТСЯ ТОЛЬКО К night-ЗАПИСИ В THEME_ENV, а не к самой константе
+ * *_NIGHT: makeDusk(day, night) интерполирует сумерки из тех же чисел, и
+ * если бы они изменились здесь, сумерки бы уехали вместе с ночью — это
+ * запрещённая регрессия (12.16: день и сумерки обязаны остаться как есть).
+ */
+function brightenNight(night, ambK, dirK) {
+    return {
+        zenith: night.zenith,
+        horizon: night.horizon,
+        fog: night.fog,
+        ambient: { color: night.ambient.color, intensity: night.ambient.intensity * ambK },
+        dir: {
+            color: night.dir.color,
+            intensity: night.dir.intensity * dirK,
+            dir: night.dir.dir
+        },
+        cloud: night.cloud
+    };
+}
+
+/**
  * Затянуть цвет тучами: убрать цветность и притушить.
  *
  * Именно так, а НЕ подмешиванием фиксированного серого. Серый средней
@@ -298,6 +327,11 @@ function overcast(hex, desat, dark) {
  *   ambc, dirc       — обесцвечивание цвета света (яркость правит *K)
  *   ambK, dirK       — множители яркости рассеянного и направленного света
  *   fogK             — во столько раз ближе туман (он же правит отсечение)
+ *   nearK            — ближняя граница тумана, доля от дальней (по умолчанию
+ *                      в renderer.applyViewDistance() — 0.35); у линейного
+ *                      тумана до ближней границы нет затухания вовсе, и при
+ *                      обычной доле разъезд с полотном под колёсами читался
+ *                      как «тумана нет, есть только серая дымка у горизонта»
  *   cloudK, starK    — доля облаков и звёзд
  */
 const WEATHER_ENV = {
@@ -321,11 +355,20 @@ const WEATHER_ENV = {
     // Туман — единственная погода без осадков: полотно сухое, меняется
     // только дальность. Она же правит отсечение (renderer.applyViewDistance
     // считает предел от sc.fog.far), поэтому туман ещё и дешевле ясного дня.
+    //
+    // nearK снижен с общих 0.35 до 0.08: иначе ближняя граница тумана
+    // отъезжала на 55-95 м от камеры (0.35 от уже подрезанной fogK
+    // дальности), и весь коридор перед машиной — как раз то расстояние,
+    // на которое смотрит игрок на гоночной скорости, — оставался абсолютно
+    // чистым. Жалоба «туман виден по серому небу, а на дороге его нет» —
+    // ровно про этот зазор. fogK заодно подтянут с 0.44 до 0.40: дальняя
+    // граница чуть ближе, видимость на дороге прочитывается как «небольшая»,
+    // а не только как лёгкая дымка на горизонте.
     fog: {
         sky: [0.82, 0.90], fogc: [0.76, 0.98], cloud: [0.6, 0.92],
         ambc: 0.55, ambK: 0.95,
         dirc: 0.62, dirK: 0.32,
-        fogK: 0.44, cloudK: 1.2, starK: 0.0
+        fogK: 0.40, nearK: 0.08, cloudK: 1.2, starK: 0.0
     }
 };
 
@@ -653,11 +696,24 @@ const TOD_PARAMS = {
     night: { fogK: 0.78, lights: true, lampK: 1.0, stars: 1.0, clouds: 0.0, moon: 1.0 }
 };
 
+// Насколько светлее показывается ночь относительно исходных *_NIGHT таблиц
+// (см. brightenNight выше). Сумерки по-прежнему считаются от исходных
+// таблиц через makeDusk — эти множители на них не влияют.
+//
+// 1.25/1.20 (первая попытка) дали в сумме едва заметную разницу: запечённый
+// цвет полотна и рельефа усреднённо остался в единицах процента от дневного
+// (замерено по буферу vertex color, а не на глаз, см. отчёт). Числа подняты
+// до 1.45 у обоих — с запасом ниже сумеречных intensity (city: ambient
+// 0.6688, dir 0.735 против новых ночных 0.58 и 0.435), чтобы ночь не
+// подъехала к сумеркам, но стала заметно светлее прежней.
+const NIGHT_AMBIENT_BOOST = 1.45;
+const NIGHT_DIR_BOOST = 1.45;
+
 const THEME_ENV = {
     city: {
         day: CITY_DAY,
         dusk: makeDusk(CITY_DAY, CITY_NIGHT),
-        night: CITY_NIGHT,
+        night: brightenNight(CITY_NIGHT, NIGHT_AMBIENT_BOOST, NIGHT_DIR_BOOST),
         palette: {
             concrete: ['#b9bfc6', '#cbcabe', '#a8aeb6', '#c4bbab', '#9aa2ac'],
             accent: ['#d0552f', '#3f7ea8', '#cbb04a'],
@@ -671,7 +727,7 @@ const THEME_ENV = {
     mountain: {
         day: MOUNTAIN_DAY,
         dusk: makeDusk(MOUNTAIN_DAY, MOUNTAIN_NIGHT),
-        night: MOUNTAIN_NIGHT,
+        night: brightenNight(MOUNTAIN_NIGHT, NIGHT_AMBIENT_BOOST, NIGHT_DIR_BOOST),
         palette: {
             needle: ['#3d7042', '#4a7d48', '#336038', '#578a48'],
             trunk: '#4a3a2c',
@@ -686,7 +742,7 @@ const THEME_ENV = {
     industrial: {
         day: INDUSTRIAL_DAY,
         dusk: makeDusk(INDUSTRIAL_DAY, INDUSTRIAL_NIGHT),
-        night: INDUSTRIAL_NIGHT,
+        night: brightenNight(INDUSTRIAL_NIGHT, NIGHT_AMBIENT_BOOST, NIGHT_DIR_BOOST),
         palette: {
             hangar: ['#8d9298', '#7c8a90', '#98917f', '#6f7a80'],
             tank: ['#b0b4b0', '#9aa39a', '#c0b49a'],
@@ -838,6 +894,10 @@ export function buildScenery(track, theme, seed, quality, opts) {
 
     const fogColor = toColor(env.fog);
     const fogFar = Q.fogFar * tod.fogK * (wx ? wx.fogK : 1);
+    // Доля ближней границы от дальней. У большинства погод она общая
+    // (см. renderer.applyViewDistance), у тумана — своя, гораздо меньше:
+    // без этого туман не давал затухания рядом с камерой вовсе.
+    const fogNearK = (wx && wx.nearK !== undefined) ? wx.nearK : 0.35;
     const sets = ctx.sets;
     const api = {
         group: group,
@@ -857,8 +917,10 @@ export function buildScenery(track, theme, seed, quality, opts) {
         // осадки: null, если у этой погоды их нет (ясно, туман)
         precip: precip,
 
-        // параметры, которые применяет renderer.js
-        fog: { color: fogColor, near: fogFar * 0.35, far: fogFar },
+        // параметры, которые применяет renderer.js. near — только для
+        // информации (renderer пересчитывает её сам через nearK и свой
+        // множитель дальности отрисовки), реальная доля — nearK.
+        fog: { color: fogColor, near: fogFar * fogNearK, far: fogFar, nearK: fogNearK },
         background: fogColor.clone(),
         light: {
             ambient: { color: toColor(env.ambient.color), intensity: env.ambient.intensity },
