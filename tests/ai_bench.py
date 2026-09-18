@@ -79,7 +79,8 @@ def build(seed=4242, n_mobs=N_MOBS):
         p.needs_full = False
     fl_rooms = [r for r in gen.generate(seed, 1, 64, 48).rooms]
     rnd = random.Random(seed ^ 0xA1)
-    mobs = [e for e in w.entities.values() if e.kind == world_mod.K_ENEMY]
+    mobs = [e for e in w.entities.values()
+            if e.kind in world_mod.ENEMY_KINDS]      # рубаки И стрелки (4.2)
     # добиваем до N_MOBS: 2.2 меряется на 200 сущностях, а штатный потолок
     # расстановки 48 — стенд обязан брать верхнюю границу контракта
     while len(mobs) < n_mobs:
@@ -144,7 +145,7 @@ def run(label, awake, shoot, ticks):
     med = statistics.median(samples)
     p99 = pct(samples, 0.99)
     alive = sum(1 for e in w.entities.values()
-                if e.kind == world_mod.K_ENEMY)
+                if e.kind in world_mod.ENEMY_KINDS)
     print("\n--- %s ---" % label)
     print("  сущностей в мире %d (врагов живых %d), игроков %d"
           % (len(w.entities), alive, N_PLAYERS))

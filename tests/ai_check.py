@@ -25,13 +25,18 @@
      видит. Рядом — цена решения: байт тумана против луча на каждого врага.
   6. ЗАМАХ ЧИТАЕМ. Игрок, нажавший рывок по появлению бита F_WINDUP, из-под
      удара уходит; неподвижный — получает. Числа в тиках.
-  7. ВРАГ УМИРАЕТ И РАССТАВЛЕН ПО 8.1: не в стартовой комнате, числом от
+  7. ВИДЫ ВРАГА РАЗЛИЧИМЫ НА ПРОВОДЕ. Стрелок держит полосу и пятится,
+     рубака прёт в упор — и уходят они РАЗНЫМИ значениями kind (4.2), а не
+     битом в flags. Смотрится не поле сущности, а то, что реально уходит
+     клиенту: proto.encode_entity и настоящий снапшот.
+  8. ВРАГ УМИРАЕТ И РАССТАВЛЕН ПО 8.1: не в стартовой комнате, числом от
      глубины этажа.
 
 Запуск:  python3 tests/ai_check.py [число_этажей_в_п.2]
 Выход: 0 — зелено, 1 — красно.
 """
 
+import json
 import math
 import os
 import statistics
@@ -42,7 +47,8 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from server import ai, combat, gen, nav, physics, vis as vis_mod   # noqa: E402
+from server import ai, combat, gen, nav, physics, proto            # noqa: E402
+from server import vis as vis_mod                                 # noqa: E402
 from server import world as world_mod                             # noqa: E402
 
 W = world_mod
@@ -589,6 +595,34 @@ def t_ranged():
         w2.step()
     check(abs(e2.x - p2.x) > d0 + 0.5, "стрелок пятится от подошедшего вплотную",
           "было %.2f, стало %.2f" % (d0, abs(e2.x - p2.x)))
+
+    # --- 4.2: виды различаются ЗНАЧЕНИЕМ kind, а не битом в flags --------
+    # Ведут себя эти двое противоположно (один прёт в упор, другой держит
+    # полосу 5-9 и пятится — проверено выше), и игрок обязан видеть разницу
+    # ДО того, как получит урон. Проверяется не поле сущности, а то, что
+    # реально уходит на провод: proto.encode_entity и настоящий снапшот.
+    w3 = make_world(hall(24, 12))
+    add_player(w3, 5.5, 5.5)
+    em = ai.make_enemy(w3, 8.5, 5.5, ai.AI_MELEE)
+    er = ai.make_enemy(w3, 12.5, 5.5, ai.AI_RANGED)
+    am = proto.encode_entity(em)
+    ar = proto.encode_entity(er)
+    check(am[1] != ar[1],
+          "рубака и стрелок уходят на провод РАЗНЫМИ kind (4.2)",
+          "рубака kind=%d, стрелок kind=%d; в снапшоте это поле 2 из 10 (4.3)"
+          % (am[1], ar[1]))
+    check(am[8] == ar[8] == 0,
+          "вид врага НЕ спрятан в бит flags (flags — про «что он делает»)",
+          "flags у обоих %d" % am[8])
+    check(em.team == er.team == 2,
+          "оба вида остались во вражеской команде (урон идёт по team, 4.2)",
+          "команды %d и %d" % (em.team, er.team))
+    tail = w3.snapshot_full()
+    got = sorted(set(a[1] for a in json.loads("{" + tail)["e"]))
+    check(got == sorted(set([W.K_PLAYER, am[1], ar[1]])),
+          "настоящий снапшот несёт все три значения kind",
+          "в снапшоте kind: %s (игрок %d, рубака %d, стрелок %d)"
+          % (got, W.K_PLAYER, am[1], ar[1]))
 
 
 def t_death_and_spawn():

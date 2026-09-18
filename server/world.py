@@ -21,9 +21,20 @@ DT = 1.0 / TICK_HZ
 
 # kind
 K_PLAYER = 1
-K_ENEMY = 2
+K_ENEMY = 2           # рубака: прёт в ближний бой (4.2)
 K_PROP = 3
 K_SHOT = 4
+# 4.2: виды врага различаются ЗНАЧЕНИЕМ kind, а не битом в flags. Рубака и
+# стрелок ведут себя противоположно (один прёт в упор, другой держит полосу
+# 5-9 клеток и пятится), и игрок обязан видеть разницу до того, как получит
+# урон. Бит в flags смешал бы «кто это» с «что он сейчас делает»: flags
+# меняются каждый замах, вид — никогда. Цена на проводе нулевая: kind в
+# снапшоте уже есть (4.3), это тот же один символ.
+K_ENEMY_RANGED = 5    # стрелок: держит дистанцию и стреляет (4.2)
+
+# Все вражеские виды одним местом: команда, расталкивание и ИИ спрашивают
+# «враг ли это», а не перечисляют номера.
+ENEMY_KINDS = (K_ENEMY, K_ENEMY_RANGED)
 
 # flags (4.3). DEAD и OFFLINE — из контракта; WINDUP и DASH добавлены на
 # этапе 2a и вынесены в отчёт как правка 4.3. Почему битом, а не событием:
@@ -117,7 +128,8 @@ class Entity(object):
         # команда: 1 игроки, 2 враги, 0 нейтрал (реквизит). Бьют друг друга
         # только разные команды, поэтому дружественного огня нет по
         # построению, а не по проверке "если это игрок".
-        self.team = 1 if kind == K_PLAYER else (2 if kind == K_ENEMY else 0)
+        self.team = 1 if kind == K_PLAYER else (2 if kind in ENEMY_KINDS
+                                                else 0)
         self.atk_hit = 0        # тик, на котором прилетит удар (0 — нет замаха)
         self.atk_ready = 0      # тик, с которого можно бить снова
         self.dash_end = 0       # последний тик рывка (0 — не в рывке)
@@ -183,6 +195,39 @@ class World(object):
 
     # --- тик ---------------------------------------------------------------
 
+    def _crowd_push(self, dt):
+        """Смещения расталкивания на этот тик: id -> (px, py), или None.
+
+        Считается ДО прохода по сущностям и по их положению на начало тика:
+        иначе тело, которое шагнуло первым, толкало бы соседа сильнее, чем
+        сосед его, и толпа поехала бы в сторону порядка обхода словаря.
+
+        Расталкиваются ВРАГИ МЕЖДУ СОБОЙ. Игроки — нет, и это осознанно:
+        толкать игрока телом врага значит менять бой (из-под замаха
+        выталкивало бы само), а слипание, которое лечится, — про толпу
+        врагов. Снаряды — нет: у них та же команда 2, но прямая линия
+        входит в их смысл (4.2a), поэтому отбор идёт по kind, а не по team.
+        """
+        xs = []
+        ys = []
+        rs = []
+        steps = []
+        ids = []
+        for e in self.entities.values():
+            if e.kind not in ENEMY_KINDS or (e.flags & F_DEAD):
+                continue
+            xs.append(e.x)
+            ys.append(e.y)
+            rs.append(e.r)
+            steps.append(e.speed * dt)
+            ids.append(e.id)
+        if len(xs) < 2:
+            return None
+        res = physics.separate(xs, ys, rs, steps)
+        if not res:
+            return None
+        return dict((ids[i], v) for i, v in res.items())
+
     def step(self, dt=DT):
         self.tick += 1
         grid = self.grid
@@ -191,6 +236,8 @@ class World(object):
         # враг встаёт в первом же проёме — 8.3). Состав мира ai.step не
         # меняет, поэтому словарь под ним не шевелится.
         ai.step(self, dt)
+        # тела друг для друга больше не проницаемы (physics.separate)
+        pushes = self._crowd_push(dt)
         gone = None
         for e in self.entities.values():
             # кнопки и боевые таймеры — до движения: рывок выставляет скорость
@@ -220,7 +267,8 @@ class World(object):
                         gone = []
                     gone.append(e.id)
                     continue
-            if e.vx or e.vy:
+            pmv = pushes.get(e.id) if pushes else None
+            if e.vx or e.vy or pmv:
                 if e.ctl and (e.flags & F_DEAD):
                     # дух летает (8.5): стены ему не преграда, зато он не
                     # светит туман (viewers) и не трогает бой
@@ -231,7 +279,7 @@ class World(object):
                 # прямая линия входит в смысл снаряда
                 nx, ny, hit = physics.move_circle(grid, e.x, e.y,
                                                   e.vx * dt, e.vy * dt, e.r,
-                                                  e.kind != K_SHOT)
+                                                  e.kind != K_SHOT, pmv)
                 e.x = nx
                 e.y = ny
                 if hit:
