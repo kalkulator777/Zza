@@ -73,14 +73,22 @@ def race_enabled() -> bool:
     return backend() == RAPIER
 
 
-# --- что Rapier пока не считает (§12.24) -------------------------------------
+# --- что Rapier пока не считает (§12.24, §12.25) -----------------------------
 #
-# Бонусы, поток машин и происшествия живут в game/items.py, game/traffic.py и
-# game/events.py и написаны под состояние старой физики: они правят x/z/vx/vz
-# и подменяют характеристики между шагами. У Rapier состояние машины лежит
-# внутри модуля, менять его снаружи между шагами нечем, а на половину
-# перенесённой механике играть хуже, чем без неё. Поэтому при physics=rapier
-# эти три настройки честно опускаются, и комната об этом СООБЩАЕТ.
+# Поток машин и происшествия живут в game/traffic.py и game/events.py и
+# написаны под состояние старой физики: они правят x/z/vx/vz и подменяют
+# характеристики между шагами. У Rapier состояние машины лежит внутри
+# модуля, менять его снаружи между шагами нечем, а на половину перенесённой
+# механике играть хуже, чем без неё. Поэтому при physics=rapier эти
+# настройки честно опускаются, и комната об этом СООБЩАЕТ.
+#
+# БОНУСЫ ИЗ ЭТОГО СПИСКА УШЛИ (§12.25): дверь «внешнее воздействие на
+# машину» в ABI теперь есть — буфер EFFECTS и структура CarEffect. Через
+# неё же поедут покрытие и выталкивание происшествий: grip_drop уже
+# множит сцепление колёс, push_* и shift_* уже двигают тело. Здесь остались
+# только те две настройки, которым нужна не дверь, а тела в мире —
+# болванки потока и корпуса твёрдых препятствий, — и та, что не про
+# воздействие вовсе.
 #
 # Столкновения в этом списке с другой стороны: их Rapier считает ВНУТРИ
 # шага, и выключить их нечем — групп столкновений в ABI нет. Галочка
@@ -88,7 +96,6 @@ def race_enabled() -> bool:
 #
 # (имя поля настроек, во что оно ставится, что сказать игроку)
 RESTRICTED = (
-    ('items_enabled', False, 'бонусы выключены'),
     ('traffic', 'off', 'поток машин выключен'),
     ('events', 'off', 'происшествия выключены'),
     ('collisions', True, 'столкновения включены всегда'),
@@ -255,6 +262,7 @@ class RapierHost(object):
         store = self._store
         self._f_step = ex['rp_step']
         self._f_inputs = ex['rp_inputs_ptr']
+        self._f_effects = ex['rp_effects_ptr']
         self._f_outputs = ex['rp_outputs_ptr']
         self._f_descs = ex['rp_descs_ptr']
         self._f_tuning = ex['rp_tuning_ptr']
@@ -269,6 +277,10 @@ class RapierHost(object):
         if stride != abi.CarOut.SIZE:
             raise HostError('шаг записи вывода %d, в раскладке %d'
                             % (stride, abi.CarOut.SIZE))
+        eff_floats = ex['rp_effect_floats'](store)
+        if eff_floats != abi.CarEffect.FLOATS:
+            raise HostError('чисел в записи воздействия %d, в раскладке %d'
+                            % (eff_floats, abi.CarEffect.FLOATS))
         max_cars = ex['rp_max_cars'](store)
         if max_cars != abi.MAX_CARS:
             raise HostError('машин в модуле %d, в раскладке %d'
@@ -301,6 +313,10 @@ class RapierHost(object):
         self._base = base
         self.inputs = (ctypes.c_float * (abi.MAX_CARS * abi.CarInput.FLOATS)) \
             .from_address(base + self._f_inputs(store))
+        # Внешние воздействия (§12.25): хозяин пишет дозу на один шаг,
+        # модуль применяет её внутри шага и запись обнуляет.
+        self.effects = (ctypes.c_float * (abi.MAX_CARS * abi.CarEffect.FLOATS)) \
+            .from_address(base + self._f_effects(store))
         self.outputs = (ctypes.c_float * (abi.MAX_CARS * abi.CarOut.FLOATS)) \
             .from_address(base + self._f_outputs(store))
         self.descs = (ctypes.c_float * (abi.MAX_CARS * abi.CarDesc.FLOATS)) \
@@ -503,7 +519,13 @@ from .protocol import (BTN_THROTTLE, BTN_BRAKE, BTN_LEFT,   # noqa: E402
 # единственная пара объявлений, ровно как у WEATHER_GRIP.
 from .physics import (DRIFT_CHARGE_L1, DRIFT_CHARGE_L2,   # noqa: E402
                       DRIFT_CHARGE_L3, DRIFT_BOOST_L1,
-                      DRIFT_BOOST_L2, DRIFT_BOOST_L3, BOOST_ACCEL)
+                      DRIFT_BOOST_L2, DRIFT_BOOST_L3, BOOST_ACCEL,
+                      SPIN_RATE, SLOW_FACTOR)
+
+# Дозы воздействий на один шаг (§12.25). Считаются из тех же констант
+# раздела 6, по которым живёт классика: второго объявления не заводим,
+# а браузер берёт ту же пару из static/js/physics.js.
+SPEED_DROP_SLOW = 1.0 - SLOW_FACTOR   # доля продольной скорости за шаг «Грозы»
 
 
 def car_tuning(stats, mode: str) -> dict:
@@ -688,7 +710,8 @@ class RapierRace(object):
             ground = track.surface(state.x, state.z, state.sample_idx)[3]
             idx = self.host.spawn_car(state.x, ground + rest_y, state.z, state.yaw)
             self.slots.append([car, idx, idx * abi.CarInput.FLOATS,
-                               idx * abi.CarOut.FLOATS, rest_y, 1.0 / steer_max])
+                               idx * abi.CarOut.FLOATS, rest_y, 1.0 / steer_max,
+                               idx * abi.CarEffect.FLOATS])
 
         self.ticks = 0
         self.micros = []
@@ -759,6 +782,8 @@ class RapierRace(object):
         host = self.host
         host._sync()
         inputs = host.inputs
+        effects = host.effects
+        out = host.outputs
         for entry in self.slots:
             car = entry[0]
             if car.removed:
@@ -788,11 +813,74 @@ class RapierRace(object):
             # Флаг взят с прошлого шага — у клиента он ровно такой же,
             # потому что считается той же surface() по той же позе.
             inputs[base + abi.CarInput.OFFTRACK] = 1.0 if car.state.offtrack else 0.0
+            self._write_effect(entry, effects, out, dt)
         started = time.perf_counter()
         host._f_step(host._store, 1)
         self.micros.append((time.perf_counter() - started) * 1e6)
         self.ticks += 1
         self._read_all(events)
+
+    # --- внешние воздействия (§12.25) -----------------------------------
+
+    def _write_effect(self, entry, effects, out, dt):
+        """Перевести таймеры бонусов в дозу воздействия на ЭТОТ шаг.
+
+        Единственная дверь, через которую в мир Rapier попадает всё, что
+        действует на машину извне. Правило разделения то же, что у награды
+        за занос (§12.24): **числа снаружи, механика в модуле**. Здесь —
+        только перевод «сколько секунд осталось» в «что сделать на этом
+        шаге»; сами секунды назначает ``game/items.py``.
+
+        Почему таймеры тикают ЗДЕСЬ, а не в модуле. Их надо уметь
+        восстанавливать при откате клиента, а кольцо отката у клиента уже
+        есть — ``net.js`` хранит ``spinTime`` и ``slowTime`` с самой старой
+        физики. Положи таймер в модуль — пришлось бы расширять ``CarSave``
+        и заводить второе место, откуда его восстанавливать. Доза же живёт
+        один шаг и переигрывается из таймера бесплатно.
+
+        Порядок «действует и тикает на одном и том же шаге» дословно
+        повторяет шаги 1 и 8 раздела 6.2: у классики ``spin_time -= dt``
+        стоит там же, где раскрутка применяется.
+        """
+        car = entry[0]
+        state = car.state
+        e = entry[6]
+        E = abi.CarEffect
+
+        spin = state.spin_time
+        if spin > 0.0:
+            # Раскрутка: крутит, глушит ввод и сжигает копилку заноса.
+            # Последнее — не украшение: без него заглушённый ручник
+            # выглядел бы для шага 15 как «отпустил» и попадание ракеты
+            # ОПЛАЧИВАЛО бы занос. У классики от этого спасает
+            # items._apply_hit, который обнуляет заряд руками.
+            effects[e + E.SPIN_RATE] = SPIN_RATE
+            effects[e + E.STUN] = 1.0
+            effects[e + E.DRIFT_RESET] = 1.0
+            spin -= dt
+            state.spin_time = spin if spin > 0.0 else 0.0
+
+        slow = state.slow_time
+        if slow > 0.0:
+            effects[e + E.SPEED_DROP] = SPEED_DROP_SLOW
+            slow -= dt
+            state.slow_time = slow if slow > 0.0 else 0.0
+
+        # Щит на движение не влияет вовсе — тикает здесь только потому,
+        # что у классики его тикает физика, а тут физики хозяина нет.
+        shield = state.shield_time
+        if shield > 0.0:
+            shield -= dt
+            state.shield_time = shield if shield > 0.0 else 0.0
+
+        # Буст: его остаток держит МОДУЛЬ (он же платит за занос), а
+        # хозяин умеет только добавить. Разница между тем, что лежит в
+        # состоянии, и тем, что в модуле, и есть заявка: ``_read_all``
+        # уравнивает их каждый тик, поэтому всё, что больше, написано
+        # хозяином — то есть ``ItemSystem.use``.
+        want = state.boost_time
+        if want > out[entry[3] + abi.CarOut.BOOST_TIME]:
+            effects[e + E.BOOST_ADD] = want
 
     def _read_all(self, events=None):
         """Поза из модуля -> CarState, затем шаг 16 из game/track.py."""

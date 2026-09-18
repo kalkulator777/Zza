@@ -54,6 +54,7 @@ abi = rh.abi
 OUT = abi.CarOut
 INP = abi.CarInput
 SAVE = abi.CarSave
+EFF = abi.CarEffect
 
 DT = 1.0 / 60.0
 
@@ -102,7 +103,7 @@ ROLLBACK_SEED = 4062
 
 # md5 выпущенного модуля. Сторож, а не украшение: хэши четырёх движков в
 # §12.24 сняты С ЭТИХ БАЙТ, и другой файл их не наследует.
-WASM_MD5 = '1390afb0d01b75b3e8eb64d39f9623b5'
+WASM_MD5 = 'c254183dfe1421c13789f5ae847d2bc1'
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +209,23 @@ class Car(object):
 
     def g(self, field):
         return self.out[self.base + field]
+
+    # --- внешние воздействия (§12.25) ------------------------------------
+
+    def dose(self, **fields):
+        """Записать дозу воздействия на СЛЕДУЮЩИЙ шаг: dose(spin_rate=9.0)."""
+        h = self.h
+        h._sync()
+        base = self.idx * EFF.FLOATS
+        for name, value in fields.items():
+            h.effects[base + getattr(EFF, name.upper())] = value
+
+    def dose_row(self, idx=None):
+        """Что лежит в записи воздействия сейчас — списком из EFF.FLOATS чисел."""
+        h = self.h
+        h._sync()
+        base = (self.idx if idx is None else idx) * EFF.FLOATS
+        return [h.effects[base + k] for k in range(EFF.FLOATS)]
 
     def offtrack(self):
         """Тот же флаг и той же surface(), что у хозяина в ``_read_all``."""
@@ -731,11 +749,21 @@ def report_restrictions(report):
                         '; '.join(sim.disabled_features)))
         # Настройка снята — подсистема обязана быть пустой, а не просто
         # выключенной флагом: именно на этой разнице сгорел гандикап.
+        # Бонусы проверяются С ДРУГОЙ СТОРОНЫ: их попросили включёнными, и
+        # они обязаны РАБОТАТЬ (§12.25), а не быть тихо опущенными. Мало
+        # флага: та же ошибка гандикапа читалась бы как «включено и молчит»,
+        # поэтому смотрим ещё и на то, что боксы на трассе есть.
         items = getattr(sim, 'items', None)
-        report.check(items is None or not getattr(items, 'enabled', False),
-                     'бонусов в гонке нет',
-                     'items_enabled=%r' % (None if items is None
-                                           else getattr(items, 'enabled', None)))
+        boxes = 0 if items is None else getattr(items, 'box_count', 0)
+        report.check(items is not None and getattr(items, 'enabled', False)
+                     and boxes > 0,
+                     'бонусы в гонке включены и разложены',
+                     'items_enabled=%r, боксов %d'
+                     % (None if items is None
+                        else getattr(items, 'enabled', None), boxes))
+        report.check('items_enabled' not in [row[0] for row in rh.RESTRICTED],
+                     'бонусы больше не в списке опущенного',
+                     'опущено: %s' % ', '.join(row[0] for row in rh.RESTRICTED))
         traffic = getattr(sim, 'traffic', None)
         report.check(traffic is None or not getattr(traffic, 'cars', None),
                      'болванок потока в гонке нет',
@@ -762,6 +790,209 @@ def report_restrictions(report):
             os.environ.pop(rh.ENV_VAR, None)
         else:
             os.environ[rh.ENV_VAR] = saved
+
+
+# ---------------------------------------------------------------------------
+# Внешние воздействия: CarEffect (§12.25)
+# ---------------------------------------------------------------------------
+# Дверь, через которую в мир Rapier попадает всё, что действует на машину
+# извне: бонусы сейчас, покрытие и выталкивание происшествий — следом. Дверь
+# опасна ровно тем же, чем любая дверь: её можно не закрыть (доза осталась в
+# памяти и действует вечно), можно пройти дважды (два применения сложились)
+# и можно войти не в свою (воздействие на чужую машину). Проверки ниже
+# закрывают каждую из трёх, и каждая доказывает, что СПОСОБНА покраснеть:
+# рядом с ней стоит прогон, где охраняемое свойство нарушено нарочно.
+
+def report_effects(report):
+    print('  внешние воздействия (CarEffect, §12.25):')
+
+    # 1. Доза живёт ОДИН шаг. Модуль стирает запись после шага; если он этого
+    #    не сделает, машина с однажды выписанной раскруткой будет крутиться
+    #    до конца гонки. Прогон с повторной выпиской — рядом: он показывает,
+    #    что метод вообще видит вращение.
+    car = Car()
+    car.spin_up(20.0)
+    car.dose(spin_rate=rh.SPIN_RATE, stun=1.0)
+    before = car.yaw_open
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    turned_once = car.yaw_open - before
+    left = car.dose_row()
+    before = car.yaw_open
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    turned_after = car.yaw_open - before
+    car.dose(spin_rate=rh.SPIN_RATE, stun=1.0)
+    before = car.yaw_open
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    turned_again = car.yaw_open - before
+    want = rh.SPIN_RATE / 60.0
+    report.check(abs(turned_once - want) < 0.02 * want,
+                 'доза поворачивает ровно на spin_rate*dt',
+                 '%.5f рад против %.5f' % (turned_once, want))
+    report.check(not any(left), 'модуль стёр запись воздействия после шага',
+                 'осталось: %s' % (['%.3f' % v for v in left] if any(left) else 'нули'))
+    report.check(abs(turned_after) < 0.1 * want,
+                 'на следующем шаге доза НЕ действует',
+                 'без выписки %.5f рад, с выпиской %.5f'
+                 % (turned_after, turned_again))
+    report.check(abs(turned_again - want) < 0.02 * want,
+                 'метод видит вращение, когда дозу выписали заново',
+                 '%.5f рад' % turned_again)
+
+    # 2. Два применения подряд НЕ складываются. Правило «новый буст не
+    #    укорачивает уже идущий» (6.3) закрывает и это: берётся максимум.
+    car = Car()
+    car.dose(boost_add=1.0)
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    one = car.g(OUT.BOOST_TIME)
+    car.dose(boost_add=1.0)
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    twice = car.g(OUT.BOOST_TIME)
+    car.dose(boost_add=2.0)
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    bigger = car.g(OUT.BOOST_TIME)
+    report.check(twice <= one and twice > 0.0,
+                 'две дозы буста подряд не складываются',
+                 'после первой %.3f с, после второй %.3f с' % (one, twice))
+    report.check(bigger > twice,
+                 'но большая доза буст ПРОДЛЕВАЕТ (метод способен увидеть рост)',
+                 '%.3f -> %.3f с' % (twice, bigger))
+
+    # 3. Воздействие адресуется по своей записи. Адресата в структуре нет
+    #    намеренно: попасть в чужую машину можно только написав в её запись.
+    h = host()
+    h.reset(0)
+    h.add_ground(3000.0, rh.TRACK_FRICTION)
+    h.tuning_preset(0)
+    h.set_tuning(rh.car_tuning(car_spec(), 'arcade'))
+    tune = h.tuning_values()
+    rest = tune['wheel_radius'] + tune['suspension_rest'] + tune['half_height'] * 0.2
+    a = h.spawn_car(0.0, rest, 0.0, 0.0)
+    b = h.spawn_car(0.0, rest, 30.0, 0.0)
+    for _ in range(rh.SETTLE_TICKS):
+        h.step(1)
+    yaw_a0 = h.outputs[a * OUT.FLOATS + OUT.YAW]
+    yaw_b0 = h.outputs[b * OUT.FLOATS + OUT.YAW]
+    h._sync()
+    h.effects[a * EFF.FLOATS + EFF.SPIN_RATE] = rh.SPIN_RATE
+    h.step(1)
+    moved_a = abs(h.outputs[a * OUT.FLOATS + OUT.YAW] - yaw_a0)
+    moved_b = abs(h.outputs[b * OUT.FLOATS + OUT.YAW] - yaw_b0)
+    report.check(moved_a > 0.9 * want and moved_b < 1e-4,
+                 'доза действует только на свою машину',
+                 'своя %.5f рад, соседняя %.7f рад' % (moved_a, moved_b))
+
+    # 4. ПОПАДАНИЕ НЕ ОПЛАЧИВАЕТ ЗАНОС. Раскрутка глушит ввод, а шаг 15
+    #    видит отпущенный ручник как «занос закончен» — то есть без
+    #    drift_reset ракета в спину стала бы способом обналичить копилку.
+    #    У классики от этого спасает items._apply_hit, который обнуляет
+    #    заряд руками; здесь то же самое делает доза.
+    def hit_run(with_reset):
+        # Копим занос ровно тем же пилотом, каким это делают проверки
+        # «честный занос платит все три уровня»: сравнивать имеет смысл
+        # только одинаковое.
+        c = Car()
+        c.spin_up(22.0)
+        c.yaw_open = 0.0
+        c._prev_yaw = c.g(OUT.YAW)
+        pilot = pilot_arc(13.0)
+        for i in range(int(60 * 5.0)):
+            v_fwd, v_lat = c.v_fwd_lat()
+            thr, brk, steer, hb = pilot(i, c, v_fwd, v_lat)
+            c.drive(thr, brk, steer, hb)
+        charged = c.g(OUT.DRIFT_CHARGE)
+        best = 0.0
+        for _ in range(int(60 * 1.5)):
+            if with_reset:
+                c.dose(spin_rate=rh.SPIN_RATE, stun=1.0, drift_reset=1.0)
+            else:
+                c.dose(spin_rate=rh.SPIN_RATE, stun=1.0)
+            c.drive(0.0, 0.0, 0.0, 0.0)
+            if c.g(OUT.BOOST_TIME) > best:
+                best = c.g(OUT.BOOST_TIME)
+        return charged, best
+
+    charged, paid = hit_run(True)
+    charged_bad, paid_bad = hit_run(False)
+    report.check(charged > L1 and paid == 0.0,
+                 'попадание сжигает занос, а не оплачивает его',
+                 'копилка %.2f с (уровень 1 с %.2f), выплата %.2f с'
+                 % (charged, L1, paid))
+    report.check(paid_bad > 0.0,
+                 'без drift_reset дыра открыта — проверка способна покраснеть',
+                 'без сброса выплачено %.2f с' % paid_bad)
+
+    # 5. stun действительно отнимает управление.
+    car = Car()
+    for _ in range(60):
+        car.dose(stun=1.0)
+        car.drive(1.0, 0.0, 0.0, 0.0)
+    stunned = car.g(OUT.SPEED)
+    car = Car()
+    for _ in range(60):
+        car.drive(1.0, 0.0, 0.0, 0.0)
+    free = car.g(OUT.SPEED)
+    report.check(stunned < 0.05 * free and free > 5.0,
+                 'stun глушит ввод: секунда полного газа не сдвигает',
+                 '%.3f м/с против %.2f м/с без дозы' % (stunned, free))
+
+    # 6. grip_drop режет сцепление: то же покрытие, что масло у классики
+    #    (OIL_GRIP = 0.45, то есть доза 0.55). В дуге машина уезжает шире.
+    def arc_yaw(drop):
+        c = Car()
+        c.spin_up(20.0)
+        c.yaw_open = 0.0
+        c._prev_yaw = c.g(OUT.YAW)
+        for _ in range(90):
+            if drop:
+                c.dose(grip_drop=drop)
+            c.drive(0.6, 0.0, 1.0, 0.0)
+        return abs(c.yaw_open)
+
+    dry = arc_yaw(0.0)
+    oily = arc_yaw(0.55)
+    report.check(oily < 0.8 * dry,
+                 'grip_drop роняет сцепление: в дуге машину несёт',
+                 'поворот за 1,5 с: %.2f рад по сухому, %.2f по маслу'
+                 % (dry, oily))
+
+    # 7. speed_drop снимает заказанную долю продольной скорости. Одно поле
+    #    на «Грозу» и на тряску по обломкам.
+    car = Car()
+    car.spin_up(25.0)
+    v0 = car.v_fwd_lat()[0]
+    car.dose(speed_drop=0.10)
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    v_dosed = car.v_fwd_lat()[0]
+    car2 = Car()
+    car2.spin_up(25.0)
+    v0b = car2.v_fwd_lat()[0]
+    car2.drive(0.0, 0.0, 0.0, 0.0)
+    v_free = car2.v_fwd_lat()[0]
+    took = (v_free - v_dosed) / v0
+    report.check(abs(took - 0.10) < 0.02,
+                 'speed_drop снимает ровно заказанную долю',
+                 'просили 10 %%, сняло %.1f %% (с %.2f до %.2f м/с)'
+                 % (took * 100.0, v0, v_dosed))
+
+    # 8. push и shift двигают тело на заказанное. Пока их никто не зовёт —
+    #    они ждут происшествий и трамплинов (§12.25), — но мёртвый код в
+    #    ABI хуже отсутствующего: проверка держит их живыми.
+    car = Car()
+    px0 = car.g(OUT.PX)
+    car.dose(push_x=5.0)
+    car.drive(0.0, 0.0, 0.0, 0.0)
+    vx = car.g(OUT.VX)
+    car2 = Car()
+    px2 = car2.g(OUT.PX)
+    car2.dose(shift_x=2.0)
+    car2.drive(0.0, 0.0, 0.0, 0.0)
+    moved = car2.g(OUT.PX) - px2
+    report.check(abs(vx - 5.0) < 0.6,
+                 'push задаёт приращение скорости в м/с',
+                 'просили +5.00, вышло %+.3f м/с' % vx)
+    report.check(abs(moved - 2.0) < 0.05,
+                 'shift задаёт приращение позиции в метрах',
+                 'просили +2.000, вышло %+.4f м (было %.3f)' % (moved, px0))
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +1062,7 @@ def main(argv=None):
         report_rollback(report)
         report_eps_sync(report)
         report_restrictions(report)
+        report_effects(report)
         report_module(report, wasm_parity=not args.no_wasm_parity)
     except rh.HostError as exc:
         print('  ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)

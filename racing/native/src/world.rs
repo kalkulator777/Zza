@@ -5,7 +5,8 @@
 use rapier3d::control::{DynamicRayCastVehicleController, WheelTuning};
 use rapier3d::prelude::*;
 
-use crate::abi::{CarDesc, CarInput, CarOut, CarSave, PropOut, DESCS, MAX_CARS, MAX_PROPS, PROPS, SAVES};
+use crate::abi::{CarDesc, CarEffect, CarInput, CarOut, CarSave, PropOut, DESCS, MAX_CARS,
+                 MAX_PROPS, PROPS, SAVES};
 
 /// Шаг симуляции жёстко фиксирован: 60 Гц, как в контракте.
 pub const DT: f32 = 1.0 / 60.0;
@@ -423,12 +424,30 @@ impl World {
     }
 
     /// Один шаг: вводы -> контроллеры -> Rapier -> состояния.
-    pub fn step(&mut self, inputs: &[CarInput], outputs: &mut [CarOut]) {
+    ///
+    /// `effects` — внешние воздействия на этот шаг (бонусы, покрытие,
+    /// толчки). Доза живёт РОВНО ОДИН шаг: в конце шага записи обнуляются,
+    /// и хозяин пишет их заново каждый тик, пока действие длится. Нулевая
+    /// запись обязана считаться бит в бит так же, как считалось до
+    /// появления `CarEffect` — на этом стоят все снятые хэши.
+    pub fn step(&mut self, inputs: &[CarInput], outputs: &mut [CarOut],
+                effects: &mut [CarEffect]) {
         let n = self.cars.len();
 
         // 1. Руль, тяга, тормоза — по вводу.
         for i in 0..n {
-            let inp = inputs[i];
+            let eff = effects[i];
+            // Ввод заглушён: шаг 1 раздела 6.2. Не «руль в ноль мгновенно»,
+            // а «кнопки отпущены» — руль возвращается своим steer_return,
+            // ровно как у классики с обнулёнными битами кнопок. Флаг
+            // offtrack кнопкой не является и глушению не подлежит.
+            let mut inp = inputs[i];
+            if eff.stun > 0.5 {
+                inp.throttle = 0.0;
+                inp.brake = 0.0;
+                inp.steer = 0.0;
+                inp.handbrake = 0.0;
+            }
             let car = &mut self.cars[i];
             let t = car.tuning;
 
@@ -494,8 +513,16 @@ impl World {
             }
             wheels[2].brake += hb_brake * 0.5 * DT;
             wheels[3].brake += hb_brake * 0.5 * DT;
+            // Покрытие под машиной: масло и обломки съедают долю сцепления.
+            // При нулевой дозе множитель ровно 1.0, то есть в колёса
+            // записываются те же биты, что стояли там со spawn_car, и хэш
+            // мира не шевелится.
+            let grip = 1.0 - eff.grip_drop.clamp(0.0, 1.0);
+            for w in 0..4 {
+                wheels[w].friction_slip = t.friction_slip * grip;
+            }
             // Ручник роняет боковое сцепление задней оси — отсюда занос.
-            let base_side = t.side_friction_stiffness;
+            let base_side = t.side_friction_stiffness * grip;
             let dropped = base_side * (1.0 - (1.0 - t.handbrake_side_drop) * hb);
             wheels[2].side_friction_stiffness = dropped;
             wheels[3].side_friction_stiffness = dropped;
@@ -520,7 +547,18 @@ impl World {
 
         // 3. Аркадная надстройка поверх твёрдого тела.
         for i in 0..n {
-            let hb_in = inputs[i].handbrake.clamp(0.0, 1.0);
+            let eff = effects[i];
+            let stunned = eff.stun > 0.5;
+            let hb_in = if stunned {
+                0.0
+            } else {
+                inputs[i].handbrake.clamp(0.0, 1.0)
+            };
+            // Покрытие: та же доля, что в проходе 1 ушла в колёса. Всё,
+            // чем аркадная надстройка подменяет резину, обязано ронять
+            // сцепление вместе с ней — иначе на масле машину несёт, а
+            // помощь в руле продолжает доворачивать её как по сухому.
+            let grip = 1.0 - eff.grip_drop.clamp(0.0, 1.0);
             let car = &mut self.cars[i];
             let t = car.tuning;
             let on_ground = car
@@ -536,6 +574,73 @@ impl World {
             // складывает подвеску и кладёт кузов на асфальт.
             body.reset_forces(false);
             body.reset_torques(false);
+
+            // Воздействия, которые ставят состояние машины, — до всего
+            // остального в этом проходе: доза относится К ЭТОМУ шагу, и
+            // выданный буст обязан тянуть уже сейчас, а не со следующего.
+            //
+            // Буст: правило то же, что у награды за занос (§12.24) — новый
+            // не укорачивает уже идущий. Оно же закрывает и «применить
+            // дважды»: две дозы подряд не складываются, берётся большая.
+            if eff.boost_add > car.boost_time {
+                car.boost_time = eff.boost_add;
+            }
+            if eff.drift_reset > 0.5 {
+                // Копилка сгорает БЕЗ выплаты. Классика пишет это руками в
+                // items._apply_hit; здесь то же место — до шага 15, который
+                // иначе увидел бы отпущенный (заглушённый) ручник и заплатил
+                // бы за занос тому, кого только что сбили.
+                car.drift_charge = 0.0;
+                car.drift_dir = 0.0;
+            }
+            if eff.shift_x != 0.0 || eff.shift_y != 0.0 || eff.shift_z != 0.0 {
+                // Сдвиг позиции до шага солвера: остаток перекрытия он
+                // доразведёт сам. Поворот и скорости не трогаются.
+                let p = *body.position();
+                body.set_position(
+                    Pose::from_parts(
+                        Vector::new(
+                            p.translation.x + eff.shift_x,
+                            p.translation.y + eff.shift_y,
+                            p.translation.z + eff.shift_z,
+                        ),
+                        p.rotation,
+                    ),
+                    true,
+                );
+            }
+            if eff.push_x != 0.0 || eff.push_y != 0.0 || eff.push_z != 0.0 {
+                // Толчок задан ПРИРАЩЕНИЕМ СКОРОСТИ: число не зависит от
+                // массы машины и читается так же, как state.vx у классики.
+                let m = body.mass();
+                body.apply_impulse(
+                    Vector::new(eff.push_x * m, eff.push_y * m, eff.push_z * m),
+                    true,
+                );
+            }
+            if eff.spin_rate != 0.0 {
+                // Раскрутка после попадания. Курс доворачивается
+                // КИНЕМАТИЧЕСКИ, как у классики (yaw += SPIN_RATE*dt):
+                // скорость не трогаем, машину разворачивает поперёк
+                // собственного хода, а дальше её стаскивает боковое
+                // сцепление — ровно та же картинка, что в старой физике.
+                // q' = rotY(Δ)·q — доворот вокруг МИРОВОЙ вертикали.
+                let p = *body.position();
+                let turn = Rotation::from_rotation_y(eff.spin_rate * DT);
+                body.set_position(
+                    Pose::from_parts(p.translation, turn * p.rotation),
+                    true,
+                );
+                // Своей угловой скорости у раскрутки нет: иначе она
+                // складывалась бы с кинематическим доворотом и машина
+                // крутилась бы вдвое быстрее заказанного.
+                let a = body.angvel();
+                body.set_angvel(Vector::new(a.x, 0.0, a.z), true);
+            }
+
+            // Поза и скорости читаются ПОСЛЕ воздействий: сдвиг, толчок и
+            // доворот относятся к этому шагу, и всё, что ниже, обязано
+            // видеть уже их результат.
             let pose = *body.position();
             let linvel = body.linvel();
             let angvel = body.angvel();
@@ -570,12 +675,26 @@ impl World {
                 }
             }
 
+            // Замедление — шаг 8 раздела 6.2 тем же приёмом: снимаем долю
+            // ПРОДОЛЬНОЙ скорости. Одно поле на «Грозу» и на тряску по
+            // обломкам. Симметрично бусту: в воздухе не тормозит (тормозить
+            // нечем), а таймер тикает у хозяина и в воздухе тоже.
+            if eff.speed_drop > 0.0 && on_ground > 0 {
+                let k = eff.speed_drop.clamp(0.0, 1.0);
+                body.apply_impulse(fwd * (-v_fwd * k * body.mass()), true);
+            }
+
             if on_ground > 0 {
                 // Прижим: держит машину на трамплине и в быстрых дугах.
                 let sp2 = linvel.length_squared();
                 body.add_force(Vector::new(0.0, -t.downforce * sp2, 0.0), true);
 
-                if t.yaw_assist > 0.0 {
+                // Раскрутка спорит с помощью в руле и с гашением рыскания:
+                // обе тянут кузов к «правильному» курсу, а раскрутка — это
+                // ровно потеря курса. Пока крутит, аркадная надстройка
+                // молчит; у классики её роль играли обнулённые кнопки.
+                let spinning = eff.spin_rate != 0.0;
+                if t.yaw_assist > 0.0 && !spinning {
                     // Помощь в руле: доворачиваем кузов к тому курсу, который
                     // просит руль. Это и есть «аркадный» характер. Считаем по
                     // ТОМУ ЖЕ углу, что уехал в колёса (с поправкой на скорость),
@@ -588,7 +707,7 @@ impl World {
                     };
                     // Потолок по сцеплению: просить больше, чем держит резина,
                     // нельзя — иначе машина ездит по рельсам и это видно.
-                    let a_lat_max = 9.81 * t.friction_slip;
+                    let a_lat_max = 9.81 * t.friction_slip * grip;
                     let w_max = a_lat_max / v_fwd.abs().max(4.0);
                     want = want.clamp(-w_max, w_max);
                     // Под ручником просим повернуть круче — это тот же смысл,
@@ -598,7 +717,7 @@ impl World {
                     let grip = (on_ground as f32) * 0.25;
                     body.add_torque(Vector::new(0.0, err * t.yaw_assist * grip, 0.0), true);
                 }
-                if t.yaw_damp > 0.0 {
+                if t.yaw_damp > 0.0 && !spinning {
                     // Гасим рыскание вокруг вертикали. Под ручником гасим
                     // заметно слабее, иначе занос не начинается вовсе.
                     let k = 1.0 - 0.75 * hb_in;
@@ -612,7 +731,7 @@ impl World {
                     // ровно то «цепкое» ощущение, которого от Rapier одного
                     // добиться не выходит. Под ручником выключено — иначе
                     // оно съедает занос быстрее, чем тот успевает начаться.
-                    let kill = v_lat * t.lateral_bite;
+                    let kill = v_lat * t.lateral_bite * grip;
                     let imp = left * (-kill * body.mass());
                     body.apply_impulse(imp, true);
                 }
@@ -660,7 +779,9 @@ impl World {
             } else {
                 0.0
             };
-            let hb = inputs[i].handbrake > 0.5;
+            // Заглушённый ввод не копит занос: у классики шаг 15 смотрит на
+            // те же обнулённые биты кнопок, что и шаги 1–13.
+            let hb = effects[i].stun <= 0.5 && inputs[i].handbrake > 0.5;
             // Третий барьер 12.15: за занос ВНЕ полотна заряд не копится.
             // Полотна модуль не знает, флаг приходит от хозяина (CarInput).
             let offtrack = inputs[i].offtrack > 0.5;
@@ -786,6 +907,15 @@ impl World {
                     qw: p.rotation.w,
                 };
             }
+        }
+
+        // 7. Дозы воздействий сгорают. Это и есть то, что делает их
+        //    безопасными: хозяин, забывший стереть своё воздействие, не
+        //    получит вечную раскрутку, а переигранный при откате тик
+        //    получит ровно ту дозу, которую хозяин выпишет заново из
+        //    своего таймера — а не ту, что осталась в памяти модуля.
+        for e in effects.iter_mut().take(n) {
+            *e = CarEffect::INIT;
         }
 
         self.tick += 1;

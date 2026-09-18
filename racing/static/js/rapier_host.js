@@ -99,6 +99,9 @@ export class RapierHost {
         if (this.x.rp_output_stride() !== abi.CarOut.SIZE) {
             throw new HostError('шаг записи вывода не совпал с раскладкой');
         }
+        if (this.x.rp_effect_floats() !== abi.CarEffect.FLOATS) {
+            throw new HostError('запись воздействия не совпала с раскладкой');
+        }
         if (this.x.rp_max_cars() !== abi.MAX_CARS) {
             throw new HostError('число машин в модуле не совпало с раскладкой');
         }
@@ -118,6 +121,8 @@ export class RapierHost {
         const a = this.abi;
         const x = this.x;
         this.inputs = new Float32Array(buffer, x.rp_inputs_ptr(), a.MAX_CARS * a.CarInput.FLOATS);
+        // Внешние воздействия (§12.25): доза на один шаг, модуль её стирает.
+        this.effects = new Float32Array(buffer, x.rp_effects_ptr(), a.MAX_CARS * a.CarEffect.FLOATS);
         this.outputs = new Float32Array(buffer, x.rp_outputs_ptr(), a.MAX_CARS * a.CarOut.FLOATS);
         this.descs = new Float32Array(buffer, x.rp_descs_ptr(), a.MAX_CARS * a.CarDesc.FLOATS);
         this.tuning = new Float32Array(buffer, x.rp_tuning_ptr(), a.CarTuning.FLOATS);
@@ -316,7 +321,12 @@ export class RapierHost {
 import {
     DRIFT_CHARGE_L1, DRIFT_CHARGE_L2, DRIFT_CHARGE_L3,
     DRIFT_BOOST_L1, DRIFT_BOOST_L2, DRIFT_BOOST_L3, BOOST_ACCEL,
+    SPIN_RATE, SLOW_FACTOR, DT,
 } from './physics.js';
+
+// Дозы воздействий на один шаг (§12.25) — считаются из тех же констант
+// раздела 6, что у классики. Сервер берёт эту же пару из game/physics.py.
+export const SPEED_DROP_SLOW = 1.0 - SLOW_FACTOR;
 
 // Те же числа, что на сервере. Расходиться им нельзя: с ними считается
 // первый тик гонки и высота над полотном.
@@ -434,8 +444,15 @@ export class RapierLocal {
 
     // --- шаг ------------------------------------------------------------
 
-    /** Один шаг по битовой маске кнопок протокола. */
-    step(buttons, btn, offtrack) {
+    /**
+     * Один шаг по битовой маске кнопок протокола.
+     *
+     * ``state`` — CarState своей машины: из него берётся флаг вне полотна и
+     * таймеры бонусов. Таймеры тикают ЗДЕСЬ, а не в модуле, потому что при
+     * откате их надо восстанавливать, а кольцо net.js их уже хранит
+     * (SF_SPIN, SF_SLOW) — то же решение, что на сервере (§12.25).
+     */
+    step(buttons, btn, state) {
         const host = this.host;
         host._sync();
         const a = this.abi.CarInput;
@@ -443,7 +460,7 @@ export class RapierLocal {
         const inputs = host.inputs;
         // Третий барьер 12.15 модулю снаружи: полотна он не знает. Флаг с
         // прошлого шага — сервер считает его той же surface() по той же позе.
-        inputs[base + a.OFFTRACK] = offtrack ? 1 : 0;
+        inputs[base + a.OFFTRACK] = state.offtrack ? 1 : 0;
         inputs[base + a.THROTTLE] = (buttons & btn.THROTTLE) ? 1 : 0;
         inputs[base + a.BRAKE] = (buttons & btn.BRAKE) ? 1 : 0;
         let steer = 0;
@@ -451,7 +468,45 @@ export class RapierLocal {
         if (buttons & btn.RIGHT) steer -= 1;
         inputs[base + a.STEER] = steer;
         inputs[base + a.HANDBRAKE] = (buttons & btn.DRIFT) ? 1 : 0;
+        this._writeEffect(state);
         host.x.rp_step(1);
+    }
+
+    /**
+     * Таймеры бонусов -> доза воздействия на этот шаг. Зеркало
+     * RapierRace._write_effect из game/rapier_host.py, строка в строку:
+     * всё, что влияет на движение, обязано считаться на обеих сторонах
+     * одинаково, а раскрутка и «Гроза» движение меняют.
+     *
+     * Буста здесь нет: его остаток держит модуль, а снапшот приносит
+     * только флаг. Продление по флагу делает applyAuthoritative — там же,
+     * где классика делает свой HOLDOVER.
+     */
+    _writeEffect(state) {
+        const host = this.host;
+        const E = this.abi.CarEffect;
+        const e = this.idx * E.FLOATS;
+        const eff = host.effects;
+
+        let spin = state.spinTime;
+        if (spin > 0) {
+            eff[e + E.SPIN_RATE] = SPIN_RATE;
+            eff[e + E.STUN] = 1;
+            eff[e + E.DRIFT_RESET] = 1;
+            spin -= DT;
+            state.spinTime = spin > 0 ? spin : 0;
+        }
+        let slow = state.slowTime;
+        if (slow > 0) {
+            eff[e + E.SPEED_DROP] = SPEED_DROP_SLOW;
+            slow -= DT;
+            state.slowTime = slow > 0 ? slow : 0;
+        }
+        let shield = state.shieldTime;
+        if (shield > 0) {
+            shield -= DT;
+            state.shieldTime = shield > 0 ? shield : 0;
+        }
     }
 
     /**
@@ -555,6 +610,13 @@ export class RapierLocal {
         saves[base + a.PZ] = state.z;
         saves[base + a.VX] = state.vx;
         saves[base + a.VZ] = state.vz;
+        // Остаток ускорения держит МОДУЛЬ, а снапшот везёт только флаг
+        // (раздел 5.3). net.js уже подтянул state.boostTime по своему
+        // HOLDOVER — тем же правилом, что у классики; здесь это число
+        // кладётся туда, где буст на самом деле живёт. Без этой строки
+        // подтяжка попадала бы в поле, которое readInto перезапишет из
+        // модуля на следующем же шаге, то есть не делала бы ничего.
+        saves[base + a.BOOST_TIME] = state.boostTime;
         host.carRestore(this.idx);
     }
 

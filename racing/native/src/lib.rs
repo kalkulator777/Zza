@@ -10,8 +10,8 @@ pub mod abi_gen;
 pub mod trackmesh;
 pub mod world;
 
-use abi::{fnv1a, CarInput, CarOut, FNV_SEED, DESCS, INPUTS, MAX_CARS, OUTPUTS, PROPS, SAVES,
-          TRACK_COLUMNS, TUNING};
+use abi::{fnv1a, CarEffect, CarInput, CarOut, FNV_SEED, DESCS, EFFECTS, INPUTS, MAX_CARS,
+          OUTPUTS, PROPS, SAVES, TRACK_COLUMNS, TUNING};
 use trackmesh::Centerline;
 use world::{CarTuning, Preset, World, DT};
 
@@ -59,6 +59,24 @@ pub extern "C" fn rp_max_cars() -> u32 {
 #[allow(static_mut_refs)]
 pub extern "C" fn rp_inputs_ptr() -> u32 {
     unsafe { INPUTS.as_ptr() as u32 }
+}
+
+/// Адрес массива внешних воздействий: MAX_CARS структур по 48 байт.
+///
+/// Хозяин кладёт сюда дозу на один шаг ПЕРЕД `rp_step`, модуль применяет её
+/// внутри шага и запись ОБНУЛЯЕТ. Правила — в описании `CarEffect`
+/// (tools/abi_layout.json). `rp_step(n)` при n > 1 применит дозу только на
+/// первом из n шагов: доза живёт один шаг, а не одну пачку.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn rp_effects_ptr() -> u32 {
+    unsafe { EFFECTS.as_ptr() as u32 }
+}
+
+/// Сколько в записи воздействия чисел f32 — чтобы хозяин не хардкодил.
+#[no_mangle]
+pub extern "C" fn rp_effect_floats() -> u32 {
+    (core::mem::size_of::<CarEffect>() / 4) as u32
 }
 
 /// Адрес массива состояний: MAX_CARS структур по 192 байта.
@@ -341,8 +359,9 @@ pub extern "C" fn rp_step(ticks: u32) -> u32 {
     unsafe {
         let inp: &[CarInput] = &INPUTS;
         let out: &mut [CarOut] = &mut OUTPUTS;
+        let eff: &mut [CarEffect] = &mut EFFECTS;
         for _ in 0..ticks {
-            world.step(inp, out);
+            world.step(inp, out, eff);
         }
     }
     world.tick as u32
