@@ -65,17 +65,36 @@ def free_port():
 
 
 class Server(object):
-    """Настоящий play.py в отдельном процессе."""
+    """Настоящий play.py в отдельном процессе.
 
-    def __init__(self, port=None):
+    env — ДОБАВКА к окружению процесса, а не замена ему. По умолчанию пусто,
+    то есть поведение ровно такое, каким было: чужие проверки, которые зовут
+    Server() без аргументов, получают тот же сервер, что и раньше.
+
+    Зачем это есть: server/ai.py читает ZZA_ENEMIES при импорте, и стенду,
+    который меряет не выживание, а что-нибудь другое (туман в кадре,
+    плавность), враги только мешают — одинокий ходок под обстрелом гибнет,
+    и красной становится исправная проверка исправной игры. Выключатель
+    стоит в сервере и ставится стендом осознанно, по одному месту на стенд.
+    """
+
+    def __init__(self, port=None, env=None):
         self.port = port or free_port()
         self.proc = None
         self.log = ""
+        self.env = dict(env) if env else {}
 
     def __enter__(self):
+        penv = None
+        if self.env:
+            penv = dict(os.environ)
+            penv.update(self.env)
+            print("  сервер:  окружение " +
+                  ", ".join("%s=%s" % kv for kv in sorted(self.env.items())))
         self.proc = subprocess.Popen(
             [sys.executable, "play.py", "--port", str(self.port), "--no-browser"],
-            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=penv)
         # ждём, пока порт начнёт отвечать (2.6: старт должен быть быстрым)
         t0 = time.time()
         while time.time() - t0 < 10:
