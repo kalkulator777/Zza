@@ -31,6 +31,7 @@
 
 import math
 
+from . import items
 from . import physics
 from . import proto
 from . import world as world_mod
@@ -130,6 +131,16 @@ def damage(w, target, amount, src=None, src_id=0):
             x=proto.r3(target.x), y=proto.r3(target.y))
     if hp == 0:
         kill(w, target, src, sid)
+        if src is not None:
+            # Жатва (8.4): лечит ДОБИВАНИЕ, а не попадание. Здесь, а не в
+            # _land_melee, ровно по тому же доводу, по которому здесь живёт
+            # сам урон: точка входа одна, и убийство снарядом, тараном или
+            # ударом лечит одинаково — без единой ветки "если это игрок".
+            # Ноль стаков даёт ноль, то есть у всех остальных это сравнение
+            # с нулём и ничего больше.
+            got = items.kill_heal(src)
+            if got:
+                items.heal(src, got)
     return amount
 
 
@@ -159,6 +170,7 @@ def reset(e):
     e.inv_end = 0
     e.shot_ready = 0
     e.shot_q = 0
+    e.dash_hit = None       # рывка нет — и задевать этим рывком уже некого
     e.flags &= ~(world_mod.F_WINDUP | world_mod.F_DASH)
 
 
@@ -193,6 +205,10 @@ def begin(w, e):
         start_melee(w, e)
     # Отдельного бита под дальний бой в 5.1 нет: 1 атака, 2 рывок, 4 действие,
     # 8 предмет. Снаряд повешен на 8 — см. правку контракта в отчёте 2a.
+    if btn & proto.BTN_ITEM:
+        # 8.4: подбор предмета. Сам подбор — в resolve: begin зовётся ИЗ
+        # цикла по словарю сущностей, а подбор его меняет.
+        items.request_pickup(w, e)
     if (btn & proto.BTN_SHOOT) and tick >= e.shot_ready:
         # Сам снаряд рождается в resolve: spawn идёт из world.step, то есть
         # ИЗНУТРИ цикла по словарю сущностей, а это RuntimeError. Откат
@@ -214,8 +230,15 @@ def start_dash(w, e):
     e.dash_dx = dx
     e.dash_dy = dy
     e.dash_end = w.tick + DASH_TICKS - 1        # включая текущий тик
-    e.inv_end = w.tick + DASH_INV_TICKS - 1
-    e.dash_ready = w.tick + DASH_CD_TICKS
+    # 8.4 «Ветер» делит откат; без апгрейда items.dash_cd вернёт ровно
+    # DASH_CD_TICKS, то есть число 4.2 остаётся числом 4.2.
+    cd = items.dash_cd(e, DASH_CD_TICKS)
+    # Неуязвимость не имеет права занять больше половины отката: иначе
+    # укороченный откат превращает уход в постоянный щит (вывод и замер — в
+    # items.DASH_INV_SHARE). Без Ветра это ровно DASH_INV_TICKS.
+    e.inv_end = w.tick + items.dash_inv(DASH_INV_TICKS, cd) - 1
+    e.dash_ready = w.tick + cd
+    e.dash_hit = None       # новый рывок — новый список задетых (Таран)
     e.flags |= world_mod.F_DASH
     w.make_noise(e.x, e.y, world_mod.NOISE_DASH, e.team)     # 8.2
     e.vx = dx * DASH_SPEED
@@ -247,9 +270,14 @@ def resolve(w, dt=DT):
     RuntimeError на изменении словаря во время итерации.
     """
     tick = w.tick
+    # 8.4: подбор предмета меняет состав мира (предмет исчезает вместе с
+    # собратьями по алтарю), поэтому он идёт ДО прохода, а не внутри него.
+    if w.pickups:
+        items.resolve_pickups(w)
     swings = None
     shots = None
     born = None
+    rams = None
     for e in w.entities.values():
         if e.kind == world_mod.K_SHOT:
             if shots is None:
@@ -265,10 +293,21 @@ def resolve(w, dt=DT):
             if born is None:
                 born = []
             born.append(e)
+        if e.dash_end and e.ups:
+            # Таран (8.4). Условие стоит двумя сравнениями с нулём: у того,
+            # кто не в рывке или ничего не собрал, дальше ничего не считается.
+            if rams is None:
+                rams = []
+            rams.append(e)
     gone = None
     if swings:
         for e in swings:
             _land_melee(w, e)
+    if rams:
+        # ПОСЛЕ движения: тело уже там, куда его привёл этот тик рывка, —
+        # значит задеты те, сквозь кого он прошёл, а не те, к кому он летел.
+        for e in rams:
+            items.dash_strike(w, e, damage)
     if shots:
         for s in shots:
             t = _shot_target(w, s)
@@ -344,7 +383,11 @@ def _make_shot(w, e):
     if physics.circle_hits(w.grid, x, y, SHOT_R):
         return None                      # ствол упёрт в стену — выстрела нет
     s = w.spawn(world_mod.K_SHOT, x, y, r=SHOT_R, team=e.team, owner=e.id,
-                dmg=SHOT_DMG, ttl=SHOT_TICKS, facing=e.facing, hp=1, hp_max=1)
+                dmg=SHOT_DMG, ttl=SHOT_TICKS, facing=e.facing, hp=1, hp_max=1,
+                # Рикошет (8.4): сколько раз этот снаряд переживёт стену.
+                # Считается при рождении, а не в полёте: апгрейд стрелявшего
+                # снаряду уже не догнать, если тот умрёт на лету.
+                bounce=items.shot_bounces(e))
     s.vx = ca * SHOT_SPEED
     s.vy = sa * SHOT_SPEED
     w.event("shot", a=e.id, b=s.id, x=proto.r3(x), y=proto.r3(y))

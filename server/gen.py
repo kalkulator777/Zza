@@ -49,6 +49,10 @@ MIN_H = 18
 
 R_PLAYER = 0.35        # тот же радиус, что в world.R_PLAYER (4.1, 4.3)
 MAX_SPAWNS = 8         # сколько точек появления готовим (room.MAX_PLAYERS)
+# Сколько мест готовим под предметы алтаря (8.4). Генератор знает только
+# «сколько мест», что на них положить — дело items.py; импортировать оттуда
+# нельзя, items читает world, а world читает gen через room.
+ALTAR_ITEMS = 3
 
 
 class Theme(object):
@@ -101,7 +105,8 @@ class Floor(object):
 
     __slots__ = ("grid", "spawns", "stairs", "rooms", "entry", "seed",
                  "floor", "theme", "repairs", "passable",
-                 "entry_room", "stairs_room", "stairs_dist")
+                 "entry_room", "stairs_room", "stairs_dist",
+                 "altar", "altar_room", "altar_slots", "altar_detour")
 
     def __init__(self, grid, spawns, stairs, rooms, entry, seed, floor, theme):
         self.grid = grid
@@ -117,6 +122,12 @@ class Floor(object):
         self.entry_room = 0         # номер стартовой комнаты в rooms
         self.stairs_room = 0        # номер комнаты с лестницей
         self.stairs_dist = -1       # длина пути от входа до лестницы, клеток
+        # алтарь (8.4): где лежит выбор этажа и во сколько клеток пути он
+        # обходится сверх дороги вниз
+        self.altar = None           # (tx,ty) — центр алтаря
+        self.altar_room = -1        # номер комнаты с алтарём
+        self.altar_slots = []       # [(x,y)] — куда класть предметы
+        self.altar_detour = -1      # крюк в клетках пути (см. _pick_altar)
 
 
 # --- карта расстояний ------------------------------------------------------
@@ -366,6 +377,111 @@ def _pick_stairs(grid, rooms, dist, entry_idx):
     return best, best_room
 
 
+# --- алтарь (8.4) ----------------------------------------------------------
+
+ALTAR_MIN_GAP = 1.5     # между предметами; ВЫВОД в _altar_slots
+
+
+def _altar_slots(grid, room, n, avoid=None):
+    """Места под предметы внутри комнаты: пол, круг игрока влезает, врозь.
+
+    ВЫВОД ALTAR_MIN_GAP: предмет берётся с items.PICK_R = 0.80 клетки. Если
+    два предмета стоят ближе 1.6, игрок может стоять в радиусе обоих сразу,
+    и «что именно я беру» становится вопросом к порядку обхода словаря, а не
+    к игроку. 1.5 — тот же смысл с поправкой на то, что комната бывает 4
+    клетки стороной и трём предметам в ней надо поместиться.
+
+    Порядок перебора фиксирован (по клеткам комнаты, сверху вниз), поэтому
+    один сид даёт те же места — детерминизм 8.7.
+    """
+    cx, cy = _center(room)
+    cand = []
+    for ty in range(room[1], room[3] + 1):
+        for tx in range(room[0], room[2] + 1):
+            if grid.tiles[ty * grid.w + tx] != TILE_FLOOR:
+                continue          # в том числе лестница: на ней предмету не место
+            if avoid is not None and (tx, ty) in avoid:
+                continue
+            x = tx + 0.5
+            y = ty + 0.5
+            if physics.circle_hits(grid, x, y, R_PLAYER):
+                continue          # к предмету надо суметь подойти
+            d = abs(tx - cx) + abs(ty - cy)
+            cand.append((d, ty, tx, x, y))
+    cand.sort()
+    out = []
+    for _, _, _, x, y in cand:
+        if len(out) >= n:
+            break
+        if any(abs(x - ox) < ALTAR_MIN_GAP and abs(y - oy) < ALTAR_MIN_GAP
+               for ox, oy in out):
+            continue
+        out.append((x, y))
+    return out
+
+
+def _pick_altar(grid, rooms, dist, dist_st, entry_idx, stairs_room, base, n):
+    """Комната алтаря — та, что дороже всего обходится с дороги вниз.
+
+    КРЮК = путь(вход -> алтарь) + путь(алтарь -> лестница) - путь(вход ->
+    лестница). Это ровно те лишние клетки, которые группа пробежит в темноте
+    мимо врагов, если пойдёт за апгрейдом. Ноль означает «алтарь и так по
+    дороге», то есть подарок; поэтому берётся МАКСИМУМ, и поэтому комната
+    лестницы и стартовая исключены — там крюк нулевой по построению.
+
+    Выбор идёт по НАСТОЯЩЕМУ пути (карта расстояний), а не по прямой: иначе
+    «дальняя» комната могла бы оказаться за стеной в двух шагах.
+
+    ПОТОЛОК КРЮКА — САМА ДОРОГА ВНИЗ (base). Просто «самая дальняя комната»
+    не годится: на настоящем этаже 64x48 это даёт крюк 132 клетки при пути
+    вниз 86, то есть за апгрейд надо пройти этаж ещё дважды. Такую цену не
+    платят никогда, а апгрейд, за которым не ходят, — это отсутствующий
+    апгрейд. Поэтому берётся САМЫЙ ДАЛЬНИЙ ИЗ ТЕХ, ЧЕЙ КРЮК НЕ БОЛЬШЕ base:
+    «сходить за предметом = пройти этот этаж ещё раз, максимум». Если таких
+    нет вовсе (бывает на мелких картах), берётся ближайший — цена меньше
+    обещанной не ломает ничего, цена больше обещанной ломает выбор.
+    """
+    w = grid.w
+    best = -1
+    best_detour = -1
+    fallback = -1
+    fallback_detour = -1
+    for i, r in enumerate(rooms):
+        if i == entry_idx or i == stairs_room:
+            continue
+        cx, cy = _center(r)
+        j = cy * w + cx
+        de = dist[j]
+        ds = dist_st[j]
+        if de < 0 or ds < 0:
+            continue
+        detour = de + ds - base
+        if detour <= base:
+            if detour > best_detour:
+                best_detour = detour
+                best = i
+        elif fallback < 0 or detour < fallback_detour:
+            fallback_detour = detour
+            fallback = i
+    if best < 0 and fallback >= 0:
+        best = fallback
+        best_detour = fallback_detour
+    if best < 0:
+        # комнат всего две (стартовая и с лестницей) — такой этаж генератор
+        # на 64x48 не делает, но на минимальной карте 24x18 может. Тогда
+        # алтарь идёт в комнату лестницы: крюк нулевой, зато выбор есть.
+        if stairs_room != entry_idx:
+            best = stairs_room
+            best_detour = 0
+        else:
+            return None, -1, [], -1
+    slots = _altar_slots(grid, rooms[best], n)
+    if not slots:
+        return None, -1, [], -1
+    cx, cy = _center(rooms[best])
+    return (cx, cy), best, slots, best_detour
+
+
 # --- сторож связности ------------------------------------------------------
 
 def _repair(grid, dist, entry):
@@ -458,7 +574,25 @@ def generate(seed=1, floor=1, w=ROOM_W, h=ROOM_H, theme=DEFAULT_THEME):
 
     spawns = _spawn_points(grid, rooms[entry_idx], MAX_SPAWNS)
 
+    # алтарь (8.4). Вторая карта расстояний — от лестницы: без неё «крюк»
+    # посчитать нечем, а крюк и есть цена апгрейда. Стоит она столько же,
+    # сколько первая (замер — tests/items_check.py, раздел «генератор»), и
+    # платится РАЗ НА ЭТАЖ, в тике её нет.
+    altar = altar_room = None
+    altar_slots = []
+    altar_detour = -1
+    if stairs is not None:
+        dist_st = distance_map(grid, [stairs])
+        base = dist[stairs[1] * w + stairs[0]]
+        altar, altar_room, altar_slots, altar_detour = _pick_altar(
+            grid, rooms, dist, dist_st, entry_idx, stairs_room, base,
+            ALTAR_ITEMS)
+
     fl = Floor(grid, spawns, stairs, rooms, entry, int(seed), int(floor), th.name)
+    fl.altar = altar
+    fl.altar_room = altar_room if altar_room is not None else -1
+    fl.altar_slots = altar_slots
+    fl.altar_detour = altar_detour
     fl.repairs = fl_repairs
     fl.entry_room = entry_idx
     fl.stairs_room = stairs_room
