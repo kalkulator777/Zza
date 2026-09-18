@@ -104,6 +104,20 @@ class Player(object):
         self.conn.send_str(text)
 
 
+# --- голова полного снапшота: ack И you свои у каждого игрока -------------
+# DESIGN.md 5.2 требует "you" (id своей сущности) в каждом снапшоте с
+# full:true. 4.4 требует сериализовать снапшот один раз на комнату — та же
+# коллизия, что уже решена для ack (proto.snap_with_ack): тяжёлый хвост
+# (tick, e, vis) готовится один раз в w.snapshot_full(), а лёгкая голова
+# клеится строкой отдельно на каждого игрока. you — лишь ещё одно поле в
+# этой голове, поэтому за пределы приёма proto.py не выходим: голова и так
+# уже собирается здесь, в room.py, вызовом proto.snap_with_ack. На дельтах
+# you не шлём — контракт требует его только при full:true, а хвост дельты и
+# так общий на комнату и не должен меняться ради поля, которое ему не нужно.
+def _snap_full_with_you(tail, ack, you):
+    return '{"t":"snap","ack":%d,"you":%d,%s' % (ack, you, tail)
+
+
 class Room(object):
     def __init__(self, code, settings=None, seed=None):
         self.code = code
@@ -301,7 +315,7 @@ class Room(object):
                 if full_tail is None:
                     full_tail = w.snapshot_full(remember=False)
                 p.needs_full = False
-                p.send(proto.snap_with_ack(full_tail, p.ack))
+                p.send(_snap_full_with_you(full_tail, p.ack, p.ent_id))
             else:
                 p.send(proto.snap_with_ack(tail, p.ack))
 
@@ -346,9 +360,10 @@ class Rooms(object):
         return self.create()
 
     def listing(self):
-        # форма ровно как в 5.2. Поле фазы сюда напрашивается (искать надо
-        # лобби, а не идущие партии), но это протокол лобби — этап 5.
-        return [{"id": r.code, "players": r.count_online(), "floor": r.floor}
+        # форма ровно как в 5.2: без phase нельзя отличить лобби от чужой
+        # партии посередине — а это ровно то, зачем список нужен.
+        return [{"id": r.code, "players": r.count_online(), "floor": r.floor,
+                 "phase": r.phase}
                 for r in self.rooms.values()]
 
     def housekeep(self, now):

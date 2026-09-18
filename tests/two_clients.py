@@ -20,6 +20,7 @@ import math
 import os
 import socket
 import sys
+import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "vendor"))
@@ -28,7 +29,7 @@ sys.path.insert(0, ROOT)
 from tornado.httpserver import HTTPServer          # noqa: E402
 from tornado.websocket import websocket_connect    # noqa: E402
 
-from server import proto, room as room_mod, world as world_mod  # noqa: E402
+from server import gen, physics, proto, room as room_mod, world as world_mod  # noqa: E402
 from server.app import make_app                    # noqa: E402
 from server.room import Rooms                      # noqa: E402
 
@@ -37,6 +38,40 @@ SPEED = world_mod.SPEED_RUN
 HZ = world_mod.TICK_HZ
 
 FAILS = []
+
+
+# --- своя маленькая карта для физических проверок (DESIGN.md 10.4) --------
+# Проверки упора в стену/скольжения/скорости были зашиты под старую карту-
+# заглушку и обрушились, когда этап 1 поставил настоящий BSP-генератор
+# (gen.py): игрок упирается в стену раньше и в другом месте, числа
+# разъехались. Чинить подгонкой чисел под новый генератор — повторить ту же
+# ошибку с другим сроком годности.
+#
+# Вместо этого подменяем gen.generate(): сеть, комната, мир, тик — самые
+# настоящие (весь протокол проверяется как есть), а карта — наша
+# собственная physics.Grid: простой открытый зал в кольце стен. Числа
+# физики (граница стены, свободный ход) теперь считаются по ЭТОЙ карте, а
+# не по тому, что в этот раз насыпал генератор, и не зависят от сида этажа
+# вовсе — см. tests/vis_check.py:test_walls_block(), тот же приём.
+TEST_MAP_W, TEST_MAP_H = 40, 40
+SPAWN_A = (5.5, 4.0)     # рядом с западной стеной — для упора и скольжения
+SPAWN_B = (25.5, 4.0)    # просто другая точка появления, подальше от A
+
+
+def _test_floor(*_args, **_kwargs):
+    """Подмена gen.generate(): фиксированный зал вместо генератора.
+
+    room.py читает у результата только .grid/.spawns/.stairs — этого
+    достаточно, полный Floor (rooms, entry, ...) собирать незачем.
+    """
+    g = physics.Grid(TEST_MAP_W, TEST_MAP_H)
+    for y in range(1, TEST_MAP_H - 1):
+        for x in range(1, TEST_MAP_W - 1):
+            g.set(x, y, physics.TILE_FLOOR)
+    return types.SimpleNamespace(grid=g, spawns=[SPAWN_A, SPAWN_B], stairs=None)
+
+
+gen.generate = _test_floor
 
 
 def check(ok, title, detail=""):
