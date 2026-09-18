@@ -30,7 +30,10 @@ let ws = null, pid = 0, seq = 0, snaps = 0, bytes = 0;
 document.getElementById('go').onclick = () => {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.onopen = () => { log('открыто'); ws.send(JSON.stringify({t:'hello', name:'проверка', ver:1}));
-                      ws.send(JSON.stringify({t:'join', room:''})); };
+                      ws.send(JSON.stringify({t:'join', room:''}));
+                      // комната рождается в лобби и без мира; на 0a игру
+                      // начинает готовность. Лобби-протокол — этап 5.
+                      ws.send(JSON.stringify({t:'ready', v:true})); };
   ws.onclose = () => log('закрыто');
   ws.onerror = (e) => log('ошибка сокета');
   ws.onmessage = (e) => {
@@ -42,8 +45,8 @@ document.getElementById('go').onclick = () => {
             (me ? (', я в ' + me[2].toFixed(2) + ',' + me[3].toFixed(2)) : '')); }
       return; }
     if (m.t === 'welcome') pid = m.pid;
-    if (m.t === 'joined') { pid = m.pid; log('комната ' + m.room + ', я pid ' + m.pid); return; }
-    if (m.t === 'level') { log('этаж ' + m.floor + ', карта ' + m.w + 'x' + m.h); return; }
+    if (m.t === 'joined') { pid = m.pid; log('комната ' + m.room + ', я pid ' + m.pid + ' (лобби)'); return; }
+    if (m.t === 'level') { log('игра пошла: этаж ' + m.floor + ', карта ' + m.w + 'x' + m.h); return; }
     log(e.data.slice(0, 200));
   };
 };

@@ -88,11 +88,14 @@ class GameSocket(tornado.websocket.WebSocketHandler):
         return True          # игра для локалки, ходят по IP
 
     def get_compression_options(self):
-        # permessage-deflate жмёт снапшот ~в 4 раза, но контекст сжатия
-        # у каждого соединения свой, то есть CPU умножается на число
-        # игроков — ровно то, чего избегает 4.4. Включать только вместе
-        # с замером тика. Сейчас выключено: return {} чтобы включить.
-        return None
+        # permessage-deflate. Без него снапшот на 206 сущностей даёт
+        # 263 КБ/с против бюджета 2.3 в 200 КБ/с — то есть мимо. С уровнем 1
+        # тот же снапшот весит 3238 байт = 95 КБ/с, а стоит 0.05 мс на
+        # сообщение; контекст сжатия у каждого соединения свой, значит
+        # 6 игроков = 0.3 мс к тику при бюджете 12 мс (2.2). Числа — из
+        # tests/bench_tick.py. Уровень 6 дал бы 86 КБ/с за 1.3 мс: дороже
+        # вчетверо ради 9 КБ/с, не берём.
+        return {"compression_level": 1, "mem_level": 7}
 
     def open(self):
         self.set_nodelay(True)
@@ -124,6 +127,10 @@ class GameSocket(tornado.websocket.WebSocketHandler):
             self.do_join(m)
         elif t == "ready":
             p.ready = m["v"]
+            if p.room is not None:
+                # на 0a готовность — единственный способ начать игру:
+                # протокол лобби (кнопка «старт» у хозяина) это этап 5.
+                p.room.maybe_start()
         elif t == "input":
             p.pending = m
         elif t == "ping":
@@ -141,6 +148,8 @@ class GameSocket(tornado.websocket.WebSocketHandler):
             self.send_str(proto.error("full", "комната заполнена"))
             return
         self.player = used       # при переподключении это прежний игрок
+        # в лобби мира ещё нет, и send_level честно ничего не пришлёт;
+        # вошедшему в идущую партию уровень уходит сразу
         r.send_level(self.player)
 
     def on_close(self):
@@ -158,5 +167,4 @@ def make_app(rooms):
         (r"/download", DownloadHandler),
         (r"/static/(.*)", NoCacheStatic, {"path": STATIC_DIR}),
         (r"/vendor/(.*)", NoCacheStatic, {"path": VENDOR_DIR}),
-    ], websocket_max_message_size=MAX_WS_MESSAGE, websocket_ping_interval=20,
-       websocket_ping_timeout=60)
+    ], websocket_max_message_size=MAX_WS_MESSAGE, websocket_ping_interval=20)
