@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Zza bench — three.js</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<style>
+  html,body{margin:0;padding:0;background:#05070c;overflow:hidden;height:100%}
+  #c{display:block;background:#05070c}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+
+<!--
+  common.js — обычный скрипт (не модуль), подключается классическим
+  <script src>, поэтому грузится и через file://, и через http. Он кладёт
+  всё в window.ZBench, которым ниже пользуется модульный скрипт.
+
+  Сам three.js — ES-модуль (vendor/three.module.min.js + его обязательный
+  напарник vendor/three.core.min.js, см. README про то, почему для этой
+  страницы всё-таки нужен локальный http-сервер: Chromium запрещает
+  `type="module"` из file:// по CORS, а не потому что стенду нужна сеть).
+-->
+<script src="common.js"></script>
+<script type="module">
+import * as THREE from '../vendor/three.module.min.js';
+
+(function () {
+  'use strict';
+  var ZB = window.ZBench;
+  var params = ZB.parseQuery({ n: 200, q: 'low', tile: 48, width: 1920, height: 1080, seed: 12345 });
+
+  var canvas = document.getElementById('c');
+  var hud = ZB.createHud(document.getElementById('hud'), { n: params.n, q: params.q, backend: 'three.js' });
+
+  // ---------- мир: та же карта/сущности, что у bench2d.html (тот же seed) ----------
+  var rng = ZB.mulberry32(params.seed);
+  var map = ZB.generateMap(ZB.MAP_W, ZB.MAP_H, rng);
+  var entities = ZB.createEntities(params.n, map, rng);
+  var viewTilesW = params.width / params.tile;
+  var viewTilesH = params.height / params.tile;
+
+  // ---------- renderer ----------
+  var renderer = new THREE.WebGLRenderer({
+    canvas: canvas,
+    antialias: params.q === 'high',
+    powerPreference: 'high-performance',
+    alpha: false,
+  });
+  // pixelRatio принудительно 1: иначе на HiDPI-экране реальный размер
+  // фреймбуфера окажется в 4 раза больше, чем заявленное разрешение, и
+  // число fps будет не про 1920×1080, а про что-то другое (см. README).
+  renderer.setPixelRatio(1);
+  renderer.setSize(params.width, params.height, true);
+  renderer.setClearColor(0x05070c, 1);
+  renderer.shadowMap.enabled = params.q === 'high';
+  renderer.shadowMap.type = THREE.PCFShadowMap;
+  renderer.info.autoReset = true;
+
+  var gl = renderer.getContext();
+  var gpuInfo = ZB.getGpuInfo(gl);
+
+  var scene = new THREE.Scene();
+  // Затемнение по краям — туман, а не по-кадровый шейдер/postprocessing:
+  // считается GPU нативно и бесплатно, доп. draw call не стоит.
+  scene.fog = new THREE.Fog(0x05070c, params.tile > 0 ? 6 : 6, 26);
+
+  // Ортографическая камера под углом — не перспектива (см. DESIGN 7.3).
+  var aspect = params.width / params.height;
+  var viewSize = viewTilesH * 0.62;
+  var camera = new THREE.OrthographicCamera(
+    -viewSize * aspect / 2, viewSize * aspect / 2,
+    viewSize / 2, -viewSize / 2,
+    0.1, 100
+  );
+  var elevation = THREE.MathUtils.degToRad(55);
+  var azimuth = THREE.MathUtils.degToRad(40);
+  var camDist = 20;
+  var camOffset = new THREE.Vector3(
+    Math.cos(elevation) * Math.sin(azimuth),
+    Math.sin(elevation),
+    Math.cos(elevation) * Math.cos(azimuth)
+  ).multiplyScalar(camDist);
+
+  // ---------- свет ----------
+  // low: только ambient/hemisphere — «свет запечён», никакой динамики на
+  //      пиксель сверх дешёвого hemi-градиента; тени выключены.
+  // high: + направленный свет с тенями (единственная галочка «high»).
+  var hemi = new THREE.HemisphereLight(0x8fb0ff, 0x151018, 0.9);
+  scene.add(hemi);
+  var ambient = new THREE.AmbientLight(0x404050, params.q === 'high' ? 0.4 : 0.9);
+  scene.add(ambient);
+
+  var sun = null;
+  if (params.q === 'high') {
+    sun = new THREE.DirectionalLight(0xfff2d8, 1.1);
+    sun.position.set(10, 16, 6);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(1024, 1024);
+    sun.shadow.camera.left = -20;
+    sun.shadow.camera.right = 20;
+    sun.shadow.camera.top = 20;
+    sun.shadow.camera.bottom = -20;
+    sun.shadow.camera.far = 60;
+    scene.add(sun);
+    scene.add(sun.target);
+  }
+
+  // Факел игрока: в high — настоящий PointLight; в low — дешёвый
+  // билборд-спрайт (аддитивная текстура), без per-pixel освещения сцены.
+  var torchLight = null;
+  if (params.q === 'high') {
+    torchLight = new THREE.PointLight(0xffb060, 2.2, 9, 2);
+    torchLight.position.set(0, 1.2, 0);
+    scene.add(torchLight);
+  }
+  var torchSprite = (function () {
+    var c = document.createElement('canvas');
+    c.width = c.height = 128;
+    var cx = c.getContext('2d');
+    var g = cx.createRadialGradient(64, 64, 4, 64, 64, 64);
+    g.addColorStop(0, 'rgba(255,200,120,0.9)');
+    g.addColorStop(1, 'rgba(255,140,60,0)');
+    cx.fillStyle = g;
+    cx.fillRect(0, 0, 128, 128);
+    var tex = new THREE.CanvasTexture(c);
+    var mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
+    var spr = new THREE.Sprite(mat);
+    spr.scale.set(6, 6, 1);
+    spr.position.y = 1.0;
+    scene.add(spr);
+    return spr;
+  })();
+
+  // ---------- тайлы: один InstancedMesh на тип (обязательный приём 7.3) ----------
+  var TILE_HEIGHT = {};
+  TILE_HEIGHT[ZB.TILE.FLOOR] = 0.08;
+  TILE_HEIGHT[ZB.TILE.FLOOR_ALT] = 0.08;
+  TILE_HEIGHT[ZB.TILE.WALL] = 1.6;
+  TILE_HEIGHT[ZB.TILE.PILLAR] = 2.0;
+  var TILE_COLOR = {};
+  TILE_COLOR[ZB.TILE.FLOOR] = 0x2a3142;
+  TILE_COLOR[ZB.TILE.FLOOR_ALT] = 0x323a5c;
+  TILE_COLOR[ZB.TILE.WALL] = 0x5a6478;
+  TILE_COLOR[ZB.TILE.PILLAR] = 0x6d5a80;
+
+  function makeMaterial(color) {
+    return params.q === 'high'
+      ? new THREE.MeshStandardMaterial({ color: color, roughness: 0.9, metalness: 0.03 })
+      : new THREE.MeshBasicMaterial({ color: color, fog: true });
+  }
+
+  var tileGeoCache = {};
+  function tileGeometry(h) {
+    if (!tileGeoCache[h]) tileGeoCache[h] = new THREE.BoxGeometry(1, h, 1);
+    return tileGeoCache[h];
+  }
+
+  var tileGroups = [ZB.TILE.FLOOR, ZB.TILE.FLOOR_ALT, ZB.TILE.WALL, ZB.TILE.PILLAR].map(function (type) {
+    var count = 0;
+    for (var i = 0; i < map.tiles.length; i++) if (map.tiles[i] === type) count++;
+    if (!count) return null;
+    var h = TILE_HEIGHT[type];
+    var mesh = new THREE.InstancedMesh(tileGeometry(h), makeMaterial(TILE_COLOR[type]), count);
+    mesh.castShadow = params.q === 'high' && (type === ZB.TILE.WALL || type === ZB.TILE.PILLAR);
+    mesh.receiveShadow = params.q === 'high';
+    var m4 = new THREE.Matrix4();
+    var idx = 0;
+    for (var y = 0; y < map.h; y++) {
+      for (var x = 0; x < map.w; x++) {
+        if (map.tiles[y * map.w + x] !== type) continue;
+        m4.makeTranslation(x + 0.5, h / 2, y + 0.5);
+        mesh.setMatrixAt(idx++, m4);
+      }
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    scene.add(mesh);
+    return mesh;
+  });
+
+  // ---------- сущности: один InstancedMesh на тип (kind) ----------
+  var kindCounts = ZB.KINDS.map(function () { return 0; });
+  for (var ei = 0; ei < entities.length; ei++) kindCounts[entities[ei].kind]++;
+
+  var entMeshes = ZB.KINDS.map(function (k, ki) {
+    var count = kindCounts[ki];
+    if (!count) return null;
+    var geo = new THREE.CylinderGeometry(k.size, k.size * 1.15, k.height, 7);
+    var mesh = new THREE.InstancedMesh(geo, makeMaterial(k.color), count);
+    mesh.castShadow = params.q === 'high';
+    mesh.receiveShadow = false;
+    scene.add(mesh);
+    return mesh;
+  });
+
+  var m4 = new THREE.Matrix4();
+  var q4 = new THREE.Quaternion();
+  var upAxis = new THREE.Vector3(0, 1, 0);
+  var scaleOne = new THREE.Vector3(1, 1, 1);
+  function updateEntityInstances() {
+    var slot = ZB.KINDS.map(function () { return 0; });
+    for (var i = 0; i < entities.length; i++) {
+      var e = entities[i];
+      var mesh = entMeshes[e.kind];
+      if (!mesh) continue;
+      var k = ZB.KINDS[e.kind];
+      q4.setFromAxisAngle(upAxis, -e.facing);
+      m4.compose(new THREE.Vector3(e.x + 0.5, k.height / 2, e.y + 0.5), q4, scaleOne);
+      mesh.setMatrixAt(slot[e.kind]++, m4);
+    }
+    for (var mi = 0; mi < entMeshes.length; mi++) {
+      if (entMeshes[mi]) entMeshes[mi].instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  // ---------- игрок ----------
+  var playerMesh = new THREE.Mesh(
+    new THREE.ConeGeometry(0.35, 0.9, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffe27a })
+  );
+  scene.add(playerMesh);
+
+  // ---------- главный цикл ----------
+  var stats = new ZB.FrameStats(180);
+  // См. пояснение в bench2d.html: dt (rAF-to-rAF) упирается в vsync,
+  // workStats меряет чистую CPU+submit-стоимость кадра — это `ms` из 7.1.
+  var workStats = new ZB.FrameStats(180);
+  var runCtl = ZB.createRunController(hud, 20000);
+  runCtl.onDone(function (runStats) {
+    hud.report.value = ZB.buildReport({
+      backend: 'three.js r' + THREE.REVISION, quality: params.q, n: params.n, tile: params.tile,
+      width: params.width, height: params.height,
+      drawCalls: lastDrawCalls, stats: runStats, gpu: gpuInfo,
+      workMedian: workStats.median(), workP99: workStats.p99(),
+    });
+  });
+
+  var t = 0;
+  var last = performance.now();
+  var frames = 0;
+  var lastDrawCalls = 0;
+
+  window.__bench = { frames: 0, ready: true, median: 0, p99: 0, workMedian: 0, workP99: 0, drawCalls: 0, error: null, gpu: gpuInfo };
+
+  function frame(now) {
+    var dt = Math.min(250, now - last);
+    last = now;
+    t += dt / 1000;
+    frames++;
+    var workStart = performance.now();
+
+    var p = ZB.playerPath(t, map);
+    ZB.stepEntities(entities, map, Math.min(0.1, dt / 1000), rng);
+    updateEntityInstances();
+
+    playerMesh.position.set(p.x + 0.5, 0.45, p.y + 0.5);
+    torchSprite.position.set(p.x + 0.5, 1.0, p.y + 0.5);
+    if (torchLight) torchLight.position.set(p.x + 0.5, 1.2, p.y + 0.5);
+    if (sun) {
+      sun.position.set(p.x + 10, 16, p.y + 6);
+      sun.target.position.set(p.x + 0.5, 0, p.y + 0.5);
+    }
+
+    var target = new THREE.Vector3(p.x + 0.5, 0, p.y + 0.5);
+    camera.position.copy(target).add(camOffset);
+    camera.lookAt(target);
+    scene.fog.color.setHex(0x05070c);
+
+    renderer.render(scene, camera);
+    lastDrawCalls = renderer.info.render.calls;
+
+    var workMs = performance.now() - workStart;
+    workStats.push(workMs);
+
+    stats.push(dt);
+    runCtl.push(dt);
+
+    var fitMismatch = window.innerWidth !== params.width || window.innerHeight !== params.height;
+    ZB.updateHudLive(hud, {
+      fps: stats.fps(), median: stats.median(), p99: stats.p99(),
+      ents: params.n, drawCalls: lastDrawCalls, width: params.width, height: params.height,
+      quality: params.q, fitMismatch: fitMismatch, workMs: workStats.median(),
+    });
+
+    window.__bench.frames = frames;
+    window.__bench.median = stats.median();
+    window.__bench.p99 = stats.p99();
+    window.__bench.workMedian = workStats.median();
+    window.__bench.workP99 = workStats.p99();
+    window.__bench.drawCalls = lastDrawCalls;
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  if (params.auto) {
+    setTimeout(function () { hud.runBtn.click(); }, 50);
+  }
+})();
+</script>
+</body>
+</html>

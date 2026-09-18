@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Zza bench — Canvas2D</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<style>
+  html,body{margin:0;padding:0;background:#05070c;overflow:hidden;height:100%}
+  #c{display:block;background:#05070c}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+
+<!-- Обычный (не module) скрипт — работает и через file://, и через http. -->
+<script src="common.js"></script>
+<script>
+(function () {
+  'use strict';
+  var ZB = window.ZBench;
+  var params = ZB.parseQuery({ n: 200, q: 'low', tile: 48, width: 1920, height: 1080, seed: 12345 });
+
+  var canvas = document.getElementById('c');
+  canvas.width = params.width;
+  canvas.height = params.height;
+  canvas.style.width = params.width + 'px';
+  canvas.style.height = params.height + 'px';
+  var ctx = canvas.getContext('2d', { alpha: false });
+
+  var hud = ZB.createHud(document.getElementById('hud'), { n: params.n, q: params.q, backend: 'Canvas2D' });
+
+  // ---------- мир ----------
+  var rng = ZB.mulberry32(params.seed);
+  var map = ZB.generateMap(ZB.MAP_W, ZB.MAP_H, rng);
+  var entities = ZB.createEntities(params.n, map, rng);
+
+  // ---------- статический слой тайлов: offscreen-канва, блит одним вызовом ----------
+  // Обязательный приём из DESIGN.md 7.2: карта рисуется в offscreen ОДИН РАЗ,
+  // а каждый кадр — только drawImage с исходным прямоугольником = вид камеры.
+  var TILE_COLORS = {};
+  TILE_COLORS[ZB.TILE.FLOOR] = '#23293a';
+  TILE_COLORS[ZB.TILE.FLOOR_ALT] = '#2b3350';
+  TILE_COLORS[ZB.TILE.WALL] = '#4a5266';
+  TILE_COLORS[ZB.TILE.PILLAR] = '#5a4a66';
+
+  var tilePx = params.tile;
+  var staticCanvas = document.createElement('canvas');
+  staticCanvas.width = map.w * tilePx;
+  staticCanvas.height = map.h * tilePx;
+  (function paintStaticLayer() {
+    var sctx = staticCanvas.getContext('2d', { alpha: false });
+    sctx.fillStyle = '#111520';
+    sctx.fillRect(0, 0, staticCanvas.width, staticCanvas.height);
+    for (var y = 0; y < map.h; y++) {
+      for (var x = 0; x < map.w; x++) {
+        var t = map.tiles[y * map.w + x];
+        sctx.fillStyle = TILE_COLORS[t];
+        sctx.fillRect(x * tilePx, y * tilePx, tilePx, tilePx);
+        if (t === ZB.TILE.WALL || t === ZB.TILE.PILLAR) {
+          // фальшивый вертикальный выступ стены — тоже рисуется один раз
+          sctx.fillStyle = 'rgba(0,0,0,0.35)';
+          sctx.fillRect(x * tilePx, y * tilePx - tilePx * 0.4, tilePx, tilePx * 0.4);
+          sctx.fillStyle = t === ZB.TILE.WALL ? '#616a80' : '#6d5a80';
+          sctx.fillRect(x * tilePx, y * tilePx - tilePx * 0.42, tilePx, tilePx * 0.08);
+        } else {
+          sctx.strokeStyle = 'rgba(0,0,0,0.15)';
+          sctx.strokeRect(x * tilePx + 0.5, y * tilePx + 0.5, tilePx - 1, tilePx - 1);
+        }
+      }
+    }
+  })();
+
+  // ---------- затемнение по краям + свет факела: тоже ПРЕДРАСЧЁТ, не per-frame ----------
+  // Оверлей центрирован на экране (камера всегда держит игрока в центре),
+  // поэтому один и тот же оверлей просто блитится каждый кадр — без
+  // createRadialGradient, shadowBlur и filter в горячем пути (правило 7.2).
+  var vignette = document.createElement('canvas');
+  vignette.width = params.width;
+  vignette.height = params.height;
+  (function paintVignette() {
+    var vctx = vignette.getContext('2d');
+    var cx = params.width / 2, cy = params.height / 2;
+    var torchR = Math.min(params.width, params.height) * 0.34;
+    var edgeR = Math.max(params.width, params.height) * 0.75;
+    var g = vctx.createRadialGradient(cx, cy, torchR * 0.15, cx, cy, edgeR);
+    g.addColorStop(0, 'rgba(40,26,0,0)');
+    g.addColorStop(0.35, 'rgba(10,8,4,0.15)');
+    g.addColorStop(1, 'rgba(0,0,0,0.86)');
+    vctx.fillStyle = g;
+    vctx.fillRect(0, 0, params.width, params.height);
+  })();
+
+  // ---------- HUD: цвет по типу сущности, размер по типу ----------
+  function drawEntity(e, sx, sy) {
+    var k = ZB.KINDS[e.kind];
+    var r = k.size * tilePx;
+    // тень эллипсом — БЕЗ shadowBlur, просто плоский полупрозрачный эллипс
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.beginPath();
+    ctx.ellipse(sx, sy + r * 0.7, r * 0.9, r * 0.4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    drawCalls++;
+
+    ctx.fillStyle = k.css;
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, Math.PI * 2);
+    ctx.fill();
+    drawCalls++;
+
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = Math.max(1, r * 0.18);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + Math.cos(e.facing) * r * 1.4, sy + Math.sin(e.facing) * r * 1.4);
+    ctx.stroke();
+    drawCalls++;
+  }
+
+  // ---------- q=high: демонстрация ЗАПРЕЩЁННЫХ в горячем пути приёмов ----------
+  // Единственная галочка «high»: живой перерасчёт градиента факела +
+  // shadowBlur-свечение вокруг сущностей каждый кадр — чтобы было видно,
+  // сколько это стоит, а не просто декларировать запрет.
+  function drawHighQualityExtras(px, py, cx, cy) {
+    ctx.save();
+    var g = ctx.createRadialGradient(cx, cy, 6, cx, cy, tilePx * 5);
+    g.addColorStop(0, 'rgba(255,200,120,0.35)');
+    g.addColorStop(1, 'rgba(255,200,120,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, tilePx * 5, 0, Math.PI * 2);
+    ctx.fill();
+    drawCalls++;
+
+    ctx.shadowColor = 'rgba(120,200,255,0.9)';
+    ctx.shadowBlur = 14;
+    for (var i = 0; i < entities.length; i += 5) {
+      var e = entities[i];
+      var sx = (e.x - camX) * tilePx, sy = (e.y - camY) * tilePx;
+      if (sx < -40 || sy < -40 || sx > params.width + 40 || sy > params.height + 40) continue;
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.beginPath();
+      ctx.arc(sx, sy, 3, 0, Math.PI * 2);
+      ctx.fill();
+      drawCalls++;
+    }
+    ctx.restore();
+  }
+
+  // ---------- камера ----------
+  var viewTilesW = params.width / tilePx;
+  var viewTilesH = params.height / tilePx;
+  var camX = 0, camY = 0;
+  var drawCalls = 0;
+
+  function updateCamera(px, py) {
+    camX = px - viewTilesW / 2;
+    camY = py - viewTilesH / 2;
+    camX = Math.max(0, Math.min(map.w - viewTilesW, camX));
+    camY = Math.max(0, Math.min(map.h - viewTilesH, camY));
+  }
+
+  // ---------- главный цикл ----------
+  var stats = new ZB.FrameStats(180);
+  var runCtl = ZB.createRunController(hud, 20000);
+  runCtl.onDone(function (runStats) {
+    hud.report.value = ZB.buildReport({
+      backend: 'Canvas2D', quality: params.q, n: params.n, tile: tilePx,
+      width: params.width, height: params.height,
+      drawCalls: drawCalls, stats: runStats, gpu: null,
+      workMedian: workStats.median(), workP99: workStats.p99(),
+    });
+  });
+
+  var t = 0;
+  var last = performance.now();
+  var frames = 0;
+  // Отдельно от dt (интервал rAF, который на быстрой сцене упирается в
+  // vsync монитора и перестаёт расти) меряем ЧИСТОЕ время работы кадра —
+  // это и есть `ms` из интерфейса 7.1 stats(), и именно оно чувствительно
+  // к n даже когда экранный fps уже потолок монитора.
+  var workStats = new ZB.FrameStats(180);
+
+  window.__bench = { frames: 0, ready: true, median: 0, p99: 0, workMedian: 0, workP99: 0, drawCalls: 0, error: null };
+
+  function frame(now) {
+    var dt = Math.min(250, now - last);
+    last = now;
+    t += dt / 1000;
+    frames++;
+
+    var workStart = performance.now();
+    drawCalls = 0;
+
+    var p = ZB.playerPath(t, map);
+    updateCamera(p.x, p.y);
+    ZB.stepEntities(entities, map, Math.min(0.1, dt / 1000), rng);
+
+    // 1) статический слой карты — один drawImage
+    var sx = camX * tilePx, sy = camY * tilePx;
+    ctx.drawImage(staticCanvas, sx, sy, params.width, params.height, 0, 0, params.width, params.height);
+    drawCalls++;
+
+    // 2) сущности
+    for (var i = 0; i < entities.length; i++) {
+      var e = entities[i];
+      var ssx = (e.x - camX) * tilePx, ssy = (e.y - camY) * tilePx;
+      if (ssx < -60 || ssy < -60 || ssx > params.width + 60 || ssy > params.height + 60) continue;
+      drawEntity(e, ssx, ssy);
+    }
+
+    // 3) игрок — крупная жёлтая точка в центре экрана (камера всегда на нём)
+    var pcx = params.width / 2, pcy = params.height / 2;
+    ctx.fillStyle = '#ffe27a';
+    ctx.beginPath();
+    ctx.arc(pcx, pcy, tilePx * 0.4, 0, Math.PI * 2);
+    ctx.fill();
+    drawCalls++;
+
+    // 4) свет/виньетка — один блит предрасчитанного оверлея
+    ctx.drawImage(vignette, 0, 0);
+    drawCalls++;
+
+    if (params.q === 'high') drawHighQualityExtras(p.x, p.y, pcx, pcy);
+
+    var workMs = performance.now() - workStart;
+    workStats.push(workMs);
+
+    stats.push(dt);
+    runCtl.push(dt);
+
+    var fitMismatch = window.innerWidth !== params.width || window.innerHeight !== params.height;
+    ZB.updateHudLive(hud, {
+      fps: stats.fps(), median: stats.median(), p99: stats.p99(),
+      ents: params.n, drawCalls: drawCalls, width: params.width, height: params.height,
+      quality: params.q, fitMismatch: fitMismatch, workMs: workStats.median(),
+    });
+
+    window.__bench.frames = frames;
+    window.__bench.median = stats.median();
+    window.__bench.p99 = stats.p99();
+    window.__bench.workMedian = workStats.median();
+    window.__bench.workP99 = workStats.p99();
+    window.__bench.drawCalls = drawCalls;
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // Автопрогон для автоматических замеров (tests/, ручные проверки):
+  // ?auto=1 запускает 20-секундный прогон сразу после первого кадра.
+  if (params.auto) {
+    setTimeout(function () { hud.runBtn.click(); }, 50);
+  }
+})();
+</script>
+</body>
+</html>
