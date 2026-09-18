@@ -29,6 +29,12 @@ export class Net {
     this.pid = 0;
     this.tickHz = 30;
     this.proto = 0;
+    // 5.1: token — секрет, по которому сервер узнаёт ВЕРНУВШЕГОСЯ игрока.
+    // Раньше опознание шло по имени: два Васи в комнате менялись телами, а
+    // чужое имя достаточно было назвать. Держится в sessionStorage, потому
+    // что чинить надо главный случай — F5 на своей же вкладке.
+    this.token = '';
+    try { this.token = sessionStorage.getItem('zza.token') || ''; } catch (e) { /* приватный режим */ }
 
     this.seq = 0;
     this.lastSent = null;
@@ -92,10 +98,19 @@ export class Net {
   hello(name) { return this.send({ t: 'hello', name: name || '', ver: PROTO }); }
   rooms() { return this.send({ t: 'rooms' }); }
   // room === '' или отсутствует = создать новую (5.1)
-  join(room, name) { return this.send({ t: 'join', room: room || '', name: name || '' }); }
+  join(room, name) {
+    return this.send({ t: 'join', room: room || '', name: name || '',
+                       token: this.token || '' });
+  }
   // Без этого не придёт ни level, ни снапшотов (5.1). Самая дорогая грабля
   // протокола: join кладёт в ЛОББИ, а не в игру.
   ready(v) { return this.send({ t: 'ready', v: !!v }); }
+  // 8.7: параметры игры. Клиент ПРОСИТ — решает сервер, и ответом всегда
+  // приходит joined с тем, что сервер на самом деле поставил.
+  opts(o) { return this.send({ t: 'opts', opts: o || {} }); }
+  // 8.7: кнопка хозяина. Не «игра пошла», а «хозяин сказал начать».
+  start(v) { return this.send({ t: 'start', v: v === undefined ? true : !!v }); }
+  leave() { return this.send({ t: 'leave' }); }
 
   sendInput(mv, aim, btn) {
     this.seq++;
@@ -157,6 +172,13 @@ export class Net {
     switch (m.t) {
       case 'welcome':
         this.pid = m.pid; this.tickHz = m.tick_hz || 30; this.proto = m.proto;
+        // Свой token берём ОДИН раз. Каждое новое соединение получает новый,
+        // и перезаписать им старый значило бы потерять право на свою
+        // сущность ровно в тот момент, когда оно нужно, — при переподключении.
+        if (m.token && !this.token) {
+          this.token = m.token;
+          try { sessionStorage.setItem('zza.token', m.token); } catch (e) { /* приватный режим */ }
+        }
         if (this.h.onWelcome) this.h.onWelcome(m);
         break;
       case 'roomlist':
@@ -178,6 +200,11 @@ export class Net {
         break;
       case 'ev':
         if (this.h.onEvent) this.h.onEvent(m);
+        break;
+      // 11.7: набор апгрейдов. Отдельным сообщением именно потому, что
+      // собирать его из событий pick клиенту запрещено (5.2).
+      case 'build':
+        if (this.h.onBuild) this.h.onBuild(m);
         break;
       case 'pong': {
         const sent = this.pingSentAt.get(m.id);

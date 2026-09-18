@@ -35,6 +35,24 @@
                         max-height:34vh; overflow:auto; }
   .room { display:flex; justify-content:space-between; align-items:center; gap:10px;
           padding:5px 0; border-bottom:1px solid #161c24; }
+  .room.busy span { color:#8b93a1; }
+  .pl { display:flex; align-items:center; gap:8px; padding:3px 0; }
+  .pl .rd { min-width:74px; color:#6f7684; }
+  .ok { color:#5fbf78; }
+  .no { color:#8b93a1; }
+  .crown { color:#d8b25f; }
+  /* Параметры лобби (8.7). У не-хозяина они видны, но не трогаются:
+     источник истины — сервер, и клиент даже не делает вида, что решает. */
+  select { background:#05070c; color:#d8dde5; border:1px solid #2b3442;
+           border-radius:5px; padding:6px 8px; font:inherit; flex:1 1 140px; }
+  select:disabled, input:disabled { opacity:.55; cursor:not-allowed; }
+  .opts .row { margin:7px 0; }
+  .opts label { min-width:150px; }
+  .chk { flex:0 0 auto; min-width:0; }
+  #hostNote { margin:10px 0 0; }
+  #buildHud { position:fixed; left:8px; top:26px; z-index:5; color:#c9b27a;
+              font:12px/1.5 ui-monospace, Consolas, monospace;
+              text-shadow:0 1px 2px #000; pointer-events:none; white-space:pre; }
   /* Строка состояния одна на все экраны: два элемента с одним id — это
      всегда молча не работающий второй. */
   #status { position:fixed; left:0; right:0; bottom:10px; z-index:20; text-align:center;
@@ -56,6 +74,9 @@
   <canvas id="c3"></canvas>
   <button id="backendBtn" title="Переключить бэкенд рендера (клавиша B)">2D</button>
   <div id="hud"></div>
+  <!-- 11.7: набор апгрейдов приходит сообщением build, а НЕ собирается из
+       событий pick: событие может потеряться, и HUD начал бы врать. -->
+  <div id="buildHud"></div>
   <div id="help">WASD / стрелки — движение · мышь — прицел · ЛКМ или F — удар · ПКМ или R — выстрел · Shift или пробел — рывок · E — действие · Q — предмет · B — 2D/3D</div>
 </div>
 
@@ -63,7 +84,7 @@
 <div class="panel" id="menu">
   <div class="card">
     <h1>Zza</h1>
-    <p class="dim" style="margin:0 0 14px">Кооперативный рогалик. Играть — в локальной сети, по коду комнаты.</p>
+    <p class="dim" style="margin:0 0 14px">Кооперативный рогалик. Играть — в локальной сети: создай лобби или войди в чужое.</p>
     <div class="row"><label for="name">Имя</label><input id="name" value="Игрок" maxlength="24" autocomplete="off"></div>
     <div class="row">
       <label for="code">Код комнаты</label>
@@ -71,22 +92,48 @@
       <button id="joinBtn">Войти</button>
     </div>
     <div class="row">
-      <button id="createBtn" class="primary">Создать комнату</button>
+      <button id="createBtn" class="primary">Создать лобби</button>
       <button id="refreshBtn">Обновить список</button>
       <a href="/download" style="margin-left:auto"><button>Скачать папку игры</button></a>
     </div>
+    <div class="dim" style="margin-top:12px">Лобби на этом сервере</div>
     <div id="roomlist"></div>
   </div>
 </div>
 
-<!-- Лобби -->
+<!-- Лобби (DESIGN.md 8.7): состав, параметры, готовность, старт хозяина.
+     Всё, что здесь показано, прислал сервер сообщением joined. Клиент не
+     держит своего мнения о лобби: нажал — попросил — перерисовал ответ. -->
 <div class="panel" id="lobby" style="display:none">
   <div class="card">
-    <h1>Комната <span id="roomCode">—</span></h1>
-    <p class="dim" style="margin:0 0 12px">Игра начнётся, когда готовы все, кто в сети.</p>
+    <h1>Лобби <span id="roomCode">—</span></h1>
+    <p class="dim" style="margin:0 0 4px">Продиктуй код коллеге — или пусть найдёт лобби в списке.</p>
     <div id="players"></div>
-    <div class="row" style="margin-top:14px">
+
+    <div class="opts" id="opts">
+      <div class="row"><label for="optMode">Режим</label>
+        <select id="optMode"></select></div>
+      <div class="row"><label for="optTheme">Тема карты</label>
+        <select id="optTheme"></select></div>
+      <div class="row"><label for="optSeed">Сид</label>
+        <input id="optSeed" placeholder="пусто = случайный" maxlength="10"
+               autocomplete="off" spellcheck="false">
+        <button id="optSeedBtn">Применить</button></div>
+      <div class="row"><label for="optDiff">Сложность</label>
+        <select id="optDiff"></select></div>
+      <div class="row"><label for="optMax">Максимум игроков</label>
+        <select id="optMax"></select></div>
+      <div class="row"><label for="optFF">Дружественный огонь</label>
+        <input type="checkbox" id="optFF" class="chk"></div>
+      <div class="row"><label for="optJoin">Вход в идущую игру</label>
+        <input type="checkbox" id="optJoin" class="chk"></div>
+    </div>
+
+    <p class="dim" id="hostNote">—</p>
+    <div class="row" style="margin-top:6px">
       <button id="readyBtn" class="primary">Готов</button>
+      <button id="startBtn" class="primary" style="display:none">Начать игру</button>
+      <button id="leaveBtn" style="margin-left:auto">Выйти в меню</button>
     </div>
   </div>
 </div>

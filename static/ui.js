@@ -1,9 +1,11 @@
 // -*- coding: utf-8 -*-
-// Меню, лобби, оверлей отладки и главный цикл (DESIGN.md 5, 6.1, 7.1).
+// Меню, лобби, оверлей отладки и главный цикл (DESIGN.md 5, 6.1, 7.1, 8.7).
 //
-// Красоты здесь нет намеренно: интерфейс — этап 5. Здесь ровно то, без
-// чего в игру не войти: имя, список комнат, вход по коду, кнопка «готов»,
-// и отладочный оверлей с fps / задержкой / числом сущностей / тиком.
+// ГЛАВНОЕ ПРАВИЛО ЭТОГО ФАЙЛА (8.7): состояния лобби здесь НЕТ. Ни списка
+// игроков, ни выбранных параметров, ни «я хозяин» клиент сам не выводит —
+// всё это приходит сообщением joined и перерисовывается целиком. Нажатие
+// на кнопку — это просьба к серверу, а не изменение картинки. Иначе у двух
+// вкладок мгновенно расходятся мнения о том, какой стоит сид.
 
 import { Net } from './net.js';
 import { WorldState, TICK_HZ } from './state.js';
@@ -25,6 +27,19 @@ const app = {
   players: [],
   rooms: [],
   lastErr: '',
+  // --- лобби (8.7). Всё присланное сервером, ничего своего -------------
+  host: 0,            // pid хозяина
+  armed: false,       // хозяин нажал «начать»
+  phase: '',          // lobby / playing / finished
+  opts: {},           // выбранные параметры
+  limits: null,       // что вообще разрешено выбирать — список от сервера
+  optsBuilt: false,   // выпадающие списки уже наполнены значениями сервера
+  roomsTimer: 0,      // список лобби обновляется сам, пока человек в меню
+  // --- набор апгрейдов (11.7) ------------------------------------------
+  // id сущности -> массив счётчиков. Приходит сообщением build; из событий
+  // pick НЕ собирается никогда (5.2: событие теряется).
+  builds: new Map(),
+  dropEv: false,      // проверка 11.7: «событие потерялось» (см. __zza)
   // кадры
   frames: 0, fps: 0, _fpsT0: 0, _fpsN: 0,
   // запись позиций для проверки плавности (tests/client_interp.py)
@@ -85,26 +100,36 @@ function setStatus(text, bad) {
   if (bad) app.lastErr = text;
 }
 
+const MODE_RU = { descent: 'Спуск', siege: 'Осада' };
+const PHASE_RU = { lobby: 'набор', playing: 'идёт игра', finished: 'закончено' };
+
+// 8.7: из списка видно код, режим, число игроков и идёт ли уже игра.
 function renderRoomList() {
   const box = $('roomlist');
   box.textContent = '';
   if (!app.rooms.length) {
     const p = document.createElement('div');
     p.className = 'dim';
-    p.textContent = 'Комнат нет. Создай свою — код продиктуешь коллеге.';
+    p.textContent = 'Лобби нет. Создай своё — код продиктуешь коллеге.';
     box.appendChild(p);
     return;
   }
   for (const r of app.rooms) {
     const row = document.createElement('div');
-    row.className = 'room';
+    const running = r.phase === 'playing';
+    row.className = 'room' + (running ? ' busy' : '');
     const info = document.createElement('span');
-    // phase сервер пока не присылает (см. отчёт этапа 0c) — не врём,
-    // а просто не показываем то, чего нет.
-    info.textContent = r.id + '  ·  игроков ' + r.players + '  ·  этаж ' + r.floor +
-                       (r.phase ? ('  ·  ' + r.phase) : '');
+    info.textContent = r.id +
+      '  ·  ' + (MODE_RU[r.mode] || r.mode || '—') +
+      '  ·  игроков ' + r.players + (r.max ? ('/' + r.max) : '') +
+      '  ·  ' + (PHASE_RU[r.phase] || r.phase || '') +
+      (running ? ('  ·  этаж ' + r.floor) : '');
     const b = document.createElement('button');
-    b.textContent = 'Войти';
+    // Закрытую партию показываем, но не предлагаем: постучаться в дверь,
+    // которая не откроется, человек должен не глазами, а никак.
+    const closed = running && r.join === false;
+    b.textContent = closed ? 'закрыто' : 'Войти';
+    b.disabled = closed;
     b.onclick = () => doJoin(r.id);
     row.appendChild(info);
     row.appendChild(b);
@@ -112,14 +137,107 @@ function renderRoomList() {
   }
 }
 
+// 8.7: список собравшихся с готовностью каждого и отметкой хозяина.
+// players — [pid, имя, готов, хозяин] из joined; своего мнения тут нет.
 function renderPlayers() {
   const box = $('players');
   box.textContent = '';
   for (const p of app.players) {
     const d = document.createElement('div');
-    d.textContent = (p[0] === app.net.pid ? '► ' : '   ') + p[1] + '  (pid ' + p[0] + ')';
+    d.className = 'pl';
+    const rd = document.createElement('span');
+    const ready = !!p[2];
+    rd.className = 'rd ' + (ready ? 'ok' : 'no');
+    rd.textContent = ready ? '✓ готов' : '· не готов';
+    const nm = document.createElement('span');
+    nm.textContent = (p[0] === app.net.pid ? '► ' : '   ') + p[1] +
+                     '  (pid ' + p[0] + ')';
+    d.appendChild(rd);
+    d.appendChild(nm);
+    if (p[3]) {
+      const c = document.createElement('span');
+      c.className = 'crown';
+      c.textContent = '★ хозяин';
+      d.appendChild(c);
+    }
     box.appendChild(d);
   }
+}
+
+// ---------------------------------------------------------------- лобби
+//
+// Выпадающие списки наполняются ЗНАЧЕНИЯМИ СЕРВЕРА (joined.limits), а не
+// зашитыми здесь константами. Это 8.7 буквально: список допустимых значений
+// один, и он на сервере. Зашей их тут — и однажды клиент предложит режим,
+// которого в сборке нет, а человек будет гадать, почему кнопка не работает.
+
+function fillSelect(el, items) {
+  el.textContent = '';
+  for (const it of items) {
+    const o = document.createElement('option');
+    o.value = String(it.v);
+    o.textContent = it.t;
+    if (it.off) o.disabled = true;
+    el.appendChild(o);
+  }
+}
+
+function buildOptControls() {
+  const L = app.limits;
+  if (!L || app.optsBuilt) return;
+  app.optsBuilt = true;
+  const ready = L.modes_ready || L.modes || [];
+  fillSelect($('optMode'), (L.modes || []).map((m) => ({
+    v: m, t: (MODE_RU[m] || m) + (ready.indexOf(m) < 0 ? ' (не сделана)' : ''),
+    off: ready.indexOf(m) < 0 })));
+  fillSelect($('optTheme'), (L.themes || []).map((t) => ({ v: t, t: t })));
+  const dn = L.diff_names || [];
+  fillSelect($('optDiff'), (L.diffs || []).map((d, i) => ({ v: d, t: dn[i] || d })));
+  const pr = L.players || [2, 6];
+  const nums = [];
+  for (let n = pr[0]; n <= pr[1]; n++) nums.push({ v: n, t: String(n) });
+  fillSelect($('optMax'), nums);
+}
+
+function renderLobby() {
+  const amHost = app.host === app.net.pid;
+  const o = app.opts || {};
+  buildOptControls();
+  $('roomCode').textContent = app.room;
+  renderPlayers();
+  if (o.mode !== undefined) $('optMode').value = o.mode;
+  if (o.theme !== undefined) $('optTheme').value = o.theme;
+  if (o.diff !== undefined) $('optDiff').value = String(o.diff);
+  if (o.max_players !== undefined) $('optMax').value = String(o.max_players);
+  $('optFF').checked = !!o.ff;
+  $('optJoin').checked = o.join_running !== false;
+  // Поле сида не перебиваем, пока в нём печатают: иначе ответ сервера
+  // съедает недонабранную цифру. Своё же значение показываем всегда.
+  if (document.activeElement !== $('optSeed')) {
+    $('optSeed').value = o.seed_auto ? '' : String(o.seed === undefined ? '' : o.seed);
+  }
+  $('optSeed').placeholder = o.seed_auto
+    ? ('пусто = случайный (сейчас ' + o.seed + ')') : 'пусто = случайный';
+
+  for (const id of ['optMode', 'optTheme', 'optSeed', 'optSeedBtn', 'optDiff',
+                    'optMax', 'optFF', 'optJoin']) {
+    $(id).disabled = !amHost;
+  }
+  $('readyBtn').textContent = app.ready ? 'Не готов' : 'Готов';
+  $('startBtn').style.display = amHost ? '' : 'none';
+  $('startBtn').textContent = app.armed ? 'Не начинать' : 'Начать игру';
+
+  const waiting = app.players.filter((p) => !p[2]).map((p) => p[1]);
+  $('hostNote').textContent = amHost
+    ? ('Вы хозяин: параметры и старт — ваши. ' +
+       (waiting.length ? ('Ждём: ' + waiting.join(', ')) : 'Все готовы.'))
+    : ('Параметры меняет хозяин. ' +
+       (app.armed ? 'Старт нажат — игра пойдёт, как только отметятся все.'
+                  : 'Игру начинает хозяин.'));
+}
+
+function sendOpts(o) {
+  app.net.opts(o);
 }
 
 // ---------------------------------------------------------------- сеть
@@ -127,16 +245,33 @@ function renderPlayers() {
 function doJoin(code) {
   app.name = ($('name').value || '').trim();
   app.ready = false;
+  app.optsBuilt = false;        // лимиты придут заново вместе с joined
   setStatus('вход…');
   app.net.hello(app.name);
   app.net.join(code || '', app.name);
 }
 
 function doReady() {
+  // Своё «готов» здесь только для надписи на кнопке; правду о готовности
+  // всё равно пришлёт сервер следующим joined.
   app.ready = !app.ready;
   app.net.ready(app.ready);
   $('readyBtn').textContent = app.ready ? 'Не готов' : 'Готов';
   setStatus(app.ready ? 'готов — ждём остальных' : 'в лобби');
+}
+
+function doStart() {
+  app.net.start(!app.armed);
+}
+
+function doLeave() {
+  app.net.leave();
+  app.room = '';
+  app.ready = false;
+  app.players = [];
+  show('menu');
+  setStatus('');
+  app.net.rooms();
 }
 
 function makeHandlers() {
@@ -163,15 +298,26 @@ function makeHandlers() {
     },
     onRoomList(rooms) { app.rooms = rooms; renderRoomList(); },
     onJoined(m) {
+      // 8.7: joined — это ВЕСЬ снимок лобби. Ничего не досочиняем.
       app.room = m.room;
       app.players = m.players || [];
+      app.host = m.host || 0;
+      app.armed = !!m.armed;
+      app.phase = m.phase || '';
+      if (m.opts) app.opts = m.opts;
+      if (m.limits) { app.limits = m.limits; app.optsBuilt = false; }
+      const me = app.players.find((p) => p[0] === m.pid);
+      app.ready = !!(me && me[2]);
       app.world.applyJoined(m);
-      $('roomCode').textContent = m.room;
-      renderPlayers();
+      renderLobby();
       if (app.screen === 'menu') {
         show('lobby');
-        setStatus('в лобби комнаты ' + m.room + ' — нажми «Готов»');
+        setStatus('лобби ' + m.room + ' — отметь готовность');
       }
+    },
+    // 11.7: набор апгрейдов. Единственный источник HUD «что я собрал».
+    onBuild(m) {
+      app.builds.set(m.id, m.ups || []);
     },
     onLevel(m, tiles) {
       if (!tiles) { setStatus('битая карта с сервера', true); return; }
@@ -179,6 +325,7 @@ function makeHandlers() {
       show('game');
       setStatus('');
       resize();
+      updateBuildHud();
     },
     onSnap(m) {
       app.world.applySnap(m);
@@ -198,7 +345,12 @@ function makeHandlers() {
     // 5.2: событие — это ВСПЫШКА и ничего больше. Ни здоровье, ни замах, ни
     // смерть отсюда не берутся: событие может потеряться, и клиент, который
     // держал бы на нём состояние, врал бы ровно при просадке сети.
-    onEvent(m) { app.world.pushEvent(m); },
+    onEvent(m) {
+      // dropEv — выключатель для проверки 11.7: он изображает ПОТЕРЮ
+      // события. Набор апгрейдов обязан остаться верным и без ev.
+      if (app.dropEv) return;
+      app.world.pushEvent(m);
+    },
     onError(m) { setStatus('сервер: ' + (m.msg || m.code), true); },
     onInputSent(seq, mv) { app.world.noteInput(seq, mv); },
   };
@@ -250,6 +402,30 @@ function frame(now) {
     }
   }
   updateHud(view);
+  updateBuildHud();
+}
+
+// 11.7: «что я собрал». Берётся ИСКЛЮЧИТЕЛЬНО из сообщений build. Ни одно
+// событие pick сюда не заглядывает: 5.2 прямо говорит, что событие может
+// потеряться, а HUD, который врёт под нагрузкой, хуже отсутствующего.
+function buildText(ups) {
+  const names = (app.limits && app.limits.ups) || [];
+  const parts = [];
+  for (let i = 0; i < ups.length; i++) {
+    if (!ups[i]) continue;
+    parts.push((names[i] || ('апгрейд ' + i)) + (ups[i] > 1 ? (' x' + ups[i]) : ''));
+  }
+  return parts;
+}
+
+let buildKey = '';
+function updateBuildHud() {
+  const ups = app.builds.get(app.world.selfId) || [];
+  const parts = buildText(ups);
+  const text = parts.length ? ('набор: ' + parts.join(' · ')) : '';
+  if (text === buildKey) return;      // текст в DOM — только когда он новый
+  buildKey = text;
+  $('buildHud').textContent = text;
 }
 
 let hudT0 = 0;
@@ -360,6 +536,28 @@ export function boot() {
   $('joinBtn').onclick = () => doJoin(($('code').value || '').trim().toUpperCase());
   $('refreshBtn').onclick = () => app.net.rooms();
   $('readyBtn').onclick = doReady;
+  $('startBtn').onclick = doStart;
+  $('leaveBtn').onclick = doLeave;
+
+  // Параметры лобби (8.7). Каждый обработчик делает ровно одно: ПРОСИТ
+  // сервер поставить значение. Ни один из них не меняет app.opts — картинку
+  // перерисует ответ сервера, и только он.
+  $('optMode').onchange = () => sendOpts({ mode: $('optMode').value });
+  $('optTheme').onchange = () => sendOpts({ theme: $('optTheme').value });
+  $('optDiff').onchange = () => sendOpts({ diff: parseInt($('optDiff').value, 10) });
+  $('optMax').onchange = () => sendOpts({ max_players: parseInt($('optMax').value, 10) });
+  $('optFF').onchange = () => sendOpts({ ff: $('optFF').checked });
+  $('optJoin').onchange = () => sendOpts({ join_running: $('optJoin').checked });
+  const sendSeed = () => {
+    const v = ($('optSeed').value || '').trim();
+    // Пусто = случайный (8.7). Непустое отправляем ЧИСЛОМ, если оно число;
+    // если человек набрал буквы — пусть сервер и откажет, ему решать.
+    sendOpts({ seed: v === '' ? null : (/^\d+$/.test(v) ? parseInt(v, 10) : v) });
+  };
+  $('optSeedBtn').onclick = sendSeed;
+  $('optSeed').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendSeed();
+  });
   $('backendBtn').onclick = () => setBackend(app.backend === '2d' ? '3d' : '2d');
   // Клавиша B свободна: input.js разбирает WASD/стрелки, F, R, E, Q,
   // Shift и пробел — B среди них нет.
@@ -375,6 +573,12 @@ export function boot() {
   window.addEventListener('resize', resize);
   resize();
   show('menu');
+  // Список лобби обновляется сам, пока человек в меню (8.7): коллега создал
+  // лобби минуту назад, и жать «обновить» ради этого никто не обязан. В
+  // игре и в лобби таймер молчит — там список не виден вовсе.
+  app.roomsTimer = setInterval(() => {
+    if (app.screen === 'menu' && app.net.open) app.net.rooms();
+  }, 2000);
   if (qs.get('backend') === '3d') setBackend('3d');
   setStatus('подключаемся…');
   app.net.connect();
@@ -387,6 +591,31 @@ export function boot() {
     screen: () => app.screen,
     room: () => app.room,
     pid: () => app.net.pid,
+
+    // --- лобби (tests/client_lobby_*.py, 8.7) -------------------------
+    // Только ЧТЕНИЕ показаний и те же действия, что делают кнопки. Своего
+    // пути в обход интерфейса тут нет: проверка нажимает кнопки.
+    lobby: () => ({ room: app.room, host: app.host, armed: app.armed,
+                    phase: app.phase, ready: app.ready,
+                    players: app.players, opts: app.opts,
+                    limits: app.limits }),
+    isHost: () => app.host === app.net.pid,
+    rooms: () => app.rooms,
+    token: () => app.net.token,
+    // Сырой путь для проверки «клиенту нельзя верить»: послать параметр
+    // мимо интерфейса, как это сделал бы кривой или злой клиент.
+    sendOpts: (o) => { app.net.opts(o); return true; },
+    sendStart: (v) => { app.net.start(v); return true; },
+
+    // --- набор апгрейдов (11.7) ---------------------------------------
+    myBuild: () => (app.builds.get(app.world.selfId) || []).slice(),
+    builds: () => Array.from(app.builds.entries()),
+    buildHud: () => $('buildHud').textContent,
+    // «Событие потерялось»: ev в клиент не попадает вовсе. Набор обязан
+    // остаться верным — он приходит сообщением build, а не из ev.
+    setDropEv: (v) => { app.dropEv = !!v; return app.dropEv; },
+    getDropEv: () => app.dropEv,
+
     selfId: () => app.world.selfId,
     self: () => {
       const e = app.world.self();

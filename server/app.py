@@ -101,7 +101,9 @@ class GameSocket(tornado.websocket.WebSocketHandler):
         self.set_nodelay(True)
         self.pid = self.rooms.new_pid()
         self.player = room_mod.Player(self.pid, "", self)
-        self.send_str(proto.welcome(self.pid))
+        # 5.1: token выдаётся в welcome и возвращается в join. Опознание по
+        # ИМЕНИ было дырой: тёзки путались, чужое имя угадывалось.
+        self.send_str(proto.welcome(self.pid, self.player.token))
 
     def send_str(self, text):
         try:
@@ -120,17 +122,36 @@ class GameSocket(tornado.websocket.WebSocketHandler):
         if t == "hello":
             if m["name"]:
                 p.name = m["name"]
-            self.send_str(proto.welcome(p.pid))
+            self.send_str(proto.welcome(p.pid, p.token))
         elif t == "rooms":
             self.send_str(proto.roomlist(self.rooms.listing()))
         elif t == "join":
             self.do_join(m)
-        elif t == "ready":
-            p.ready = m["v"]
+        elif t == "leave":
             if p.room is not None:
-                # на 0a готовность — единственный способ начать игру:
-                # протокол лобби (кнопка «старт» у хозяина) это этап 5.
-                p.room.maybe_start()
+                p.room.leave(p)
+            self.send_str(proto.roomlist(self.rooms.listing()))
+        elif t == "ready":
+            if p.room is not None:
+                p.room.set_ready(p, m["v"])
+            else:
+                p.ready = m["v"]
+        elif t == "opts":
+            # 8.7: параметры меняет только хозяин, и только по списку
+            # допустимых значений. Отказ — это ответ, а не молчание.
+            if p.room is None:
+                return
+            ok, bad = p.room.set_opts(p, m["opts"])
+            if not ok:
+                self.send_str(proto.error("nothost", "параметры меняет хозяин лобби"))
+            elif bad:
+                self.send_str(proto.error(
+                    "opt", "сервер не принял: " + ", ".join(sorted(bad))))
+        elif t == "start":
+            if p.room is None:
+                return
+            if not p.room.set_armed(p, m["v"]):
+                self.send_str(proto.error("nothost", "игру начинает хозяин лобби"))
         elif t == "input":
             p.pending = m
         elif t == "ping":
@@ -142,10 +163,20 @@ class GameSocket(tornado.websocket.WebSocketHandler):
             p.name = m["name"]
         if p.room is not None:
             return
+        if m["room"] and self.rooms.get(m["room"]) is None:
+            # Вход по коду в несуществующую комнату — это опечатка, а не
+            # заявка на новую: get_or_create молча создавал бы комнату с
+            # ДРУГИМ кодом, и человек искал бы там коллегу.
+            self.send_str(proto.error("nosuch", "комнаты %s нет" % m["room"]))
+            self.send_str(proto.roomlist(self.rooms.listing()))
+            return
         r = self.rooms.get_or_create(m["room"])
-        used = r.add(p)
-        if used is None:
-            self.send_str(proto.error("full", "комната заполнена"))
+        used = r.add(p, m.get("token", ""))
+        if used is None or isinstance(used, str):
+            msg = {"full": "комната заполнена",
+                   "closed": "в эту партию уже не пускают"}.get(used, "не пускают")
+            self.send_str(proto.error(used or "full", msg))
+            self.send_str(proto.roomlist(self.rooms.listing()))
             return
         self.player = used       # при переподключении это прежний игрок
         # в лобби мира ещё нет, и send_level честно ничего не пришлёт;
@@ -154,7 +185,13 @@ class GameSocket(tornado.websocket.WebSocketHandler):
 
     def on_close(self):
         p = self.player
-        if p is not None and p.room is not None:
+        # p.conn is self — обязательная проверка, а не перестраховка. При
+        # переподключении по token (room.add) прежнее соединение того же
+        # игрока закрывается НАМЕРЕННО, и его on_close приходит уже ПОСЛЕ
+        # того, как игрок переехал на новый сокет. Без этой проверки он
+        # отключил бы только что восстановленного игрока — то есть каждое
+        # второе переподключение с продублированной вкладки.
+        if p is not None and p.room is not None and p.conn is self:
             p.room.disconnect(p)
         self.player = None
 

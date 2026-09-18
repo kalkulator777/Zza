@@ -110,6 +110,53 @@ def clean_room(v):
     return ""
 
 
+# --- лобби (8.7) -----------------------------------------------------------
+# Ключи параметров игры. Список ЗАКРЫТЫЙ: всё, чего здесь нет, с провода не
+# проходит вовсе. Допустимые ЗНАЧЕНИЯ проверяет room.RoomSettings.apply —
+# это игровое правило, а не форма сообщения, и знать его proto.py нечего.
+OPT_KEYS = ("mode", "theme", "seed", "diff", "ff", "max_players", "join_running")
+
+MAX_TOKEN = 32
+MAX_OPT_STR = 32
+
+
+def clean_token(v):
+    """token из welcome (5.1). Только [0-9a-f], иначе пусто."""
+    if not isinstance(v, str):
+        return ""
+    v = v.strip().lower()[:MAX_TOKEN]
+    if v and all(c in "0123456789abcdef" for c in v):
+        return v
+    return ""
+
+
+def clean_opts(v):
+    """Параметры лобби с провода -> словарь известных ключей.
+
+    Здесь режется только ФОРМА: незнакомый ключ выбрасывается, строка
+    подрезается, нечисловой NaN/inf превращается в None (то есть в «мусор»,
+    который дальше будет отвергнут по значению). Никакого «а допустим ли
+    режим siege» здесь нет и быть не должно: источник истины по значениям —
+    room.py (8.7), и держать этот список в двух местах значит однажды
+    разрешить в одном то, что запрещено в другом.
+    """
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for k in OPT_KEYS:
+        if k not in v:
+            continue
+        x = v[k]
+        if isinstance(x, str):
+            x = x.strip()[:MAX_OPT_STR]
+        elif isinstance(x, float) and not math.isfinite(x):
+            x = None                      # 1e999/NaN — мусор, а не число
+        elif isinstance(x, (list, tuple, dict)):
+            x = None
+        out[k] = x
+    return out
+
+
 def norm_mv(v):
     """mv с провода -> (dx, dy), длина <= 1. Сервер нормирует сам (5.1)."""
     if not isinstance(v, (list, tuple)) or len(v) != 2:
@@ -136,12 +183,28 @@ def _v_rooms(m):
 
 
 def _v_join(m):
+    # token (5.1): по нему отвалившийся забирает свою сущность. Имя тоже
+    # разбирается — это запасной путь для клиента без token; см. room.add.
     return {"t": "join", "room": clean_room(m.get("room")),
-            "name": clean_name(m.get("name"))}
+            "name": clean_name(m.get("name")),
+            "token": clean_token(m.get("token"))}
 
 
 def _v_ready(m):
     return {"t": "ready", "v": bool(m.get("v"))}
+
+
+def _v_opts(m):
+    return {"t": "opts", "opts": clean_opts(m.get("opts"))}
+
+
+def _v_start(m):
+    # v отсутствует = true: «жми старт», а не «сними старт».
+    return {"t": "start", "v": True if m.get("v") is None else bool(m.get("v"))}
+
+
+def _v_leave(m):
+    return {"t": "leave"}
 
 
 def _v_input(m):
@@ -166,6 +229,7 @@ def _v_ping(m):
 _VALIDATORS = {
     "hello": _v_hello, "rooms": _v_rooms, "join": _v_join,
     "ready": _v_ready, "input": _v_input, "ping": _v_ping,
+    "opts": _v_opts, "start": _v_start, "leave": _v_leave,
 }
 
 
@@ -192,16 +256,50 @@ def encode(msg):
     return json.dumps(msg, separators=_SEP, ensure_ascii=False)
 
 
-def welcome(pid):
-    return encode({"t": "welcome", "pid": pid, "tick_hz": TICK_HZ, "proto": PROTO})
+def welcome(pid, token=""):
+    m = {"t": "welcome", "pid": pid, "tick_hz": TICK_HZ, "proto": PROTO}
+    if token:
+        m["token"] = token
+    return encode(m)
 
 
 def roomlist(rooms):
     return encode({"t": "roomlist", "rooms": rooms})
 
 
-def joined(room, pid, players):
-    return encode({"t": "joined", "room": room, "pid": pid, "players": players})
+def joined(room, pid, players, host=0, opts=None, limits=None, armed=False,
+           phase=""):
+    """Состояние лобби целиком (8.7): кто внутри, кто хозяин, какие параметры.
+
+    Шлётся при КАЖДОМ изменении лобби, а не только при входе: параметры
+    меняет хозяин, а видят их сразу все, и догонять это дельтами нечего —
+    сообщение весит две сотни байт и случается по нажатию человека.
+
+    players — [pid, имя, готов, хозяин]. Первые два поля на прежних местах:
+    на них стоят state.js и чужие проверки.
+    """
+    m = {"t": "joined", "room": room, "pid": pid, "players": players}
+    if host:
+        m["host"] = host
+    if opts is not None:
+        m["opts"] = opts
+    if limits is not None:
+        m["limits"] = limits
+    if armed:
+        m["armed"] = True
+    if phase:
+        m["phase"] = phase
+    return encode(m)
+
+
+def build(eid, ups):
+    """Набор апгрейдов сущности (11.7).
+
+    Отдельным сообщением, потому что в десять полей 4.3 набор не влезает, а
+    держать его на событии pick клиенту запрещено 5.2: событие теряется.
+    ups — позиционный список счётчиков по видам апгрейда (items.N_UP).
+    """
+    return encode({"t": "build", "id": eid, "ups": list(ups)})
 
 
 def level(floor, seed, w, h, tiles):
