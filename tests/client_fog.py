@@ -81,7 +81,24 @@ DARK_T = 10                    # «чёрный пиксель»: максима
 DROP_MIN = 0.05                # на сколько обязана упасть доля черноты
 STAIRS_RATIO = 2.0             # во сколько раз лестница краснее пола
 MS_RATIO_MAX = 3.0             # «не выросла втрое»
-WALK_BUDGET = 60.0             # с, потолок на дорогу (замерено: доходит за 12..32 с)
+
+# Потолок на дорогу — ПРЕДОХРАНИТЕЛЬ ОТ ЗАВИСАНИЯ, а не порог проверки.
+# Настоящее условие остановки — «путь перестал сокращаться» (WALK_STALL):
+# оно не зависит от загрузки машины. Загруженная машина идёт медленнее, но
+# идёт, а прежний потолок 60 с был именно порогом — headless-браузер под
+# посторонней нагрузкой в него не укладывался, и проверка краснела на
+# исправной игре (замер дирижёра: 1 красный из 4). Само число: этаж 64x48,
+# диагональ 80 клеток, бег 5 кл/с (4.2) — 16 с чистого хода; десятикратный
+# запас на обход стен, рывки поперёк и тормоза браузера.
+WALK_BUDGET = 160.0
+WALK_STALL = 8.0               # с без сокращения пути — дальше незачем
+
+# Сколько клеток обязано открыться В КАДРЕ ИСХОДНОЙ ТОЧКИ, чтобы идти
+# дальше было уже незачем. Одна клетка на экране 1920x1080 при 48 px/клетка
+# это 48*48/(1920*1080) = 0.111 п.п. черноты, порог падения DROP_MIN = 5
+# п.п. — это 45 клеток. Берём тройной запас: часть новых клеток попадает
+# под виньетку и осветляет кадр меньше, чем на полную клетку.
+ENOUGH_NEW_CELLS = 135
 MS_FRAMES = 150                # кадров в каждом замере по rAF (данные)
 BENCH_DRAWS = 300              # вызовов draw() в одной пачке замера
 
@@ -177,8 +194,17 @@ def pick_wp(level, mx, my, path):
     return best
 
 
-def walk_to(tab, level, target, keys, budget):
-    """Дойти до клетки target. Возвращает (дошёл, расстояние, секунды, рывков).
+def walk_to(tab, level, target, keys, budget, probe=None, enough=None):
+    """Идти к клетке target. Возвращает (дошёл, расстояние, секунды, рывков).
+
+    ЧТО ЗДЕСЬ ПОРОГ, А ЧТО ПРЕДОХРАНИТЕЛЬ. Дорога кончается по одному из
+    трёх: дошли; путь не сокращается WALK_STALL секунд; вызванный
+    снаружи enough() сказал «нужное уже снято». budget — только
+    предохранитель от зависания. Это и есть лечение мигания: ни одно из
+    условий не спрашивает, УСПЕЛА ли машина за отведённое время.
+
+    probe() зовётся по дороге (снять то, что видно только в пути),
+    enough() — можно ли уже разворачиваться.
 
     Две поправки, заработанные прогоном (обе — про настоящую физику, а не
     про проверку):
@@ -202,6 +228,11 @@ def walk_to(tab, level, target, keys, budget):
     pt = t0
     side = 1
     while time.time() - t0 < budget:
+        if probe is not None:
+            probe()
+        if enough is not None and enough():
+            keys.release()
+            return True, dist, time.time() - t0, nudges
         me = tab.self_pos()
         if me is None:
             break
@@ -216,7 +247,7 @@ def walk_to(tab, level, target, keys, budget):
         if len(path) < best:
             best = len(path)
             last_gain = time.time()
-        if time.time() - last_gain > 8.0:
+        if time.time() - last_gain > WALK_STALL:
             break                      # путь не сокращается — дальше незачем
         wp = pick_wp(level, mx, my, path)
         dx, dy = wp[0] + 0.5 - mx, wp[1] + 0.5 - my
@@ -308,6 +339,98 @@ def find_cell(fog, c, size, want, tile=None, away_from_dark=0, level=None,
             if best is None or d < best[0]:
                 best = (d, tx, ty, p[0], p[1])
     return None if best is None else best[1:]
+
+
+def new_in_view(fog0, fog1, c, size):
+    """Сколько клеток открылось заново ВНУТРИ кадра с камерой c.
+
+    Ровно та величина, из которой сделан порог падения черноты: клетки вне
+    кадра исходной точки на разницу двух замеров не влияют вовсе.
+    """
+    w, h = fog1["w"], fog1["h"]
+    a, b = fog0["cells"], fog1["cells"]
+    n = 0
+    for ty in range(h):
+        for tx in range(w):
+            i = ty * w + tx
+            if a[i] == VIS_DARK and b[i] != VIS_DARK and \
+                    on_screen(c, size, tx, ty, margin_tiles=0.0) is not None:
+                n += 1
+    return n
+
+
+def nearest_dark(level, fog, c, size, mx, my):
+    """Ближайшая проходимая клетка, которая ещё не разведана И попадает в
+    кадр исходной точки.
+
+    Это и есть цель добора: падение черноты считается в кадре ДОМА, и
+    клетки вне этого кадра на него не влияют вовсе — сколько бы их ни
+    открыли на том берегу карты.
+    """
+    w, h, t = level["w"], level["h"], level["tiles"]
+    cells = fog["cells"]
+    src = (int(mx), int(my))
+    seen = {src}
+    q = collections.deque([src])
+    while q:
+        cx, cy = q.popleft()
+        i = cy * w + cx
+        if cells[i] == VIS_DARK and (cx, cy) != src and \
+                on_screen(c, size, cx, cy, margin_tiles=0.0) is not None:
+            return (cx, cy)
+        for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+            if 0 <= nx < w and 0 <= ny < h and t[ny * w + nx] != TILE_WALL \
+                    and (nx, ny) not in seen:
+                seen.add((nx, ny))
+                q.append((nx, ny))
+    return None
+
+
+def measure_stairs(tab, level, size, stairs, keys):
+    """Снять «лестница краснее пола», если лестница сейчас в кадре.
+
+    Зовётся ПО ДОРОГЕ, а не после прихода, и в этом всё лечение мигания.
+    Раньше замер стоял за условием «вкладка дошла до лестницы за отведённое
+    время»: не успел headless-браузер под посторонней нагрузкой — красная
+    проверка заметности лестницы, хотя клиент рисует её правильно. А чтобы
+    увидеть лестницу, доходить до неё не надо совсем: радиус обзора 10
+    клеток (server/vis.py), кадр 40x22.5 клетки (4.1) — она появляется на
+    экране за десяток клеток до прихода.
+
+    Возвращает dict с числами или None, если снять пока нечего.
+    """
+    if on_screen(cam(tab), size, stairs[0], stairs[1], margin_tiles=1.0) is None:
+        return None
+    # Меряются пиксели, значит камера обязана стоять: на ходу коробка
+    # уезжает с клетки между двумя вызовами в браузер.
+    keys.release()
+    time.sleep(0.35)
+    c = cam(tab)
+    p = on_screen(c, size, stairs[0], stairs[1], margin_tiles=1.0)
+    if p is None:
+        return None
+    fnow = fog_of(tab)
+    state = fnow["cells"][stairs[1] * fnow["w"] + stairs[0]]
+    if state == VIS_DARK:
+        return None                    # не разведана — рисовать и нечего
+    q = int(c["t"] * 0.30)
+    st_box = box(tab, p[0] - q, p[1] - q, q * 2, q * 2)
+    # соседняя клетка пола того же освещения — эталон «обычный пол»
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                   (2, 0), (-2, 0), (0, 2), (0, -2)):
+        nx, ny = stairs[0] + dx, stairs[1] + dy
+        if level["tiles"][ny * level["w"] + nx] != TILE_FLOOR:
+            continue
+        if fnow["cells"][ny * fnow["w"] + nx] != state:
+            continue
+        pp = on_screen(c, size, nx, ny, margin_tiles=1.0)
+        if pp is None:
+            continue
+        ref = box(tab, pp[0] - q, pp[1] - q, q * 2, q * 2)
+        return {"ratio": st_box["maxR"] / max(1.0, float(ref["maxR"])),
+                "st": st_box["maxR"], "ref": ref["maxR"],
+                "state": state, "ref_cell": (nx, ny)}
+    return None
 
 
 def enemy_wire(tick, eid, x, y):
@@ -428,18 +551,91 @@ def main():
         keys = Keys(t)
         me0 = t.self_pos()
         home = (int(me0["x"]), int(me0["y"]))
+
+        # Замер лестницы снимается ПО ДОРОГЕ, а разворот делается, когда
+        # снято всё нужное, — ни то, ни другое не спрашивает, успела ли
+        # машина добежать (см. measure_stairs и WALK_BUDGET).
+        got = {}
+        clk = {"probe": 0.0, "enough": 0.0, "last": False}
+
+        def probe():
+            if stairs is None or "ratio" in got:
+                return
+            if time.time() - clk["probe"] < 0.5:
+                return
+            clk["probe"] = time.time()
+            m = measure_stairs(t, level, size, stairs, keys)
+            if m:
+                got.update(m)
+                got["at"] = time.time()
+
+        def enough():
+            """Снято ли всё, ради чего идут: число лестницы и клетки у дома.
+
+            Ответ кэшируется на секунду: считать его — это тащить весь
+            туман из браузера, а звать его приходится в каждом обороте
+            шага.
+            """
+            if "ratio" not in got:
+                return False
+            if time.time() - clk["enough"] < 1.0:
+                return clk["last"]
+            clk["enough"] = time.time()
+            got["new_cells"] = new_in_view(f0, fog_of(t), c_start, size)
+            clk["last"] = got["new_cells"] >= ENOUGH_NEW_CELLS
+            return clk["last"]
+
+        # ДОРОГА ТУДА. Лестница здесь — НАПРАВЛЕНИЕ, а не цель: сама по себе
+        # она проверке не нужна, нужны два числа — отношение яркости
+        # лестницы к полу (снимается по дороге, как только лестница попала в
+        # кадр) и столько заново открытых клеток В КАДРЕ ИСХОДНОЙ ТОЧКИ,
+        # чтобы падение черноты было заведомо выше порога. Поэтому дорога
+        # кончается, когда снято и то, и другое, а не когда ходок дошёл.
+        #
+        # Замерено, зачем это нужно: приход к лестнице НЕ означает, что у
+        # дома открылось достаточно. Пять прогонов подряд — 45, 192, 136,
+        # 186, 141 клетки, падение черноты 4.6, 21.4, 14.9, 17.0, 14.4 п.п.
+        # Тот самый прогон с 45 клетками — красный при пороге 5 п.п., и
+        # ходок в нём ДОШЁЛ до лестницы (0.67 клетки). Мигало не «не успел
+        # дойти», а «дошёл не туда, куда смотрит камера замера».
         if stairs is None:
             check(False, "на этаже есть лестница вниз (тайл 2)")
             reached, gap, secs, nudges = False, 0.0, 0.0, 0
         else:
-            reached, gap, secs, nudges = walk_to(t, level, stairs, keys,
-                                                 WALK_BUDGET)
+            t_walk = time.time()
+            reached, gap, secs, nudges = False, 0.0, 0.0, 0
+            legs = []
+            stairs_tried = False
+            while time.time() - t_walk < WALK_BUDGET:
+                if "ratio" not in got and not stairs_tried:
+                    tgt, why = stairs, "к лестнице"
+                elif enough():
+                    break
+                else:
+                    me = t.self_pos()
+                    tgt = nearest_dark(level, fog_of(t), c_start, size,
+                                       me["x"], me["y"])
+                    why = "добор клеток у дома"
+                    if tgt is None:
+                        break          # у дома разведано всё, что доступно
+                left = WALK_BUDGET - (time.time() - t_walk)
+                reached, gap, secs, n = walk_to(t, level, tgt, keys, left,
+                                                probe, enough)
+                nudges += n
+                legs.append("%s %s%s" % (why, tgt, "" if reached else " (не дошёл)"))
+                if why == "к лестнице":
+                    stairs_tried = True
+            note("дорога туда", "лестница снята %s, заново открыто в кадре "
+                 "исходной точки %s клетки (хватает %d), %.1f с, ног %d: %s"
+                 % ("да" if "ratio" in got else "НЕТ",
+                    got.get("new_cells", "?"), ENOUGH_NEW_CELLS,
+                    time.time() - t_walk, len(legs), "; ".join(legs[:6])))
         time.sleep(0.6)
         me1 = t.self_pos()
         ran = math.hypot(me1["x"] - me0["x"], me1["y"] - me0["y"])
         note("пробежка туда", "от (%.1f, %.1f) до (%.1f, %.1f), по прямой %.1f "
-                              "клетки, %.1f с, до лестницы %.2f клетки, "
-                              "рывков поперёк %d"
+                              "клетки, последняя нога %.1f с, до её цели %.2f "
+                              "клетки, рывков поперёк %d"
              % (me0["x"], me0["y"], me1["x"], me1["y"], ran, secs, gap, nudges))
 
         f1 = fog_of(t)
@@ -454,46 +650,27 @@ def main():
               % (n1[VIS_DARK], n1[VIS_SEEN], n1[VIS_LIT]))
 
         # --- пункт 6: лестница заметна ------------------------------------
-        if stairs is not None and reached:
-            c = cam(t)
-            p = on_screen(c, size, stairs[0], stairs[1], margin_tiles=1.0)
-            fnow = fog_of(t)
-            state = fnow["cells"][stairs[1] * fnow["w"] + stairs[0]]
-            if p is None:
-                check(False, "лестница попала в кадр", "камера её не захватила")
-            else:
-                q = int(c["t"] * 0.30)
-                st_box = box(t, p[0] - q, p[1] - q, q * 2, q * 2)
-                # соседняя клетка пола того же освещения — эталон «обычный пол»
-                ref = None
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1),
-                               (2, 0), (-2, 0), (0, 2), (0, -2)):
-                    nx, ny = stairs[0] + dx, stairs[1] + dy
-                    if level["tiles"][ny * level["w"] + nx] != TILE_FLOOR:
-                        continue
-                    if fnow["cells"][ny * fnow["w"] + nx] != state:
-                        continue
-                    pp = on_screen(c, size, nx, ny, margin_tiles=1.0)
-                    if pp is None:
-                        continue
-                    ref = box(t, pp[0] - q, pp[1] - q, q * 2, q * 2)
-                    ref_cell = (nx, ny)
-                    break
-                if ref is None:
-                    check(False, "рядом с лестницей нашёлся обычный пол для сравнения")
-                else:
-                    ratio = st_box["maxR"] / max(1.0, float(ref["maxR"]))
-                    note("лестница", "клетка %s, состояние тумана %d; "
-                         "эталон пола %s" % (str(stairs), state, str(ref_cell)))
-                    check(ratio >= STAIRS_RATIO,
-                          "лестница вниз не красится как обычный пол",
-                          "самый яркий красный: лестница %d, пол рядом %d, "
-                          "отношение %.1f (нужно >= %.1f)"
-                          % (st_box["maxR"], ref["maxR"], ratio, STAIRS_RATIO))
+        # Числа сняты ПО ДОРОГЕ (measure_stairs), а не после прихода: сюда
+        # приход лестницы не входит вовсе. Если по дороге снять не удалось —
+        # пробуем ещё раз отсюда, вдруг стоим прямо на ней.
+        if stairs is not None and "ratio" not in got:
+            m = measure_stairs(t, level, size, stairs, keys)
+            if m:
+                got.update(m)
+        if stairs is None:
+            pass                                   # уже покраснело выше
+        elif "ratio" not in got:
+            check(False, "лестница вниз хоть раз попала в кадр за пробежку",
+                  "лестница на %s, ходок кончил дорогу в %.2f клетки от "
+                  "последней цели" % (str(stairs), gap))
         else:
-            check(False, "вкладка дошла до лестницы за отведённое время",
-                  "не дошла %.2f клетки за %.1f с — проверка заметности "
-                  "лестницы не состоялась" % (gap, secs))
+            note("лестница", "клетка %s, состояние тумана %d; эталон пола %s"
+                 % (str(stairs), got["state"], str(got["ref_cell"])))
+            check(got["ratio"] >= STAIRS_RATIO,
+                  "лестница вниз не красится как обычный пол",
+                  "самый яркий красный: лестница %d, пол рядом %d, "
+                  "отношение %.1f (нужно >= %.1f)"
+                  % (got["st"], got["ref"], got["ratio"], STAIRS_RATIO))
 
         # --- возврат в исходную точку -------------------------------------
         back_ok, back_gap, back_secs, back_nudges = walk_to(
