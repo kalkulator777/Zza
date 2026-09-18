@@ -27,6 +27,9 @@ play.py, вкладка входит в игру кнопками и бежит 
      спине, на одной и той же сцене.
   6. Лестница вниз (тайл 2) заметна: она не красится как обычный пол.
   7. Ноль ошибок в консоли.
+  8. Этаж под замером не сменился. Это не украшение отчёта: лестница
+     работает (8.1), а дошедший до неё ходок меняет этаж, обнуляя туман
+     ПОСРЕДИ замера — см. STAIRS_KEEP.
 
 ОТКУДА ПОРОГИ (выведены из величин, не подобраны под прогон)
 
@@ -71,8 +74,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client_common import (BROWSER_ARGS, CHROMIUM, Server, Tab, check,
-                           clear_dist, note, summary, uptime)
+from client_common import (BROWSER_ARGS, CHROMIUM, Keys, Server, Tab, check,
+                           bfs_path, clear_dist, note, pick_wp, summary,
+                           uptime, walk_to, WALK_STALL)
 
 # --- размеры и пороги -----------------------------------------------------
 
@@ -99,6 +103,34 @@ WALK_STALL = 8.0               # с без сокращения пути — д�
 # п.п. — это 45 клеток. Берём тройной запас: часть новых клеток попадает
 # под виньетку и осветляет кадр меньше, чем на полную клетку.
 ENOUGH_NEW_CELLS = 135
+
+# --- НЕ НАСТУПИТЬ НА ЛЕСТНИЦУ ---------------------------------------------
+#
+# Мина, найденная при разборе: ходок шёл К ЛЕСТНИЦЕ как к цели, а лестница
+# теперь работает. Дошёл до самой клетки — room.stairs_ready видит, что все
+# живые на лестнице, и меняет этаж ПОСРЕДИ ЗАМЕРА: туман обнуляется (4.4),
+# карта другая, кадр исходной точки исчез вместе с этажом. Проверка при этом
+# проходила случайно — ровно потому, что до лестницы обычно не доходили.
+#
+# Лечение в три пояса, и первый из них — тот же принцип, что уже вылечил эту
+# проверку раньше: ЖДАТЬ НАДО ЧИСЛО, А НЕ СОБЫТИЕ. Лестница здесь нужна как
+# число (отношение яркости), а не как место, и снимается оно за десяток
+# клеток до неё.
+#
+#   1) нога «к лестнице» кончается в тот момент, когда число СНЯТО;
+#   2) цель этой ноги — не сама лестница, а точка пути в STAIRS_KEEP клетках
+#      от неё: даже если снять не удалось вовсе, ходок останавливается в
+#      стороне;
+#   3) все дороги проверки обходят клетку лестницы стороной (walk_to(avoid)),
+#      и в конце проверяется, что этаж под замером не сменился.
+#
+# Откуда STAIRS_KEEP = 2.0. walk_to объявляет приход в цель на расстоянии
+# near = 0.9 клетки от её центра, значит тело встанет не ближе 2.0 - 0.9 =
+# 1.1 клетки от центра лестницы. Самая дальняя точка клетки лестницы от её
+# центра — угол, 0.707 клетки; чтобы оказаться НА клетке (world.on_stairs
+# сравнивает int(x), int(y)), центру тела надо подойти к центру клетки ближе
+# 0.707. Запас 1.1 / 0.707 = 1.56 раза.
+STAIRS_KEEP = 2.0
 MS_FRAMES = 150                # кадров в каждом замере по rAF (данные)
 BENCH_DRAWS = 300              # вызовов draw() в одной пачке замера
 
@@ -106,166 +138,10 @@ VIS_DARK, VIS_SEEN, VIS_LIT = 0, 1, 2
 TILE_WALL, TILE_FLOOR, TILE_STAIRS = 0, 1, 2
 
 
-# --- ходьба по карте ------------------------------------------------------
-
-class Keys(object):
-    """Клавиши держатся зажатыми, как у человека, а не долбятся по 10 Гц."""
-
-    def __init__(self, tab):
-        self.tab = tab
-        self.held = set()
-
-    def set(self, want):
-        want = set(want)
-        for k in self.held - want:
-            self.tab.page.keyboard.up(k)
-        for k in want - self.held:
-            self.tab.page.keyboard.down(k)
-        self.held = want
-
-    def release(self):
-        self.set([])
-
-
-# Полоса нечувствительности по поперечной оси. Тело игрока круглое, R=0.35
-# (4.2), коридор шириной ровно в клетку: от середины можно уйти на 0.15
-# клетки, дальше край тела цепляет соседний ряд и physics.move_circle
-# обнуляет скорость по этой оси. Поэтому клавиша поперечной оси жмётся по
-# АБСОЛЮТНОМУ промаху, а не по отношению к продольному: первый вариант
-# сравнивал оси между собой, при промахе 0.18 против хода 0.63 поперечную
-# клавишу не жал — и персонаж стоял в проёме вечно (замерено).
-BAND = 0.10
-
-
-def keys_for(dx, dy, band=BAND):
-    ax, ay = abs(dx), abs(dy)
-    kx = "KeyD" if dx > 0 else ("KeyA" if dx < 0 else None)
-    ky = "KeyS" if dy > 0 else ("KeyW" if dy < 0 else None)
-    out = []
-    if kx and ax > band:
-        out.append(kx)
-    if ky and ay > band:
-        out.append(ky)
-    if not out:
-        out = [k for k in (kx, ky) if k]
-    return out
-
-
-def bfs_path(level, src, dst):
-    """Кратчайший путь по проходимым тайлам (всё, что не 0 — не стена, 4.1)."""
-    w, h, t = level["w"], level["h"], level["tiles"]
-    prev = {src: None}
-    q = collections.deque([src])
-    while q:
-        c = q.popleft()
-        if c == dst:
-            break
-        x, y = c
-        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
-            if 0 <= nx < w and 0 <= ny < h and t[ny * w + nx] != TILE_WALL \
-                    and (nx, ny) not in prev:
-                prev[(nx, ny)] = c
-                q.append((nx, ny))
-    if dst not in prev:
-        return None
-    path, c = [], dst
-    while c is not None:
-        path.append(c)
-        c = prev[c]
-    path.reverse()
-    return path
-
-
-def pick_wp(level, mx, my, path):
-    """Самая дальняя точка пути, до которой видно по прямой без стены.
-
-    Иначе персонаж цепляется плечом за угол: путь-то по клеткам, а тело
-    круглое (R_PLAYER в client_common).
-    """
-    best = path[1] if len(path) > 1 else path[0]
-    for i in range(1, min(7, len(path))):
-        wx, wy = path[i][0] + 0.5, path[i][1] + 0.5
-        dx, dy = wx - mx, wy - my
-        d = math.hypot(dx, dy)
-        if d < 1e-6:
-            continue
-        if clear_dist(level, mx, my, dx / d, dy / d, d + 0.1) >= d - 0.05:
-            best = path[i]
-    return best
-
-
-def walk_to(tab, level, target, keys, budget, probe=None, enough=None):
-    """Идти к клетке target. Возвращает (дошёл, расстояние, секунды, рывков).
-
-    ЧТО ЗДЕСЬ ПОРОГ, А ЧТО ПРЕДОХРАНИТЕЛЬ. Дорога кончается по одному из
-    трёх: дошли; путь не сокращается WALK_STALL секунд; вызванный
-    снаружи enough() сказал «нужное уже снято». budget — только
-    предохранитель от зависания. Это и есть лечение мигания: ни одно из
-    условий не спрашивает, УСПЕЛА ли машина за отведённое время.
-
-    probe() зовётся по дороге (снять то, что видно только в пути),
-    enough() — можно ли уже разворачиваться.
-
-    Две поправки, заработанные прогоном (обе — про настоящую физику, а не
-    про проверку):
-
-    * продвижение считается по ДЛИНЕ ОСТАВШЕГОСЯ ПУТИ, а не по расстоянию по
-      прямой: на карте из комнат и коридоров честный обход стены регулярно
-      уводит ОТ цели, и первый вариант объявлял это застреванием;
-    * персонаж намертво встаёт плечом об угол. Тело круглое, R=0.35 (4.2), а
-      коридор шириной ровно в клетку: от середины можно уйти только на 0.15
-      клетки, дальше край тела цепляет соседний ряд. physics.move_circle в
-      этот момент обнуляет скорость по оси, и при одной зажатой клавише
-      персонаж стоит вечно — замерено: 27 секунд в одной точке. Человек в
-      этом месте просто дёргает поперёк, и мы делаем то же.
-    """
-    t0 = time.time()
-    best = 10 ** 9
-    last_gain = t0
-    dist = 1e9
-    nudges = 0
-    px = py = None
-    pt = t0
-    side = 1
-    while time.time() - t0 < budget:
-        if probe is not None:
-            probe()
-        if enough is not None and enough():
-            keys.release()
-            return True, dist, time.time() - t0, nudges
-        me = tab.self_pos()
-        if me is None:
-            break
-        mx, my = me["x"], me["y"]
-        dist = math.hypot(mx - (target[0] + 0.5), my - (target[1] + 0.5))
-        if dist < 0.9:
-            keys.release()
-            return True, dist, time.time() - t0, nudges
-        path = bfs_path(level, (int(mx), int(my)), target)
-        if not path:
-            break
-        if len(path) < best:
-            best = len(path)
-            last_gain = time.time()
-        if time.time() - last_gain > WALK_STALL:
-            break                      # путь не сокращается — дальше незачем
-        wp = pick_wp(level, mx, my, path)
-        dx, dy = wp[0] + 0.5 - mx, wp[1] + 0.5 - my
-        moved = 1e9 if px is None else math.hypot(mx - px, my - py)
-        if moved < 0.08 and time.time() - pt > 0.45:
-            nudges += 1
-            keys.set(keys_for(-dy * side, dx * side))   # поперёк курса
-            time.sleep(0.2)
-            side = -side
-            px, py, pt = mx, my, time.time()
-            continue
-        if moved >= 0.08:
-            px, py, pt = mx, my, time.time()
-        keys.set(keys_for(dx, dy))
-        time.sleep(0.08)
-    keys.release()
-    return False, dist, time.time() - t0, nudges
-
+# Ходьба по карте (Keys, bfs_path, pick_wp, walk_to) переехала в
+# client_common.py: тем же ходоком теперь пользуется tests/client_combat.py,
+# а двух копий кода, который весь состоит из лечения настоящих граблей
+# физики, быть не должно.
 
 # --- чтение кадра ---------------------------------------------------------
 
@@ -551,6 +427,28 @@ def main():
         keys = Keys(t)
         me0 = t.self_pos()
         home = (int(me0["x"]), int(me0["y"]))
+        floor0 = level["floor"]
+
+        def short_of_stairs(mx, my):
+            """Точка пути к лестнице, не ближе STAIRS_KEEP клеток от неё.
+
+            Считается по ТОМУ ЖЕ пути, которым пошёл бы ходок: берём путь до
+            лестницы и отрезаем хвост. Так направление остаётся прежним (а
+            лестница проверке нужна именно как направление), а наступить на
+            неё становится нечем.
+            """
+            if stairs is None:
+                return None
+            path = bfs_path(level, (int(mx), int(my)), stairs)
+            if not path:
+                return None
+            for c in reversed(path):
+                if math.hypot(c[0] - stairs[0], c[1] - stairs[1]) >= STAIRS_KEEP:
+                    return c
+            return path[0]           # мы и так рядом — никуда не идём
+
+        # Клетка лестницы для всех дорог проверки — стена: по ней не ходят.
+        avoid = () if stairs is None else (stairs,)
 
         # Замер лестницы снимается ПО ДОРОГЕ, а разворот делается, когда
         # снято всё нужное, — ни то, ни другое не спрашивает, успела ли
@@ -608,7 +506,12 @@ def main():
             stairs_tried = False
             while time.time() - t_walk < WALK_BUDGET:
                 if "ratio" not in got and not stairs_tried:
-                    tgt, why = stairs, "к лестнице"
+                    me = t.self_pos()
+                    tgt = short_of_stairs(me["x"], me["y"])
+                    why = "в сторону лестницы, не доходя %.0f клеток" % STAIRS_KEEP
+                    if tgt is None:
+                        stairs_tried = True
+                        continue
                 elif enough():
                     break
                 else:
@@ -619,11 +522,16 @@ def main():
                     if tgt is None:
                         break          # у дома разведано всё, что доступно
                 left = WALK_BUDGET - (time.time() - t_walk)
+                # Нога «в сторону лестницы» кончается, как только число
+                # лестницы снято: дальше идти незачем, а подходить к самой
+                # лестнице — вредно (см. STAIRS_KEEP).
+                stop = (lambda: ("ratio" in got) or enough()) \
+                    if why.startswith("в сторону") else enough
                 reached, gap, secs, n = walk_to(t, level, tgt, keys, left,
-                                                probe, enough)
+                                                probe, stop, avoid)
                 nudges += n
                 legs.append("%s %s%s" % (why, tgt, "" if reached else " (не дошёл)"))
-                if why == "к лестнице":
+                if why.startswith("в сторону"):
                     stairs_tried = True
             note("дорога туда", "лестница снята %s, заново открыто в кадре "
                  "исходной точки %s клетки (хватает %d), %.1f с, ног %d: %s"
@@ -674,7 +582,7 @@ def main():
 
         # --- возврат в исходную точку -------------------------------------
         back_ok, back_gap, back_secs, back_nudges = walk_to(
-            t, level, home, keys, WALK_BUDGET)
+            t, level, home, keys, WALK_BUDGET, avoid=avoid)
         time.sleep(0.8)
         me2 = t.self_pos()
         c_end = cam(t)
@@ -688,7 +596,26 @@ def main():
               "вкладка вернулась в ту же точку — кадр сравнивается с самим собой",
               "промах %.2f клетки (порог 1.5)" % back_gap)
 
+        # Третий пояс против мины с лестницей. Смена этажа обнуляет туман
+        # (4.4) и меняет карту: замер «сколько черноты ушло в кадре исходной
+        # точки» после неё не значит ничего, и молчать об этом нельзя.
+        lvl_now = t.js("window.__zza.level()")
+        me_now = t.self_pos()
+        d_st = 1e9 if stairs is None else math.hypot(
+            me_now["x"] - (stairs[0] + 0.5), me_now["y"] - (stairs[1] + 0.5))
+        check(lvl_now["floor"] == floor0,
+              "этаж под замером не сменился (ходок не наступил на лестницу)",
+              "этаж %d, был %d; до лестницы сейчас %.2f клетки (тело на клетке "
+              "лестницы при < %.3f)" % (lvl_now["floor"], floor0, d_st, 0.707))
+
         # --- ЧИСЛО 1: чернота после ---------------------------------------
+        # Здоровье печатается рядом: враги на этаже уже есть, и в тот день,
+        # когда у них появится ИИ, упавшее hp объяснит красный кадр быстрее,
+        # чем его будут искать в тумане (красная кайма по краю кадра при
+        # hp <= 50% — это 11% пикселей, и она не чёрная).
+        hp_end = t.js("window.__zza.me()")
+        note("здоровье вкладки на замере", "hp %s/%s, flags %s"
+             % (hp_end["hp"], hp_end["hpMax"], hp_end["flags"]))
         dark_on_end = frame_dark(t)[0]
         t.js("window.__zza.setFog(false)")
         time.sleep(0.25)

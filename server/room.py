@@ -24,6 +24,7 @@ import asyncio
 import random
 import time
 
+from . import ai
 from . import gen
 from . import proto
 from . import world as world_mod
@@ -143,6 +144,8 @@ class Room(object):
         fl = gen.generate(s.seed, s.floor, s.map_w, s.map_h, s.theme)
         self.world = world_mod.World(fl.grid, s.seed, s.floor,
                                      fl.spawns, fl.stairs)
+        # 8.1: враги по комнатам, кроме стартовой, числом от глубины этажа
+        ai.populate(self.world, fl)
         for i, p in enumerate(self.players.values()):
             e = self.world.spawn_player(p.name, i)
             p.ent_id = e.id
@@ -334,6 +337,7 @@ class Room(object):
         s.floor += 1
         fl = gen.generate(s.seed, s.floor, s.map_w, s.map_h, s.theme)
         self.world.enter_floor(s.floor, fl.grid, fl.spawns, fl.stairs)
+        ai.populate(self.world, fl)      # 8.1: этаж глубже — врагов больше
         for p in self.players.values():
             # 5.2: при смене этажа клиент получает level и полный снапшот.
             # Порядок обязателен: level чистит у клиента сущности и туман,

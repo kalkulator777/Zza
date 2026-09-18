@@ -29,9 +29,30 @@ export const K_ENEMY = 2;
 export const K_PROP = 3;
 export const K_SHOT = 4;
 
-// flags (DESIGN.md 4.3)
+// flags (DESIGN.md 4.3). WINDUP и DASH — НЕ украшение: 5.2 запрещает держать
+// состояние на событиях ev, поэтому замах (8 тиков) и рывок (5 тиков) клиенту
+// больше нечем рисовать. Читаются каждый кадр, объявлены здесь один раз.
 export const F_DEAD = 1;
 export const F_OFFLINE = 2;
+export const F_WINDUP = 4;
+export const F_DASH = 8;
+
+// Виды событий ev (5.2). На проводе — строки; внутри клиента числа, чтобы
+// сравнение в горячем пути рендера было числовым, а не строковым.
+export const FX_HIT = 1;
+export const FX_DIE = 2;
+export const FX_SHOT = 3;
+export const FX_BOOM = 4;
+const FX_KIND = { hit: FX_HIT, die: FX_DIE, shot: FX_SHOT, boom: FX_BOOM };
+
+// Сколько вспышек живёт одновременно. 5.2: потолок событий 64 на тик, а
+// вспышка живёт 0.3 с = 9 тиков; честный потолок 64*9 = 576 записей в кадре
+// не нужен никому — глазом в одной точке различимы единицы. 96 — это полтора
+// потолка ОДНОГО тика: пачка из одного тика влезает целиком, а дальше новые
+// вспышки затирают самые старые. Кольцо выделено один раз: мусор на 30 Гц
+// событий сборщик собирает не бесплатно.
+const FX_MAX = 96;
+const FX_LIFE_MS = 300;
 
 // Тайлы карты (DESIGN.md 4.1, server/physics.py)
 export const TILE_WALL = 0;
@@ -61,6 +82,10 @@ const HARD_RESYNC = 6;       // тиков: больше — не догоняе
 // Скорость бега игрока (DESIGN.md 4.2) — нужна только для опознания своей
 // сущности по корреляции ввода, на отрисовку не влияет.
 const SPEED_RUN = 5.0;
+
+// Глубина журнала событий для проверок. 64 — потолок событий на тик (4.2),
+// то есть журнал вмещает ровно одну самую тяжёлую пачку.
+const EVLOG = 64;
 
 function lerp(a, b, t) { return a + (b - a) * t; }
 
@@ -154,6 +179,31 @@ export class WorldState {
     // проверка плавности умеет краснеть.
     this.interp = true;
 
+    // --- вспышки от событий ev (5.2) ------------------------------------
+    // Кольцо предвыделенных записей. Событие МОЖЕТ ПОТЕРЯТЬСЯ, и на нём
+    // нельзя держать состояние (5.2): отсюда и срок жизни в миллисекундах, и
+    // то, что ни одна проверка игры сюда не смотрит. Полоска здоровья, замах
+    // и рывок живут в снапшоте, а здесь — только то, что нельзя восстановить.
+    this.fx = new Array(FX_MAX);
+    for (let i = 0; i < FX_MAX; i++) {
+      this.fx[i] = { k: 0, x: 0, y: 0, dmg: 0, a: 0, b: 0, t0: -1e9, tick: 0 };
+    }
+    this.fxI = 0;
+    this.fxOn = true;        // выключатель для проверки «умеет краснеть»
+    this.evs = 0;            // сколько событий пришло за забег
+
+    // Журнал событий для проверок: кольцо ЧИСЕЛ, без единого объекта в
+    // горячем пути. tests/client_combat.py читает его, чтобы сказать, на
+    // каком тике пришло hit.
+    this.evK = new Int32Array(EVLOG);
+    this.evTick = new Int32Array(EVLOG);
+    this.evA = new Int32Array(EVLOG);
+    this.evB = new Int32Array(EVLOG);
+    this.evDmg = new Int32Array(EVLOG);
+    this.evNow = new Float64Array(EVLOG);
+    this.evI = 0;
+    this.evN = 0;
+
     // своя сущность (см. selfId ниже)
     this.pid = 0;
     this.room = '';
@@ -167,7 +217,8 @@ export class WorldState {
 
     this.view = { tick: 0, alpha: 0, level: null, ents: this.order,
                   self: null, selfId: 0, interp: true,
-                  fog: null, fogVersion: 0 };
+                  fog: null, fogVersion: 0,
+                  fx: null, fxLife: FX_LIFE_MS, now: 0 };
   }
 
   reset() {
@@ -221,6 +272,58 @@ export class WorldState {
       const first = this._sentMv.keys().next().value;
       this._sentMv.delete(first);
     }
+  }
+
+  /**
+   * Событие ev (5.2). ТОЛЬКО вспышка и журнал: ни одно поле мира отсюда не
+   * меняется. Здоровье, смерть, замах и рывок берутся из снапшота — событие
+   * может потеряться, и клиент, который держал бы на нём состояние, показал
+   * бы игроку ложь ровно в тот момент, когда сеть просела.
+   */
+  pushEvent(m, nowMs) {
+    const k = FX_KIND[m.k] || 0;
+    if (!k) return 0;
+    this.evs++;
+    const now = nowMs === undefined ? performance.now() : nowMs;
+
+    const j = this.evI;
+    this.evK[j] = k;
+    this.evTick[j] = m.tick | 0;
+    this.evA[j] = m.a | 0;
+    this.evB[j] = m.b | 0;
+    this.evDmg[j] = m.dmg | 0;
+    this.evNow[j] = now;
+    this.evI = (j + 1) % EVLOG;
+    if (this.evN < EVLOG) this.evN++;
+
+    if (!this.fxOn) return k;
+    // Координаты у события есть не всегда (5.2 не требует их от каждого
+    // вида): без точки вспышку рисовать негде — берём того, с кем это
+    // случилось, из мира. Если и его нет — вспышки просто не будет.
+    let x = m.x, y = m.y;
+    if (typeof x !== 'number' || typeof y !== 'number') {
+      const e = this.ents.get(m.b) || this.ents.get(m.a);
+      if (e === undefined) return k;
+      x = e.dx; y = e.dy;
+    }
+    const f = this.fx[this.fxI];
+    this.fxI = (this.fxI + 1) % FX_MAX;
+    f.k = k; f.x = x; f.y = y; f.dmg = m.dmg | 0;
+    f.a = m.a | 0; f.b = m.b | 0; f.t0 = now; f.tick = m.tick | 0;
+    return k;
+  }
+
+  /** Последние события журналом (для проверок, не для игры). */
+  evLog() {
+    const out = [];
+    const n = this.evN;
+    const base = (this.evI - n + EVLOG * 2) % EVLOG;
+    for (let i = 0; i < n; i++) {
+      const j = (base + i) % EVLOG;
+      out.push({ k: this.evK[j], tick: this.evTick[j], a: this.evA[j],
+                 b: this.evB[j], dmg: this.evDmg[j], now: this.evNow[j] });
+    }
+    return out;
   }
 
   applySnap(m) {
@@ -434,6 +537,11 @@ export class WorldState {
     // красный прогон tests/client_fog.py.
     v.fog = this.fogOn ? this.fog : null;
     v.fogVersion = this.fogVersion;
+    // Вспышки: рендер сам решает, какие из них ещё живы (по now - t0).
+    // Чистить кольцо здесь незачем — просроченная запись стоит одного
+    // сравнения, а сборка живого списка каждый кадр стоила бы мусора.
+    v.fx = this.fxOn ? this.fx : null;
+    v.now = nowMs;
     return v;
   }
 }

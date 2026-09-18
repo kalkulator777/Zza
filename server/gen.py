@@ -32,6 +32,7 @@
 
 import random
 
+from . import nav
 from . import physics
 
 TILE_WALL = physics.TILE_WALL      # 0
@@ -120,47 +121,12 @@ class Floor(object):
 
 # --- карта расстояний ------------------------------------------------------
 # Одна структура на три задачи: связность при генерации (здесь), поиск пути
-# врагов (8.3) и распространение шума (8.2). Волновой обход по 4 соседям,
-# стоимость клетки 1. См. отчёт этапа 1: выносить в отдельный модуль стоит
-# на этапе 2, когда появится второй потребитель.
+# врагов (8.3) и распространение шума (8.2). 8.3 разрешал держать её в этом
+# файле ровно до появления ВТОРОГО потребителя; на этапе 2b он появился, и
+# волна переехала в server/nav.py. Имя gen.distance_map оставлено: генератор
+# зовёт его в четырёх местах, и менять их ради переезда незачем.
 
-def distance_map(grid, sources, limit=-1):
-    """BFS от списка клеток. Возвращает list[int], -1 = недостижимо."""
-    w = grid.w
-    h = grid.h
-    tiles = grid.tiles
-    dist = [-1] * (w * h)
-    frontier = []
-    for tx, ty in sources:
-        if 0 <= tx < w and 0 <= ty < h:
-            i = ty * w + tx
-            if tiles[i] != TILE_WALL and dist[i] < 0:
-                dist[i] = 0
-                frontier.append(i)
-    d = 0
-    while frontier:
-        if limit >= 0 and d >= limit:
-            break
-        d += 1
-        nxt = []
-        for i in frontier:
-            x = i % w
-            if x > 0 and dist[i - 1] < 0 and tiles[i - 1] != TILE_WALL:
-                dist[i - 1] = d
-                nxt.append(i - 1)
-            if x < w - 1 and dist[i + 1] < 0 and tiles[i + 1] != TILE_WALL:
-                dist[i + 1] = d
-                nxt.append(i + 1)
-            j = i - w
-            if j >= 0 and dist[j] < 0 and tiles[j] != TILE_WALL:
-                dist[j] = d
-                nxt.append(j)
-            j = i + w
-            if j < w * h and dist[j] < 0 and tiles[j] != TILE_WALL:
-                dist[j] = d
-                nxt.append(j)
-        frontier = nxt
-    return dist
+distance_map = nav.distance_map
 
 
 # --- разбиение -------------------------------------------------------------

@@ -17,11 +17,26 @@
 // выступ вверх (рисуется в статическом слое, то есть бесплатно).
 
 import { K_PLAYER, K_ENEMY, K_PROP, K_SHOT, F_DEAD, F_OFFLINE,
+         F_WINDUP, F_DASH, FX_HIT, FX_DIE, FX_SHOT, FX_BOOM,
          TILE_WALL, TILE_STAIRS, VIS_DARK, VIS_LIT }
   from './state.js';
 
 const MARGIN_TILES = 10;     // запас кэша карты вокруг экрана, в клетках
 const WALL_RISE = 0.45;      // высота фальшивого выступа стены, в клетках
+
+// --- бой (DESIGN.md 4.2) --------------------------------------------------
+// Дуга удара рисуется ТЕМИ ЖЕ числами, какими сервер её считает: дальность
+// 1.2 клетки от центра, полная ширина 110 градусов. Расходиться им нельзя —
+// нарисованная дуга это обещание игроку, куда придёт удар.
+const MELEE_REACH = 1.2;
+const MELEE_ARC = 110 * Math.PI / 180;
+// Хвост снаряда: 12 кл/с (4.2) за 1.5 кадра при 30 Гц — 0.4 клетки. Это не
+// украшение: точка радиусом 0.12 клетки на скорости 12 кл/с иначе читается
+// как мерцание, а не как летящий предмет.
+const SHOT_TAIL = 0.40;
+// Полоска здоровья над головой. 0.8 клетки в ширину — уже головы (0.7) на
+// столько, чтобы край полоски не сливался с телом.
+const HPBAR_W = 0.8;
 
 // --- туман (DESIGN.md 4.4, значения 5.2) ---------------------------------
 //
@@ -71,7 +86,36 @@ const COL = {
   stairsStepA: '#caa14a',
   stairsStepB: '#8f6f2c',
   stairsEdge: '#f0c96a',
+
+  // --- бой ---------------------------------------------------------------
+  // Замах — тёплый и ОЧЕНЬ светлый: он обязан читаться в темноте подземелья
+  // за долю секунды. Заливка сектора даёт площадь (её видно краем глаза),
+  // кромка даёт точную границу (по ней видно, попадёшь ли).
+  windupFill: 'rgba(255,186,54,0.30)',
+  windupEdge: '#ffd86b',
+  windupRing: 'rgba(255,214,107,0.55)',
+  // Рывок — холодный: он про неуязвимость, а не про урон, и путать его с
+  // замахом нельзя ни в каком кадре.
+  dashRing: '#8fe6ff',
+  dashTrail: 'rgba(143,230,255,0.20)',
+  // Вспышки событий (5.2). Держатся 0.3 с и состояния не несут.
+  fxHit: '#ff7a4a',
+  fxHitCore: '#ffd9c0',
+  fxDie: '#dce9ff',
+  fxShot: '#ffe27a',
+  fxBoom: '#ffb066',
+  hpGood: '#7fd18a',
+  hpLow: '#e0a04a',
+  hpBad: '#d16a6a',
+  hpBack: 'rgba(0,0,0,0.62)',
+  hurtEdge: 'rgba(190,40,30,0.55)',
 };
+
+// Порог «мало здоровья»: ниже него полоска краснеет и по краю кадра идёт
+// красная кайма. 0.5 — это ровно 2 попадания врага ближней атакой (20 урона,
+// 4.2) до порога и ещё 2 после: предупреждение приходит на середине пути,
+// а не когда всё уже решено.
+const HURT_AT = 0.5;
 
 const KIND = {};
 KIND[K_PLAYER] = { r: 0.35, css: '#7fd18a', ring: '#dff3e2' };
@@ -142,7 +186,16 @@ export function createRenderer() {
     fogRepaints: 0,
 
     camX: 0, camY: 0,
-    _drawCalls: 0, _ents: 0, _ms: 0, _hidden: 0,
+    _drawCalls: 0, _ents: 0, _ms: 0, _hidden: 0, _fx: 0,
+
+    // Выключатели существуют ровно затем же, зачем setFog и setInterp:
+    // чтобы проверка боя умела ПОКРАСНЕТЬ, а замер «стоимость кадра до и
+    // после» делался на одной сцене спина к спине.
+    //   combat=false — рендер ровно такой, каким он был до этой работы:
+    //     ни замаха, ни рывка, ни вспышек, ни своего здоровья;
+    //   windup=false — всё остальное на месте, не рисуется только замах.
+    combat: true, windup: true,
+
     _pool: [], _vis: [],
 
     // --- 7.1 ---------------------------------------------------------
@@ -180,7 +233,8 @@ export function createRenderer() {
       // hidden — сущности, скрытые туманом (их сервер прислал, а группа их
       // не видит). Число для tests/client_fog.py и для оверлея отладки.
       return { drawCalls: this._drawCalls, ents: this._ents, ms: this._ms,
-               hidden: this._hidden, fogRepaints: this.fogRepaints };
+               hidden: this._hidden, fogRepaints: this.fogRepaints,
+               fx: this._fx };
     },
 
     // --- камера ------------------------------------------------------
@@ -419,12 +473,100 @@ export function createRenderer() {
 
     // --- сущности ----------------------------------------------------
 
+    // --- бой: замах и рывок живут в flags (4.3), а не в событиях ------
+    //
+    // Почему это вообще рисуется отдельной функцией, а не двумя строчками в
+    // теле сущности: замах обязан быть виден ВСЕ 8 тиков (0.267 с) и обязан
+    // показывать, КУДА придёт удар. Сервер замораживает facing на время
+    // замаха (combat.start_melee), поэтому нарисованный сектор — это не
+    // намёк, а обещание: удар придёт ровно в него.
+
+    _drawWindup(e, sx, sy, r) {
+      const ctx = this.ctx;
+      const reach = MELEE_REACH * this.tilePx;
+      const a0 = e.dfacing - MELEE_ARC / 2;
+      const a1 = e.dfacing + MELEE_ARC / 2;
+      // Сектор: заливка даёт площадь, её видно краем глаза.
+      ctx.fillStyle = COL.windupFill;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.arc(sx, sy, reach, a0, a1);
+      ctx.closePath();
+      ctx.fill();
+      // Кромка: по ней видно точную границу досягаемости.
+      ctx.strokeStyle = COL.windupEdge;
+      ctx.lineWidth = Math.max(2, r * 0.18);
+      ctx.stroke();
+      // Кольцо вокруг самого бойца: если сектор ушёл за край кадра или
+      // накрыт телом соседа, замах всё равно видно по владельцу.
+      ctx.strokeStyle = COL.windupRing;
+      ctx.lineWidth = Math.max(2, r * 0.26);
+      ctx.beginPath();
+      ctx.arc(sx, sy, r * 1.15, 0, Math.PI * 2);
+      ctx.stroke();
+      this._drawCalls += 3;
+    },
+
+    _drawDash(e, sx, sy, r) {
+      const ctx = this.ctx, tpx = this.tilePx;
+      // Хвост строится по СКОРОСТИ из снапшота: направление рывка отдельным
+      // полем не передаётся, а vx/vy на рывке — это ровно оно (14 кл/с).
+      let dx = e.vx, dy = e.vy;
+      const d = Math.hypot(dx, dy);
+      if (d > 1e-6) {
+        dx /= d; dy /= d;
+        ctx.fillStyle = COL.dashTrail;
+        for (let i = 1; i <= 3; i++) {
+          const k = i * 0.32 * tpx;
+          ctx.beginPath();
+          ctx.arc(sx - dx * k, sy - dy * k, r * (1 - i * 0.18), 0, Math.PI * 2);
+          ctx.fill();
+        }
+        this._drawCalls += 3;
+      }
+      // Кольцо неуязвимости: холодное и яркое, чтобы «меня сейчас не
+      // достать» читалось с одного взгляда и отличалось от замаха.
+      ctx.strokeStyle = COL.dashRing;
+      ctx.lineWidth = Math.max(2, r * 0.22);
+      ctx.beginPath();
+      ctx.arc(sx, sy, r * 1.45, 0, Math.PI * 2);
+      ctx.stroke();
+      this._drawCalls++;
+    },
+
+    _drawShot(e, sx, sy, r) {
+      const ctx = this.ctx, tpx = this.tilePx;
+      let dx = e.vx, dy = e.vy;
+      const d = Math.hypot(dx, dy);
+      if (d > 1e-6) {
+        dx /= d; dy /= d;
+        const tail = SHOT_TAIL * tpx;
+        ctx.strokeStyle = COL.fxShot;
+        ctx.lineWidth = Math.max(2, r * 1.1);
+        ctx.beginPath();
+        ctx.moveTo(sx - dx * tail, sy - dy * tail);
+        ctx.lineTo(sx, sy);
+        ctx.stroke();
+        this._drawCalls++;
+      }
+      ctx.fillStyle = '#fff6cf';
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fill();
+      this._drawCalls++;
+    },
+
     _drawEntity(e, sx, sy, isSelf) {
       const ctx = this.ctx, tpx = this.tilePx;
       const k = KIND[e.kind] || KIND_DEF;
       const r = k.r * tpx;
       const dead = (e.flags & F_DEAD) !== 0;
       const offline = (e.flags & F_OFFLINE) !== 0;
+
+      if (e.kind === K_SHOT) {          // снаряд: ни тени, ни полоски, ни глаз
+        this._drawShot(e, sx, sy, r);
+        return;
+      }
 
       // Тень — плоский эллипс, без shadowBlur (7.2).
       if (!dead) {
@@ -433,6 +575,14 @@ export function createRenderer() {
         ctx.ellipse(sx, sy + r * 0.75, r * 0.95, r * 0.42, 0, 0, Math.PI * 2);
         ctx.fill();
         this._drawCalls++;
+      }
+
+      // Замах — ПОД телом: тело сверху, сектор вокруг него.
+      if (this.combat && this.windup && !dead && (e.flags & F_WINDUP)) {
+        this._drawWindup(e, sx, sy, r);
+      }
+      if (this.combat && !dead && (e.flags & F_DASH)) {
+        this._drawDash(e, sx, sy, r);
       }
 
       // 4.3: бит 1 = мёртв -> дух (полупрозрачный, холодный).
@@ -469,17 +619,21 @@ export function createRenderer() {
       }
       ctx.globalAlpha = 1;
 
-      // Полоска здоровья — ради неё hp_max и живёт в снапшоте (4.3)
+      // Полоска здоровья — ради неё hp_max и живёт в снапшоте (4.3).
+      // Берётся ТОЛЬКО из снапшота: событие hit может потеряться (5.2), и
+      // полоска, собранная из событий, показала бы ложь ровно в тот момент,
+      // когда сеть просела.
       if (!dead && e.hpMax > 0 && e.hp < e.hpMax &&
           (e.kind === K_PLAYER || e.kind === K_ENEMY)) {
-        const bw = tpx * 0.8, bh = Math.max(3, tpx * 0.09);
+        const f = Math.max(0, Math.min(1, e.hp / e.hpMax));
+        const bw = tpx * HPBAR_W, bh = Math.max(3, tpx * 0.09);
         const bx = sx - bw / 2, by = sy - r - bh * 2.2;
-        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillStyle = COL.hpBack;
         ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
-        ctx.fillStyle = '#d16a6a';
+        ctx.fillStyle = COL.hpBad;
         ctx.fillRect(bx, by, bw, bh);
-        ctx.fillStyle = '#7fd18a';
-        ctx.fillRect(bx, by, bw * Math.max(0, e.hp / e.hpMax), bh);
+        ctx.fillStyle = f > HURT_AT ? COL.hpGood : COL.hpLow;
+        ctx.fillRect(bx, by, bw * f, bh);
         this._drawCalls += 3;
       }
 
@@ -492,6 +646,149 @@ export function createRenderer() {
         const spr = textSprite('дух', '12px system-ui, sans-serif', '#9fc8ff');
         ctx.drawImage(spr, sx - spr.width / 2, sy - r - spr.height - 4);
         this._drawCalls++;
+      }
+    },
+
+    // --- вспышки событий (5.2) ---------------------------------------
+    //
+    // Событие может потеряться, состояния на нём нет: пропавшая вспышка
+    // стоит ровно одной невидимой искры, а не вранья на экране. Всё, что
+    // тут рисуется, — плоские заливки и обводки: ни градиента, ни
+    // shadowBlur, ни composite (7.2). Градиент в кадре — самая частая
+    // причина, по которой «красивые вспышки» съедают бюджет.
+
+    _drawFx(view, now) {
+      const fx = view.fx;
+      this._fx = 0;
+      if (!fx || !this.combat) return;
+      const ctx = this.ctx, tpx = this.tilePx, life = view.fxLife;
+      const fogOn = !!(view.fog && view.level);
+      const me = view.selfId;
+      for (let i = 0; i < fx.length; i++) {
+        const f = fx[i];
+        if (f.k === 0) continue;
+        const age = now - f.t0;
+        if (age < 0 || age > life) continue;
+        const sx = (f.x - this.camX) * tpx;
+        const sy = (f.y - this.camY) * tpx;
+        if (sx < -tpx * 2 || sy < -tpx * 2 ||
+            sx > this.w + tpx * 2 || sy > this.h + tpx * 2) continue;
+        // 5.2: то, что происходит в темноте, клиент показывать не имеет
+        // права — вспышка выдала бы позицию врага не хуже его тела.
+        // Исключение то же, что и для сущностей: своё видно всегда.
+        if (fogOn && f.a !== me && f.b !== me && !this._lit(view, f.x, f.y)) continue;
+        const p = age / life;                 // 0..1 — прожитая доля
+        const fade = 1 - p;
+        this._fx++;
+        ctx.globalAlpha = fade;
+        if (f.k === FX_HIT) {
+          // Кольцо расходится, ядро гаснет на месте. Размер кольца — от
+          // урона: 20 (ближняя) заметно крупнее 12 (снаряд).
+          const grow = tpx * (0.20 + 0.50 * p) * (1 + Math.min(1, f.dmg / 40));
+          ctx.strokeStyle = COL.fxHit;
+          ctx.lineWidth = Math.max(2, tpx * 0.09 * fade);
+          ctx.beginPath();
+          ctx.arc(sx, sy, grow, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.fillStyle = COL.fxHitCore;
+          ctx.beginPath();
+          ctx.arc(sx, sy, tpx * 0.16 * fade, 0, Math.PI * 2);
+          ctx.fill();
+          this._drawCalls += 2;
+        } else if (f.k === FX_DIE) {
+          ctx.strokeStyle = COL.fxDie;
+          ctx.lineWidth = Math.max(2, tpx * 0.10 * fade);
+          ctx.beginPath();
+          ctx.arc(sx, sy, tpx * (0.30 + 1.10 * p), 0, Math.PI * 2);
+          ctx.stroke();
+          this._drawCalls++;
+        } else if (f.k === FX_SHOT) {
+          ctx.fillStyle = COL.fxShot;
+          ctx.beginPath();
+          ctx.arc(sx, sy, tpx * 0.22 * fade, 0, Math.PI * 2);
+          ctx.fill();
+          this._drawCalls++;
+        } else {                              // FX_BOOM: искра о стену
+          ctx.fillStyle = COL.fxBoom;
+          ctx.beginPath();
+          ctx.arc(sx, sy, tpx * (0.10 + 0.16 * p) * fade, 0, Math.PI * 2);
+          ctx.fill();
+          this._drawCalls++;
+        }
+      }
+      ctx.globalAlpha = 1;
+    },
+
+    // --- своё здоровье и смерть: поверх виньетки ----------------------
+    //
+    // Рисуется ПОСЛЕ затемнения намеренно. Виньетка у нижнего края кадра
+    // множит на 0.2 (замерено), и полоска здоровья, положенная под неё,
+    // оказалась бы самым тусклым местом экрана — ровно то, на что смотрят
+    // в последнюю секунду жизни.
+
+    /**
+     * Где лежит полоска СВОЕГО здоровья. Отдельным методом, потому что это
+     * же число нужно проверке: она смотрит пиксели полоски, и списывать
+     * геометрию в питон означало бы завести вторую истину о раскладке.
+     */
+    hpBarRect() {
+      const w = Math.min(420, this.w * 0.28);
+      return { x: (this.w - w) / 2, y: this.h - 20 - 26, w: w, h: 20 };
+    },
+
+    _drawSelfHud(view) {
+      if (!this.combat) return;
+      const me = view.self;
+      if (!me) return;
+      const ctx = this.ctx;
+      const dead = (me.flags & F_DEAD) !== 0;
+
+      if (!dead && me.hpMax > 0) {
+        const f = Math.max(0, Math.min(1, me.hp / me.hpMax));
+        const b = this.hpBarRect();
+        const bw = b.w, bh = b.h, bx = b.x, by = b.y;
+        ctx.fillStyle = COL.hpBack;
+        ctx.fillRect(bx - 3, by - 3, bw + 6, bh + 6);
+        ctx.fillStyle = COL.hpBad;
+        ctx.fillRect(bx, by, bw, bh);
+        ctx.fillStyle = f > HURT_AT ? COL.hpGood : COL.hpLow;
+        ctx.fillRect(bx, by, bw * f, bh);
+        const spr = textSprite(me.hp + ' / ' + me.hpMax,
+                               '14px ui-monospace, Consolas, monospace', '#0a0d12');
+        ctx.drawImage(spr, bx + bw / 2 - spr.width / 2, by + bh / 2 - spr.height / 2);
+        this._drawCalls += 4;
+
+        // Мало здоровья — красная кайма по краю кадра. Кайма, а не заливка
+        // всего экрана: четыре полосы по 40 px это 0.24 млн пикселей против
+        // 2.07 млн у полного кадра, в 8.6 раза дешевле, а видно её так же.
+        if (f <= HURT_AT) {
+          const t = 40, a = (HURT_AT - f) / HURT_AT;
+          ctx.globalAlpha = 0.25 + 0.55 * a;
+          ctx.fillStyle = COL.hurtEdge;
+          ctx.fillRect(0, 0, this.w, t);
+          ctx.fillRect(0, this.h - t, this.w, t);
+          ctx.fillRect(0, t, t, this.h - t * 2);
+          ctx.fillRect(this.w - t, t, t, this.h - t * 2);
+          ctx.globalAlpha = 1;
+          this._drawCalls += 4;
+        }
+        return;
+      }
+
+      if (dead) {
+        // 8.5: смерть это не серый экран, а другой режим игры. Так и
+        // написано словами — иначе игрок пять секунд не понимает, почему
+        // он вдруг проходит сквозь стены.
+        ctx.globalAlpha = 0.16;
+        ctx.fillStyle = '#2a5fa8';
+        ctx.fillRect(0, 0, this.w, this.h);
+        ctx.globalAlpha = 1;
+        const a = textSprite('ТЫ ДУХ', '44px system-ui, sans-serif', '#cfe4ff');
+        const b = textSprite('летишь сквозь стены · воскреснешь на следующем этаже',
+                             '18px system-ui, sans-serif', '#9fc8ff');
+        ctx.drawImage(a, (this.w - a.width) / 2, this.h * 0.5 - a.height);
+        ctx.drawImage(b, (this.w - b.width) / 2, this.h * 0.5 + 6);
+        this._drawCalls += 3;
       }
     },
 
@@ -552,7 +849,16 @@ export function createRenderer() {
         const sx = (e.dx - this.camX) * tpx;
         const sy = (e.dy - this.camY) * tpx;
         if (sx < -tpx * 2 || sy < -tpx * 2 || sx > this.w + tpx * 2 || sy > this.h + tpx * 2) continue;
-        if (fogOn && e.id !== view.selfId && !this._lit(view, e.dx, e.dy)) {
+        // Своя сущность рисуется всегда (5.2). Второе исключение —
+        // МЁРТВЫЙ ИГРОК: дух не светит туман (4.4), поэтому союзник,
+        // умерший в неразведанном коридоре, не виден никому вообще, и
+        // группа теряет его насовсем. Ничего секретного это не выдаёт:
+        // враги живыми игроками не бывают (team 1 — только игроки), а
+        // трупы врагов сервер убирает из мира в тот же тик (combat.resolve).
+        // Правка 5.2 — в отчёте.
+        const ghost = e.kind === K_PLAYER && (e.flags & F_DEAD) !== 0;
+        if (fogOn && e.id !== view.selfId && !ghost &&
+            !this._lit(view, e.dx, e.dy)) {
           hidden++;
           continue;
         }
@@ -569,12 +875,19 @@ export function createRenderer() {
       this._ents = ents.length;
       this._hidden = hidden;
 
-      // 4) свет и затемнение — один блит предрасчитанного оверлея (7.2).
+      // 4) вспышки событий — ПОВЕРХ сущностей, но ПОД затемнением: искра
+      // в дальнем углу должна гаснуть в темноте вместе со всем остальным.
+      this._drawFx(view, t0);
+
+      // 5) свет и затемнение — один блит предрасчитанного оверлея (7.2).
       // q=low обходится без него: это украшение, а не механика.
       if (this.quality !== 'low' && this.vig) {
         ctx.drawImage(this.vig, 0, 0);
         this._drawCalls++;
       }
+
+      // 6) своё здоровье и «ты дух» — поверх всего: это интерфейс, а не мир.
+      this._drawSelfHud(view);
 
       this._ms = performance.now() - t0;
     },

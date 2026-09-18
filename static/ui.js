@@ -28,7 +28,27 @@ const app = {
   // запись стоимости кадра (tests/client_fog.py). Выключена по умолчанию:
   // stats() создаёт объект, и в обычной игре этот мусор ни к чему.
   msRec: false, msRing: [],
+  // запись КАДРОВ и СНАПШОТОВ для tests/client_combat.py. Оба выключены:
+  // первый читает пиксели канвы каждый кадр, второй создаёт объект на
+  // каждый снапшот — в игре ни то, ни другое не нужно.
+  watch: { on: false, x: 0, y: 0, w: 0, h: 0, out: [], max: 0 },
+  trk: { on: false, out: [], max: 0 },
 };
+
+// Хэш куска кадра. Нужен ровно одному вопросу: «изменился ли кадр», и
+// ответ должен быть ДА/НЕТ, а не «средняя яркость подросла на 0.3». FNV-1a
+// по каждому четвёртому пикселю: 4 пикселя подряд одинаковыми не бывают
+// (тело игрока 34 px в поперечнике, дуга замаха 115 px), а работы вчетверо
+// меньше — эта функция зовётся каждый кадр, пока идёт запись.
+function frameHash(data) {
+  let h = 2166136261;
+  for (let i = 0; i < data.length; i += 16) {
+    h ^= data[i]; h = Math.imul(h, 16777619);
+    h ^= data[i + 1]; h = Math.imul(h, 16777619);
+    h ^= data[i + 2]; h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
 // ---------------------------------------------------------------- экраны
 
@@ -143,8 +163,25 @@ function makeHandlers() {
       setStatus('');
       resize();
     },
-    onSnap(m) { app.world.applySnap(m); },
-    onEvent(m) { /* 5.2: события этапа 0c ещё не рисуются */ },
+    onSnap(m) {
+      app.world.applySnap(m);
+      // Запись flags/hp по СНАПШОТАМ, а не по кадрам: замах живёт в flags
+      // (4.3) и меняется ровно на тике сервера. Кадр показывает его с
+      // задержкой интерполяции (6.1), и мерить по кадру номер тика — значит
+      // мерить задержку, а не замах.
+      const tr = app.trk;
+      if (tr.on) {
+        const e = app.world.self();
+        tr.out.push({ tick: m.tick, flags: e ? e.flags : -1,
+                      hp: e ? e.hp : -1, hpMax: e ? e.hpMax : -1,
+                      now: performance.now() });
+        if (tr.out.length >= tr.max) tr.on = false;
+      }
+    },
+    // 5.2: событие — это ВСПЫШКА и ничего больше. Ни здоровье, ни замах, ни
+    // смерть отсюда не берутся: событие может потеряться, и клиент, который
+    // держал бы на нём состояние, врал бы ровно при просадке сети.
+    onEvent(m) { app.world.pushEvent(m); },
     onError(m) { setStatus('сервер: ' + (m.msg || m.code), true); },
     onInputSent(seq, mv) { app.world.noteInput(seq, mv); },
   };
@@ -176,6 +213,17 @@ function frame(now) {
     if (app.msRing.length > 600) app.msRing.shift();
   }
 
+  // Запись кадров: хэш куска канвы + тик, состояние которого в этом куске
+  // нарисовано. Только для проверок; в игре выключено.
+  const wt = app.watch;
+  if (wt.on) {
+    const g = $('c').getContext('2d');
+    const d = g.getImageData(wt.x, wt.y, wt.w, wt.h).data;
+    wt.out.push({ now: now, rt: view.tick, lt: app.world.latestTick,
+                  h: frameHash(d) });
+    if (wt.out.length >= wt.max) wt.on = false;
+  }
+
   // Запись позиций своего персонажа — для проверки плавности.
   const r = app.rec;
   if (r.on) {
@@ -197,6 +245,8 @@ function updateHud(view) {
   const n = app.net;
   $('hud').textContent =
     'fps ' + app.fps.toFixed(0) +
+    (view.self ? ('   hp ' + view.self.hp + '/' + view.self.hpMax +
+                  (view.self.flags & 1 ? ' (дух)' : '')) : '') +
     '   задержка ' + (n.rtt ? n.rtt.toFixed(1) : '—') + ' мс' +
     '   сущностей ' + s.ents + (s.hidden ? ' (в темноте ' + s.hidden + ')' : '') +
     '   тик ' + Math.floor(view.tick) + '/' + app.world.latestTick +
@@ -269,6 +319,54 @@ export function boot() {
     samples: () => app.rec.samples,
     status: () => $('status').textContent,
 
+    // --- бой (tests/client_combat.py) --------------------------------
+    // Выключатели существуют затем же, зачем setFog: чтобы проверка умела
+    // покраснеть, и чтобы «стоимость кадра до и после» мерилась на ОДНОЙ
+    // сцене спина к спине, а не на двух разных прогонах.
+    //   setCombat(false) — рендер ровно такой, каким он был до этой работы;
+    //   setWindup(false) — пропадает ТОЛЬКО замах;
+    //   setFx(false)     — пропадают только вспышки от событий.
+    setCombat: (v) => { app.render.combat = !!v; return app.render.combat; },
+    getCombat: () => app.render.combat,
+    setWindup: (v) => { app.render.windup = !!v; return app.render.windup; },
+    getWindup: () => app.render.windup,
+    setFx: (v) => { app.world.fxOn = !!v; return app.world.fxOn; },
+    getFx: () => app.world.fxOn,
+
+    // Геометрия полоски своего здоровья — из рендера, а не списана в питон.
+    hpBar: () => app.render.hpBarRect(),
+
+    // Своё здоровье и флаги — то, что клиент ОБЯЗАН нарисовать. Числа из
+    // снапшота, не из событий.
+    me: () => {
+      const e = app.world.self();
+      return e ? { id: e.id, hp: e.hp, hpMax: e.hpMax, flags: e.flags,
+                   x: e.dx, y: e.dy, facing: e.dfacing } : null;
+    },
+    // Журнал событий ev (5.2): вид, тик сервера, кто кого, сколько урона.
+    evLog: () => app.world.evLog(),
+    evs: () => app.world.evs,
+
+    // Запись СНАПШОТОВ: тик сервера и flags/hp своей сущности на нём.
+    track: (n) => { app.trk = { on: true, out: [], max: n }; return n; },
+    tracking: () => app.trk.on,
+    tracks: () => app.trk.out,
+
+    // Запись КАДРОВ: хэш куска канвы и тик, состояние которого нарисовано.
+    // Именно так отвечают на вопрос «на каком тике кадр изменился»: питон
+    // опросом из-за границы процесса такого разрешения не даёт вовсе.
+    watch: (x, y, w, h, n) => {
+      const c = $('c');
+      x = Math.max(0, Math.min(c.width - 1, Math.round(x)));
+      y = Math.max(0, Math.min(c.height - 1, Math.round(y)));
+      w = Math.max(1, Math.min(c.width - x, Math.round(w)));
+      h = Math.max(1, Math.min(c.height - y, Math.round(h)));
+      app.watch = { on: true, x: x, y: y, w: w, h: h, out: [], max: n };
+      return { x: x, y: y, w: w, h: h };
+    },
+    watching: () => app.watch.on,
+    watched: () => app.watch.out,
+
     // --- туман (tests/client_fog.py) ---------------------------------
     // Выключатель «клиент игнорирует vis» — ровно тот клиент, что был до
     // тумана. Нужен, чтобы проверка тумана умела покраснеть.
@@ -307,7 +405,7 @@ export function boot() {
       }
       const n = d.length / 4;
       return { n: n, dark: dark, frac: dark / n, maxCh: maxCh, maxR: maxR,
-               mean: sum / n, box: [x, y, w, h] };
+               mean: sum / n, box: [x, y, w, h], hash: frameHash(d) };
     },
 
     // Подать сообщение тем же путём, каким его подаёт провод: net._onMessage

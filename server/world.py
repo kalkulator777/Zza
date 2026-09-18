@@ -11,6 +11,7 @@
 
 import math
 
+from . import nav
 from . import physics
 from . import proto
 from . import vis as vis_mod
@@ -41,6 +42,23 @@ SPEED_SHOT = 12.0
 
 R_PLAYER = 0.35   # радиус игрока: проходит в проём в одну клетку
 
+# --- громкость действий (8.2), в КЛЕТКАХ ПУТИ, а не по прямой -------------
+# Шум считается волной по полу (nav.noise_wave), поэтому «18» — это 18
+# клеток обхода стен, а не круг радиуса 18.
+#
+# ОТКУДА ЧИСЛА. Комната генератора — 4..11 клеток стороной (gen.Theme), её
+# диагональ не больше 15; коридор между центрами соседних комнат — десятки
+# клеток. Отсюда три уровня, а не три вкуса:
+#   * выстрел 18 — заведомо больше комнаты: слышно ЗА дверью, в соседней;
+#     это и есть «дальний бой громкий» (8.2), и это цена стрельбы;
+#   * ближняя атака 6 — заведомо меньше комнаты: слышно тех, кто и так
+#     рядом, за дверь не уходит;
+#   * рывок 2 — соседние клетки, «почти беззвучно» (8.2).
+# 18 — ещё и то число, на котором 8.3 замерил цену волны: 0.046 мс.
+NOISE_SHOT = 18
+NOISE_MELEE = 6
+NOISE_DASH = 2
+
 
 def _clamp(v, lo, hi):
     return lo if v < lo else (hi if v > hi else v)
@@ -54,6 +72,9 @@ def _clamp(v, lo, hi):
 # Обратный порядок (import combat первым) тоже проверен: тогда world
 # выполняется целиком, а combat получает уже готовый модуль.
 from . import combat        # noqa: E402
+# ai.py читает combat и world; стоит ниже combat по той же причине,
+# что и combat: к этому моменту оба нужных ему модуля уже готовы.
+from . import ai            # noqa: E402
 
 
 class Entity(object):
@@ -69,7 +90,10 @@ class Entity(object):
                  # world.tick съехать не может.
                  "atk_hit", "atk_ready", "dash_end", "dash_ready",
                  "dash_dx", "dash_dy", "inv_end", "shot_ready", "shot_q",
-                 "owner", "dmg")
+                 "owner", "dmg",
+                 # ИИ (ai.py). На проводе их нет: 4.3 разрешает ровно десять
+                 # полей, и вид врага в них не влезает.
+                 "ai", "ai_alert", "ai_wind")
 
     def __init__(self, eid, kind, x, y):
         self.id = eid
@@ -105,6 +129,9 @@ class Entity(object):
         self.shot_q = 0         # выстрел заказан, родится в combat.resolve
         self.owner = 0          # для снаряда: чей
         self.dmg = 0            # для снаряда: сколько снимает
+        self.ai = 0             # вид поведения (ai.AI_*), 0 — ИИ нет
+        self.ai_alert = 0       # тик, до которого враг гонится без видимости
+        self.ai_wind = 0        # тик выстрела врага (0 — замаха нет)
 
 
 class World(object):
@@ -123,6 +150,11 @@ class World(object):
         self._sent = {}        # id -> последний отправленный массив
         self._removed = []     # id, удалённые с прошлой дельты
         self.events = []       # (tick, kind, kw) -> proto.ev, вынимает комната
+        # Карта расстояний до живых игроков (8.3). ОДНА на этаж и на всех
+        # врагов: пересчёт раз в nav.NAV_PERIOD тиков, см. server/nav.py.
+        self.nav = nav.Field(grid)
+        self.noises = []       # (tx, ty, громкость, команда) — шум этого тика
+        self.noise_waves = 0   # сколько волн шума посчитано за жизнь мира
 
     # --- реестр ------------------------------------------------------------
 
@@ -154,6 +186,11 @@ class World(object):
     def step(self, dt=DT):
         self.tick += 1
         grid = self.grid
+        # ИИ врагов — ДО движения: он выставляет vx/vy, которые физика ниже
+        # и отрабатывает (вместе с подталкиванием на углах 4.2a, без которого
+        # враг встаёт в первом же проёме — 8.3). Состав мира ai.step не
+        # меняет, поэтому словарь под ним не шевелится.
+        ai.step(self, dt)
         gone = None
         for e in self.entities.values():
             # кнопки и боевые таймеры — до движения: рывок выставляет скорость
@@ -241,6 +278,24 @@ class World(object):
         if len(self.events) < self.MAX_EVENTS:
             self.events.append((self.tick, kind, kw))
 
+    # --- шум (8.2) ---------------------------------------------------------
+
+    MAX_NOISES = 32
+
+    def make_noise(self, x, y, loud, team=0):
+        """Сложить шум; разбирает ai.step в начале СЛЕДУЮЩЕГО тика.
+
+        Отложенность намеренная и стоит ровно один тик (33 мс): шум рождается
+        внутри прохода по сущностям (combat.begin) и внутри combat.resolve,
+        а волну там считать нельзя — она должна быть ОДНА на все источники
+        одной громкости, а не по волне на каждый выстрел (8.3).
+
+        Потолок — предохранитель, как у событий: мир можно шагать и без ИИ
+        (стенд, проверка), тогда список никто не вычерпывает.
+        """
+        if len(self.noises) < self.MAX_NOISES:
+            self.noises.append((int(x), int(y), int(loud), int(team)))
+
     # --- смена этажа (8.1) -------------------------------------------------
 
     def enter_floor(self, floor, grid, spawns, stairs):
@@ -254,6 +309,8 @@ class World(object):
         self.grid = grid
         self.spawns = spawns or [(2.5, 2.5)]
         self.stairs = stairs
+        self.nav.drop()          # карта старого этажа больше ничего не значит
+        del self.noises[:]
         if grid.w * grid.h == self.fog.n:
             self.fog.grid = grid
             self.fog.forget_all()     # 4.4: память группы забывается целиком

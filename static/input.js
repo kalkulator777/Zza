@@ -7,11 +7,15 @@
 // с частотой ~30-60 Гц, а на некоторых раскладках и чаще) не превращается
 // в поток сообщений: повторы просто перезаписывают один и тот же бит.
 
-// btn: битовая маска (5.1)
-export const BTN_ATTACK = 1;
-export const BTN_DASH = 2;
-export const BTN_USE = 4;
-export const BTN_ITEM = 8;
+// btn: битовая маска (5.1). Дальний бой получил СВОЙ бит 8, предмет уехал
+// на 16 — до этапа 2a бита под стрельбу в контракте не было вовсе, и снаряд
+// висел на бите предмета. Значения берутся из 5.1, а не из того, что было в
+// коде раньше.
+export const BTN_ATTACK = 1;    // ближняя атака
+export const BTN_DASH = 2;      // рывок
+export const BTN_USE = 4;       // действие
+export const BTN_SHOOT = 8;     // дальняя атака
+export const BTN_ITEM = 16;     // предмет
 
 const MOVE_KEYS = {
   KeyW: [0, -1], ArrowUp: [0, -1],
@@ -28,9 +32,14 @@ const MOVE_KEYS_FALLBACK = {
   ц: [0, -1], ы: [0, 1], ф: [-1, 0], в: [1, 0],
 };
 
+// Клавиатурные дубли боевых кнопок есть намеренно. Мышь — основной путь
+// (ЛКМ ближняя, ПКМ дальняя), но кнопка, которую нельзя нажать с клавиатуры,
+// не проверяется автоматически: playwright жмёт клавиши по коду, а мышь — по
+// пикселям, и пиксели зависят от того, куда уехала камера.
 const BTN_KEYS = {
   Space: BTN_DASH, ShiftLeft: BTN_DASH, ShiftRight: BTN_DASH,
   KeyE: BTN_USE, KeyQ: BTN_ITEM,
+  KeyF: BTN_ATTACK, KeyR: BTN_SHOOT,
 };
 
 // Клавиши, у которых поведение браузера по умолчанию мешает игре
@@ -133,7 +142,9 @@ export class Input {
   _mouse(e, isDown) {
     if (!this.enabled) return;
     if (isDown && e.target !== this.canvas) return;
-    const bit = e.button === 0 ? BTN_ATTACK : (e.button === 2 ? BTN_USE : 0);
+    // ПКМ — дальняя атака (бит 8), а не «действие»: действие висит на E,
+    // и отдавать правую кнопку мыши под него в игре про бой — расточительство.
+    const bit = e.button === 0 ? BTN_ATTACK : (e.button === 2 ? BTN_SHOOT : 0);
     if (!bit) return;
     if (isDown) { this.mouseBtn |= bit; e.preventDefault(); }
     else this.mouseBtn &= ~bit;

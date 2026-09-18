@@ -14,6 +14,8 @@ static/ и WebSocket через tornado.
 числа нельзя истолковать (CLAUDE.md, правило 8).
 """
 
+import collections
+import math
 import os
 import socket
 import subprocess
@@ -181,6 +183,8 @@ class Tab(object):
 
 # --- разбор карты: направление, в котором точно есть чистый разбег --------
 
+TILE_WALL, TILE_FLOOR, TILE_STAIRS = 0, 1, 2
+
 DIRS = [
     ("вправо", (1, 0), ["KeyD"]),
     ("вниз", (0, 1), ["KeyS"]),
@@ -200,7 +204,7 @@ def _blocked(level, x, y):
         for tx in (int((x - R_PLAYER) // 1), int((x + R_PLAYER) // 1)):
             if tx < 0 or ty < 0 or tx >= w or ty >= h:
                 return True
-            if tiles[ty * w + tx] == 0:       # TILE_WALL
+            if tiles[ty * w + tx] == TILE_WALL:
                 return True
     return False
 
@@ -249,6 +253,187 @@ def ensure_runway(tab, level, need, speed=5.0):
         time.sleep(0.25)
     me = tab.self_pos()
     return pick_run(level, me["x"], me["y"], need)
+
+
+# --- ходьба по карте (общая для client_fog.py и client_combat.py) ---------
+#
+# Переехало сюда из client_fog.py целиком, вместе с заработанными прогонами
+# поправками. Второй копии этого кода быть не должно: он весь состоит из
+# лечения настоящих граблей физики, и разойдись копии — вторая проверка
+# начнёт мигать там, где первая уже вылечена.
+
+WALK_STALL = 8.0               # с без сокращения пути — дальше незачем
+
+# Полоса нечувствительности по поперечной оси. Тело игрока круглое, R=0.35
+# (4.2), коридор шириной ровно в клетку: от середины можно уйти на 0.15
+# клетки, дальше край тела цепляет соседний ряд и physics.move_circle
+# обнуляет скорость по этой оси. Поэтому клавиша поперечной оси жмётся по
+# АБСОЛЮТНОМУ промаху, а не по отношению к продольному: первый вариант
+# сравнивал оси между собой, при промахе 0.18 против хода 0.63 поперечную
+# клавишу не жал — и персонаж стоял в проёме вечно (замерено).
+BAND = 0.10
+
+
+class Keys(object):
+    """Клавиши держатся зажатыми, как у человека, а не долбятся по 10 Гц."""
+
+    def __init__(self, tab):
+        self.tab = tab
+        self.held = set()
+
+    def set(self, want):
+        want = set(want)
+        for k in self.held - want:
+            self.tab.page.keyboard.up(k)
+        for k in want - self.held:
+            self.tab.page.keyboard.down(k)
+        self.held = want
+
+    def release(self):
+        self.set([])
+
+
+def keys_for(dx, dy, band=BAND):
+    ax, ay = abs(dx), abs(dy)
+    kx = "KeyD" if dx > 0 else ("KeyA" if dx < 0 else None)
+    ky = "KeyS" if dy > 0 else ("KeyW" if dy < 0 else None)
+    out = []
+    if kx and ax > band:
+        out.append(kx)
+    if ky and ay > band:
+        out.append(ky)
+    if not out:
+        out = [k for k in (kx, ky) if k]
+    return out
+
+
+def bfs_path(level, src, dst, avoid=()):
+    """Кратчайший путь по проходимым тайлам (всё, что не 0 — не стена, 4.1).
+
+    avoid — клетки, на которые ходить нельзя, хотя стеной они не являются.
+    Ровно одна такая клетка есть на каждом этаже: ЛЕСТНИЦА. Дойти до неё —
+    значит сменить этаж (room.stairs_ready), а проверка, которая меняет под
+    собой этаж, меряет уже не то, что начинала мерить.
+    """
+    w, h, t = level["w"], level["h"], level["tiles"]
+    avoid = set(avoid) - {src, dst}
+    prev = {src: None}
+    q = collections.deque([src])
+    while q:
+        c = q.popleft()
+        if c == dst:
+            break
+        x, y = c
+        for nx, ny in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if 0 <= nx < w and 0 <= ny < h and t[ny * w + nx] != TILE_WALL \
+                    and (nx, ny) not in prev and (nx, ny) not in avoid:
+                prev[(nx, ny)] = c
+                q.append((nx, ny))
+    if dst not in prev:
+        # Обход не нашёлся — например, лестница стоит в единственном
+        # коридоре. Тогда идём как придётся: пусть лучше проверка пройдёт
+        # рядом с лестницей, чем встанет намертво.
+        if avoid:
+            return bfs_path(level, src, dst)
+        return None
+    path, c = [], dst
+    while c is not None:
+        path.append(c)
+        c = prev[c]
+    path.reverse()
+    return path
+
+
+def pick_wp(level, mx, my, path):
+    """Самая дальняя точка пути, до которой видно по прямой без стены.
+
+    Иначе персонаж цепляется плечом за угол: путь-то по клеткам, а тело
+    круглое (R_PLAYER выше).
+    """
+    best = path[1] if len(path) > 1 else path[0]
+    for i in range(1, min(7, len(path))):
+        wx, wy = path[i][0] + 0.5, path[i][1] + 0.5
+        dx, dy = wx - mx, wy - my
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            continue
+        if clear_dist(level, mx, my, dx / d, dy / d, d + 0.1) >= d - 0.05:
+            best = path[i]
+    return best
+
+
+def walk_to(tab, level, target, keys, budget, probe=None, enough=None,
+            avoid=(), near=0.9):
+    """Идти к клетке target. Возвращает (дошёл, расстояние, секунды, рывков).
+
+    ЧТО ЗДЕСЬ ПОРОГ, А ЧТО ПРЕДОХРАНИТЕЛЬ. Дорога кончается по одному из
+    трёх: дошли; путь не сокращается WALK_STALL секунд; вызванный
+    снаружи enough() сказал «нужное уже снято». budget — только
+    предохранитель от зависания. Это и есть лечение мигания: ни одно из
+    условий не спрашивает, УСПЕЛА ли машина за отведённое время.
+
+    probe() зовётся по дороге (снять то, что видно только в пути),
+    enough() — можно ли уже разворачиваться.
+
+    Две поправки, заработанные прогоном (обе — про настоящую физику, а не
+    про проверку):
+
+    * продвижение считается по ДЛИНЕ ОСТАВШЕГОСЯ ПУТИ, а не по расстоянию по
+      прямой: на карте из комнат и коридоров честный обход стены регулярно
+      уводит ОТ цели, и первый вариант объявлял это застреванием;
+    * персонаж намертво встаёт плечом об угол. Тело круглое, R=0.35 (4.2), а
+      коридор шириной ровно в клетку: от середины можно уйти только на 0.15
+      клетки, дальше край тела цепляет соседний ряд. physics.move_circle в
+      этот момент обнуляет скорость по оси, и при одной зажатой клавише
+      персонаж стоит вечно — замерено: 27 секунд в одной точке. Человек в
+      этом месте просто дёргает поперёк, и мы делаем то же.
+    """
+    t0 = time.time()
+    best = 10 ** 9
+    last_gain = t0
+    dist = 1e9
+    nudges = 0
+    px = py = None
+    pt = t0
+    side = 1
+    while time.time() - t0 < budget:
+        if probe is not None:
+            probe()
+        if enough is not None and enough():
+            keys.release()
+            return True, dist, time.time() - t0, nudges
+        me = tab.self_pos()
+        if me is None:
+            break
+        mx, my = me["x"], me["y"]
+        dist = math.hypot(mx - (target[0] + 0.5), my - (target[1] + 0.5))
+        if dist < near:
+            keys.release()
+            return True, dist, time.time() - t0, nudges
+        path = bfs_path(level, (int(mx), int(my)), target, avoid)
+        if not path:
+            break
+        if len(path) < best:
+            best = len(path)
+            last_gain = time.time()
+        if time.time() - last_gain > WALK_STALL:
+            break                      # путь не сокращается — дальше незачем
+        wp = pick_wp(level, mx, my, path)
+        dx, dy = wp[0] + 0.5 - mx, wp[1] + 0.5 - my
+        moved = 1e9 if px is None else math.hypot(mx - px, my - py)
+        if moved < 0.08 and time.time() - pt > 0.45:
+            nudges += 1
+            keys.set(keys_for(-dy * side, dx * side))   # поперёк курса
+            time.sleep(0.2)
+            side = -side
+            px, py, pt = mx, my, time.time()
+            continue
+        if moved >= 0.08:
+            px, py, pt = mx, my, time.time()
+        keys.set(keys_for(dx, dy))
+        time.sleep(0.08)
+    keys.release()
+    return False, dist, time.time() - t0, nudges
 
 
 def summary():
