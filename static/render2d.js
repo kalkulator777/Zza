@@ -16,11 +16,39 @@
 // Объём подделывается: тень эллипсом под объектом, у стен — вертикальный
 // выступ вверх (рисуется в статическом слое, то есть бесплатно).
 
-import { K_PLAYER, K_ENEMY, K_PROP, K_SHOT, F_DEAD, F_OFFLINE, TILE_WALL }
+import { K_PLAYER, K_ENEMY, K_PROP, K_SHOT, F_DEAD, F_OFFLINE,
+         TILE_WALL, TILE_STAIRS, VIS_DARK, VIS_LIT }
   from './state.js';
 
 const MARGIN_TILES = 10;     // запас кэша карты вокруг экрана, в клетках
 const WALL_RISE = 0.45;      // высота фальшивого выступа стены, в клетках
+
+// --- туман (DESIGN.md 4.4, значения 5.2) ---------------------------------
+//
+// Маска тумана — ОТДЕЛЬНАЯ маленькая канва, FOG_PX пикселей на клетку, и
+// она перерисовывается ТОЛЬКО когда пришла дельта vis (или уехало окно
+// кэша карты), а не каждый кадр. В кадре тумана стоит ровно один
+// drawImage с растяжением: маска 4 px/клетка растягивается в 48 px/клетка
+// самим браузером. Считать маску экранного размера каждый кадр — ровно то,
+// чего 7.2 запрещать не успевает, но что убивает бюджет вернее любого
+// shadowBlur: 1920x1080 = 2 млн пикселей на кадр.
+//
+// FOG_PX = 4 выбран так: растяжение в 12 раз даёт билинейную кайму шириной
+// в один пиксель маски, то есть 1/4 клетки (12 экранных пикселей) — граница
+// света мягкая, но свет не течёт в неразведанную клетку целиком. Маска на
+// окно 47x35 клеток = 188x140 = 26 тыс. пикселей: перерисовать её — это
+// заполнить 105 КБ, десятые доли миллисекунды, и происходит это 5 раз в
+// секунду (обзор пересчитывается при переходе игрока в другую клетку,
+// server/vis.py), а не 100.
+const FOG_PX = 4;
+// Выступ стены (WALL_RISE) торчит в клетку СВЕРХУ. У неразведанной стены
+// его надо закрыть, иначе из черноты выглядывает полоска стены, которой
+// группа не видела. 0.45 клетки * 4 = 1.8 -> 2 пикселя маски.
+const FOG_RISE = Math.max(1, Math.round(WALL_RISE * FOG_PX));
+// «Открыта, но не видна» — холодная, приглушённая. Не чёрная: стены надо
+// помнить. Альфа 0.52 гасит пол с (35,41,58) до (22,28,45) — читается как
+// память, а не как свет.
+const FOG_SEEN_RGBA = [10, 16, 34, 133];   // 133/255 = 0.52
 
 const COL = {
   bg: '#05070c',
@@ -31,6 +59,12 @@ const COL = {
   wallTop: '#666f88',
   wallSide: '#1b2028',        // боковина: тот же камень, но в тени
   shadow: 'rgba(0,0,0,0.40)',
+  // Лестница вниз (4.1, тайл 2). Тёплое золото против холодного пола:
+  // единственная клетка на этаж, найти её надо с одного взгляда.
+  stairsBg: '#3b2f14',
+  stairsStepA: '#caa14a',
+  stairsStepB: '#8f6f2c',
+  stairsEdge: '#f0c96a',
 };
 
 const KIND = {};
@@ -63,6 +97,26 @@ function textSprite(text, font, color) {
   return m;
 }
 
+// Лестница вниз (4.1). Рисуется в СТАТИЧЕСКОМ слое, то есть в кадре стоит
+// ноль. Заметность даётся тремя вещами сразу — тёплым цветом против
+// холодного пола, ступенями поперёк и яркой рамкой: так клетка читается и
+// краем глаза, и в «памяти группы», где всё приглушено.
+function paintStairs(g, px, py, s) {
+  g.fillStyle = COL.stairsBg;
+  g.fillRect(px, py, s, s);
+  const steps = 4;
+  for (let i = 0; i < steps; i++) {
+    // Ступени сужаются книзу — читается как уходящий вниз пролёт.
+    const inset = s * (0.09 + 0.07 * i);
+    g.fillStyle = (i & 1) ? COL.stairsStepB : COL.stairsStepA;
+    g.fillRect(px + inset, py + s * (0.13 + 0.20 * i), s - inset * 2, s * 0.12);
+  }
+  const lw = Math.max(2, s * 0.06);
+  g.strokeStyle = COL.stairsEdge;
+  g.lineWidth = lw;
+  g.strokeRect(px + lw / 2, py + lw / 2, s - lw, s - lw);
+}
+
 export function createRenderer() {
   return {
     name: 'Canvas2D',
@@ -77,8 +131,12 @@ export function createRenderer() {
     // предрасчитанный оверлей света/затемнения
     vig: null,
 
+    // маска тумана: FOG_PX пикселей на клетку, окно то же, что у карты
+    fog: null, fogCtx: null, fogImg: null, fogKey: '', fogOn: false,
+    fogRepaints: 0,
+
     camX: 0, camY: 0,
-    _drawCalls: 0, _ents: 0, _ms: 0,
+    _drawCalls: 0, _ents: 0, _ms: 0, _hidden: 0,
     _pool: [], _vis: [],
 
     // --- 7.1 ---------------------------------------------------------
@@ -102,16 +160,21 @@ export function createRenderer() {
       }
       this._buildVignette();
       this.stKey = '';                        // окно кэша карты больше не годится
+      this.fogKey = '';                       // маска тумана вместе с ним
     },
 
     dispose() {
       this.st = null; this.stCtx = null; this.vig = null;
+      this.fog = null; this.fogCtx = null; this.fogImg = null;
       this.ctx = null; this.canvas = null;
       textCache.clear();
     },
 
     stats() {
-      return { drawCalls: this._drawCalls, ents: this._ents, ms: this._ms };
+      // hidden — сущности, скрытые туманом (их сервер прислал, а группа их
+      // не видит). Число для tests/client_fog.py и для оверлея отладки.
+      return { drawCalls: this._drawCalls, ents: this._ents, ms: this._ms,
+               hidden: this._hidden, fogRepaints: this.fogRepaints };
     },
 
     // --- камера ------------------------------------------------------
@@ -119,6 +182,11 @@ export function createRenderer() {
     /** Экранные пиксели -> мировые клетки. Нужно input.js для прицела. */
     screenToWorld(sx, sy) {
       return [this.camX + sx / this.tilePx, this.camY + sy / this.tilePx];
+    },
+
+    /** Мировые клетки -> экранные пиксели. Обратное к screenToWorld. */
+    worldToScreen(wx, wy) {
+      return [(wx - this.camX) * this.tilePx, (wy - this.camY) * this.tilePx];
     },
 
     _updateCamera(view) {
@@ -185,12 +253,17 @@ export function createRenderer() {
         ? true : tiles[y * level.w + x] === TILE_WALL;
 
       // Пол и сетка
+      const stairs = [];
       for (let y = 0; y < th; y++) {
         for (let x = 0; x < tw; x++) {
           const wx = tx0 + x, wy = ty0 + y;
           if (solid(wx, wy)) continue;
           g.fillStyle = ((wx ^ wy) & 1) ? COL.floor : COL.floorAlt;
           g.fillRect(x * tpx, y * tpx, tpx, tpx);
+          if (wx >= 0 && wy >= 0 && wx < level.w && wy < level.h &&
+              tiles[wy * level.w + wx] === TILE_STAIRS) {
+            stairs.push(x, y);
+          }
         }
       }
       g.strokeStyle = COL.grid;
@@ -199,6 +272,11 @@ export function createRenderer() {
       for (let x = 0; x <= tw; x++) { g.moveTo(x * tpx + 0.5, 0); g.lineTo(x * tpx + 0.5, th * tpx); }
       for (let y = 0; y <= th; y++) { g.moveTo(0, y * tpx + 0.5); g.lineTo(tw * tpx, y * tpx + 0.5); }
       g.stroke();
+
+      // Лестница — ПОСЛЕ сетки, иначе её штрих режет ступени пополам.
+      for (let i = 0; i < stairs.length; i += 2) {
+        paintStairs(g, stairs[i] * tpx, stairs[i + 1] * tpx, tpx);
+      }
 
       // Стены: сначала вертикальный выступ (объём подделкой, 7.2), потом
       // «крышка». Рисуется один раз на перепокраску, в кадре стоит ноль.
@@ -226,6 +304,93 @@ export function createRenderer() {
           }
         }
       }
+    },
+
+    // --- туман: маска строится РЕДКО, в кадре только блит --------------
+
+    /**
+     * Готова ли маска тумана к кадру. Перерисовывается только тогда, когда
+     * что-то из этого изменилось: сам туман (fogVersion растёт в state.js
+     * при дельте vis), окно кэша карты или этаж. Пока игрок стоит на месте,
+     * маска не трогается вовсе — обзор от кадра не зависит.
+     */
+    _ensureFog(level, view) {
+      const arr = view.fog;
+      if (!level || !arr || !this.st) { this.fogOn = false; return false; }
+      this.fogOn = true;
+      const cw = this.stTw * FOG_PX, ch = this.stTh * FOG_PX;
+      if (!this.fog || this.fog.width !== cw || this.fog.height !== ch) {
+        this.fog = document.createElement('canvas');
+        this.fog.width = cw; this.fog.height = ch;
+        this.fogCtx = this.fog.getContext('2d');
+        this.fogImg = null;
+        this.fogKey = '';
+      }
+      const key = this.stKey + '|' + this.stTx + ',' + this.stTy +
+                  '|' + view.fogVersion;
+      if (key === this.fogKey) return true;
+      this.fogKey = key;
+      this._paintFog(level, arr);
+      this.fogRepaints++;
+      return true;
+    },
+
+    _paintFog(level, arr) {
+      const cw = this.fog.width, ch = this.fog.height;
+      let img = this.fogImg;
+      if (!img || img.width !== cw || img.height !== ch) {
+        img = this.fogImg = this.fogCtx.createImageData(cw, ch);
+      }
+      const d = img.data;
+      d.fill(0);                       // VIS_LIT = прозрачно, полный свет
+      const tx0 = this.stTx, ty0 = this.stTy, tw = this.stTw, th = this.stTh;
+      const W = level.w, H = level.h, tiles = level.tiles;
+      const sr = FOG_SEEN_RGBA[0], sg = FOG_SEEN_RGBA[1];
+      const sb = FOG_SEEN_RGBA[2], sa = FOG_SEEN_RGBA[3];
+
+      for (let y = 0; y < th; y++) {
+        const wy = ty0 + y;
+        const inY = wy >= 0 && wy < H;
+        for (let x = 0; x < tw; x++) {
+          const wx = tx0 + x;
+          // За краем карты — та же чернота: там нет ничего и знать нечего.
+          let v = VIS_DARK, wall = true;
+          if (inY && wx >= 0 && wx < W) {
+            const i = wy * W + wx;
+            v = arr[i];
+            wall = tiles[i] === TILE_WALL;
+          }
+          if (v === VIS_LIT) continue;
+          let r, g, b, a;
+          let y0 = y * FOG_PX;
+          const y1 = y0 + FOG_PX;
+          if (v === VIS_DARK) {
+            r = 0; g = 0; b = 0; a = 255;
+            // Закрыть выступ неразведанной стены, торчащий в клетку сверху.
+            // Строки идут сверху вниз, поэтому дописываем поверх уже
+            // положенного — так и надо: стены там нет, пока её не увидели.
+            if (wall && y0 >= FOG_RISE) y0 -= FOG_RISE;
+          } else {
+            r = sr; g = sg; b = sb; a = sa;
+          }
+          for (let py = y0; py < y1; py++) {
+            let o = (py * cw + x * FOG_PX) * 4;
+            for (let px = 0; px < FOG_PX; px++) {
+              d[o] = r; d[o + 1] = g; d[o + 2] = b; d[o + 3] = a;
+              o += 4;
+            }
+          }
+        }
+      }
+      this.fogCtx.putImageData(img, 0, 0);
+    },
+
+    /** Видна ли клетка, в которой стоит сущность (5.2: только VIS_LIT). */
+    _lit(view, wx, wy) {
+      const L = view.level, f = view.fog;
+      const tx = Math.floor(wx), ty = Math.floor(wy);
+      if (tx < 0 || ty < 0 || tx >= L.w || ty >= L.h) return false;
+      return f[ty * L.w + tx] === VIS_LIT;
     },
 
     // --- 7.2 приём 2: свет предрасчитан, в кадре только блит ----------
@@ -349,18 +514,42 @@ export function createRenderer() {
         this._drawCalls++;
       }
 
-      // 2) сущности, сверху вниз по y — иначе тень ложится поверх соседа.
+      // 2) туман — ОДИН drawImage растянутой маски. Сама маска посчитана
+      // выше и только тогда, когда менялся туман (4.4): в кадре тумана
+      // стоит ровно один блит, как и карты.
+      if (this._ensureFog(view.level, view) && this.fog) {
+        const fx = (this.camX - this.stTx) * FOG_PX;
+        const fy = (this.camY - this.stTy) * FOG_PX;
+        ctx.drawImage(this.fog,
+                      fx, fy, (this.w / tpx) * FOG_PX, (this.h / tpx) * FOG_PX,
+                      0, 0, this.w, this.h);
+        this._drawCalls++;
+      }
+
+      // 3) сущности, сверху вниз по y — иначе тень ложится поверх соседа.
       // Список видимых переиспользуется: мусор на 200 сущностей 100 раз в
       // секунду сборщик собирает не бесплатно, а поля мира draw() трогать
       // не имеет права (7.1).
+      //
+      // ЗДЕСЬ ЖЕ ТУМАН РЕЖЕТ СУЩНОСТЕЙ. Сервер шлёт всех без разбора (4.4:
+      // снапшот один на комнату), и прятать невидимое обязан клиент. Иначе
+      // враг в неосвещённой комнате виден сквозь темноту — это прямая
+      // выдача того, чего группа не видит. Своя сущность рисуется всегда:
+      // мёртвый игрок туман не светит (4.4) и иначе потерял бы сам себя.
       const ents = view.ents;
       const pool = this._pool, vis = this._vis;
+      const fogOn = !!(view.fog && view.level);
+      let hidden = 0;
       vis.length = 0;
       for (let i = 0; i < ents.length; i++) {
         const e = ents[i];
         const sx = (e.dx - this.camX) * tpx;
         const sy = (e.dy - this.camY) * tpx;
         if (sx < -tpx * 2 || sy < -tpx * 2 || sx > this.w + tpx * 2 || sy > this.h + tpx * 2) continue;
+        if (fogOn && e.id !== view.selfId && !this._lit(view, e.dx, e.dy)) {
+          hidden++;
+          continue;
+        }
         let rec = pool[vis.length];
         if (rec === undefined) { rec = { e: null, sx: 0, sy: 0 }; pool.push(rec); }
         rec.e = e; rec.sx = sx; rec.sy = sy;
@@ -372,8 +561,9 @@ export function createRenderer() {
         this._drawEntity(rec.e, rec.sx, rec.sy, rec.e.id === view.selfId);
       }
       this._ents = ents.length;
+      this._hidden = hidden;
 
-      // 3) свет и затемнение — один блит предрасчитанного оверлея (7.2).
+      // 4) свет и затемнение — один блит предрасчитанного оверлея (7.2).
       // q=low обходится без него: это украшение, а не механика.
       if (this.quality !== 'low' && this.vig) {
         ctx.drawImage(this.vig, 0, 0);

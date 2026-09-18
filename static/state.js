@@ -33,9 +33,18 @@ export const K_SHOT = 4;
 export const F_DEAD = 1;
 export const F_OFFLINE = 2;
 
-// Тайлы карты (server/physics.py)
+// Тайлы карты (DESIGN.md 4.1, server/physics.py)
 export const TILE_WALL = 0;
 export const TILE_FLOOR = 1;
+export const TILE_STAIRS = 2;   // лестница вниз; стеной для физики она не является
+
+// Туман войны: значения клетки на проводе (DESIGN.md 5.2, server/vis.py).
+// Туман ОДИН на команду (4.4) — клиент не считает его сам, а только применяет
+// то, что прислал сервер.
+export const VIS_DARK = 0;      // не открыта: клиент не знает о ней ничего
+export const VIS_SEEN = 1;      // открыта, но сейчас не видна — память группы
+export const VIS_LIT = 2;       // видна прямо сейчас хотя бы одному живому
+export const VIS_KEEP = 255;    // только в дельте: клетка не менялась
 
 // Глубина истории позиций на сущность. Нужно строго больше DELAY_TICKS,
 // иначе кадр с задержкой в два тика не попадает между двумя выборками.
@@ -130,6 +139,17 @@ export class WorldState {
     this.renderTick = null;
     this.lastNow = 0;
 
+    // Туман (4.4, 5.2). Позиционный массив w*h, живёт МЕЖДУ снапшотами:
+    // сервер шлёт только изменившиеся клетки, остальное клиент помнит сам.
+    // fogVersion растёт при каждом изменении — по нему рендер понимает, что
+    // маску пора перерисовать, и в остальных кадрах её не трогает вовсе.
+    this.fog = null;
+    this.fogVersion = 0;
+    this.visMsgs = 0;
+    // Выключатель «клиент игнорирует vis» — ровно то, чем клиент был до
+    // тумана. Существует только чтобы tests/client_fog.py мог покраснеть.
+    this.fogOn = true;
+
     // 6.1 можно выключить — этим tests/client_interp.py доказывает, что
     // проверка плавности умеет краснеть.
     this.interp = true;
@@ -142,10 +162,12 @@ export class WorldState {
     this._rankGuess = 0;
     this._score = new Map();    // id -> счёт корреляции ввода
     this._locked = false;
+    this._youSeen = false;      // сервер прислал `you` — подпорки молчат
     this._sentMv = new Map();   // seq -> [dx, dy]
 
     this.view = { tick: 0, alpha: 0, level: null, ents: this.order,
-                  self: null, selfId: 0, interp: true };
+                  self: null, selfId: 0, interp: true,
+                  fog: null, fogVersion: 0 };
   }
 
   reset() {
@@ -157,8 +179,11 @@ export class WorldState {
     this.renderTick = null;
     this.selfId = 0;
     this._locked = false;
+    this._youSeen = false;
     this._score.clear();
     this._sentMv.clear();
+    this.fog = null;
+    this.fogVersion++;
   }
 
   // --- вход данных -------------------------------------------------------
@@ -182,6 +207,10 @@ export class WorldState {
     this.latestTick = -1;
     this.renderTick = null;
     this.level = { floor: m.floor, seed: m.seed, w: m.w, h: m.h, tiles: tiles };
+    // 4.4: при смене этажа память группы сбрасывается — новый этаж начинается
+    // в полной темноте. Полный туман придёт следующим снапшотом (full:true).
+    this.fog = new Uint8Array(m.w * m.h);
+    this.fogVersion++;
   }
 
   // Запоминаем свой ввод: сервер эхом вернёт seq в поле ack, и по нему
@@ -234,17 +263,47 @@ export class WorldState {
         if (this.ents.delete(rm[i])) this.orderDirty = true;
       }
       if (this.selfId && rm.indexOf(this.selfId) >= 0) {
-        this.selfId = 0; this._locked = false;
+        // Своя сущность исчезла. Сбрасываем и знание из `you`: если сервер
+        // заведёт новую, он пришлёт `you` снова, а до тех пор пусть работают
+        // подпорки — иначе selfId останется нулём навсегда.
+        this.selfId = 0; this._locked = false; this._youSeen = false;
+      }
+    }
+
+    // --- туман (5.2, поле vis) --------------------------------------------
+    // Полный снапшот несёт весь массив, дельта — только изменившиеся клетки
+    // (255 = «не менялась»). И то и другое накатывается на ОДИН И ТОТ ЖЕ
+    // массив: память группы живёт у клиента между снапшотами.
+    if (typeof m.vis === 'string' && this.fog) {
+      this.visMsgs++;
+      try {
+        if (visApply(m.vis, this.fog)) this.fogVersion++;
+      } catch (e) {
+        // Битый vis — беда, но не повод ронять кадр: лучше старый туман.
       }
     }
 
     this.latestTick = tick;
     this.ack = m.ack | 0;
     this.snaps++;
+
+    // --- своя сущность: 5.2, поле `you` -----------------------------------
+    // Пришло — значит истина, и гадать больше не о чем. Подпорки в
+    // _resolveSelf остаются запасным путём и включаются сами, если `you`
+    // в снапшоте нет (старый сервер, дельта без поля).
+    if (typeof m.you === 'number' && isFinite(m.you) && m.you > 0) {
+      this.selfId = m.you;
+      this._youSeen = true;
+      this._locked = true;
+    }
     this._resolveSelf();
   }
 
   // --- опознание своей сущности -----------------------------------------
+  //
+  // ЗАПАСНОЙ ПУТЬ. Штатный — поле `you` в снапшоте (5.2), оно читается в
+  // applySnap и, когда пришло, выключает всё, что ниже (_youSeen). Всё
+  // остальное здесь — подпорки на случай сервера, который `you` ещё не шлёт.
   //
   // ДЫРА В ПРОТОКОЛЕ (5.2): ни welcome, ни joined, ни snap не сообщают,
   // какой id сущности принадлежит этому игроку. pid != id сущности.
@@ -264,6 +323,7 @@ export class WorldState {
   //      отрыве, поэтому два игрока, бегущие в одну сторону, ничего не
   //      портят: они просто не дают отрыва.
   _resolveSelf() {
+    if (this._youSeen) return;      // сервер сказал прямо — подпорки не нужны
     const mine = [];
     for (const e of this.ents.values()) {
       if (e.kind === K_PLAYER) mine.push(e.id);
@@ -369,6 +429,11 @@ export class WorldState {
     v.selfId = this.selfId;
     v.self = this.self();
     v.interp = this.interp;
+    // fog === null означает «тумана нет» — рендер тогда рисует ровно то же,
+    // что рисовал до тумана. Это и путь для старого сервера без vis, и
+    // красный прогон tests/client_fog.py.
+    v.fog = this.fogOn ? this.fog : null;
+    v.fogVersion = this.fogVersion;
     return v;
   }
 }
@@ -389,4 +454,29 @@ export function rleDecode(b64, expect) {
     }
   }
   return expect ? out : Uint8Array.from(grow);
+}
+
+// --- RLE тумана (5.2, server/vis.py) --------------------------------------
+// Тот же формат пар (значение, длина<=255), но накатывается НА МЕСТЕ, на уже
+// имеющийся массив: в дельте значение 255 (VIS_KEEP) означает «эти клетки не
+// менялись», и их надо перешагнуть, а не обнулить. Полный туман приходит тем
+// же кодом — в нём 255 просто не встречается.
+//
+// Возвращает true, если хоть одна клетка изменилась: по этому рендер решает,
+// перерисовывать маску или нет. Дельта, в которой всё совпало, кадра не стоит.
+export function visApply(b64, out) {
+  const bin = atob(b64);
+  const len = out.length;
+  let n = 0;
+  let changed = false;
+  for (let i = 0; i + 1 < bin.length && n < len; i += 2) {
+    const v = bin.charCodeAt(i);
+    const c = bin.charCodeAt(i + 1);
+    if (v === VIS_KEEP) { n += c; continue; }
+    const end = n + c < len ? n + c : len;
+    for (; n < end; n++) {
+      if (out[n] !== v) { out[n] = v; changed = true; }
+    }
+  }
+  return changed;
 }

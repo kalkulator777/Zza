@@ -25,6 +25,9 @@ const app = {
   frames: 0, fps: 0, _fpsT0: 0, _fpsN: 0,
   // запись позиций для проверки плавности (tests/client_interp.py)
   rec: { on: false, want: 0, samples: [] },
+  // запись стоимости кадра (tests/client_fog.py). Выключена по умолчанию:
+  // stats() создаёт объект, и в обычной игре этот мусор ни к чему.
+  msRec: false, msRing: [],
 };
 
 // ---------------------------------------------------------------- экраны
@@ -168,6 +171,11 @@ function frame(now) {
   const view = app.world.buildView(now);
   app.render.draw(view, view.alpha);
 
+  if (app.msRec) {
+    app.msRing.push(app.render.stats().ms);
+    if (app.msRing.length > 600) app.msRing.shift();
+  }
+
   // Запись позиций своего персонажа — для проверки плавности.
   const r = app.rec;
   if (r.on) {
@@ -190,7 +198,7 @@ function updateHud(view) {
   $('hud').textContent =
     'fps ' + app.fps.toFixed(0) +
     '   задержка ' + (n.rtt ? n.rtt.toFixed(1) : '—') + ' мс' +
-    '   сущностей ' + s.ents +
+    '   сущностей ' + s.ents + (s.hidden ? ' (в темноте ' + s.hidden + ')' : '') +
     '   тик ' + Math.floor(view.tick) + '/' + app.world.latestTick +
     '   кадр ' + s.ms.toFixed(2) + ' мс' +
     '   drawCalls ' + s.drawCalls +
@@ -260,6 +268,56 @@ export function boot() {
     recording: () => app.rec.on,
     samples: () => app.rec.samples,
     status: () => $('status').textContent,
+
+    // --- туман (tests/client_fog.py) ---------------------------------
+    // Выключатель «клиент игнорирует vis» — ровно тот клиент, что был до
+    // тумана. Нужен, чтобы проверка тумана умела покраснеть.
+    setFog: (v) => { app.world.fogOn = !!v; return app.world.fogOn; },
+    getFog: () => app.world.fogOn,
+    fog: () => {
+      const L = app.world.level, f = app.world.fog;
+      if (!L || !f) return null;
+      return { w: L.w, h: L.h, cells: Array.from(f), msgs: app.world.visMsgs };
+    },
+    worldToScreen: (x, y) => app.render.worldToScreen(x, y),
+    canvasSize: () => ({ w: $('c').width, h: $('c').height }),
+
+    // Пиксели НАСТОЯЩЕГО кадра: «видно» — это то, что попало на канву, а
+    // не то, что лежит в модели мира. dark считает пиксели, у которых
+    // максимальный канал не выше thresh (чернота), maxR — самый яркий
+    // красный в коробке (по нему видно врага: #d16a6a это r=209, а самый
+    // красный кусок подземелья — стена #666f88, r=102).
+    pixels: (x, y, w, h, thresh) => {
+      const c = $('c');
+      const g = c.getContext('2d');
+      x = Math.max(0, Math.min(c.width - 1, Math.round(x || 0)));
+      y = Math.max(0, Math.min(c.height - 1, Math.round(y || 0)));
+      w = Math.max(1, Math.min(c.width - x, Math.round(w || c.width)));
+      h = Math.max(1, Math.min(c.height - y, Math.round(h || c.height)));
+      const d = g.getImageData(x, y, w, h).data;
+      const t = thresh === undefined ? 10 : thresh;
+      let dark = 0, maxCh = 0, maxR = 0, sum = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], gg = d[i + 1], b = d[i + 2];
+        const m = r > gg ? (r > b ? r : b) : (gg > b ? gg : b);
+        if (m <= t) dark++;
+        if (m > maxCh) maxCh = m;
+        if (r > maxR) maxR = r;
+        sum += m;
+      }
+      const n = d.length / 4;
+      return { n: n, dark: dark, frac: dark / n, maxCh: maxCh, maxR: maxR,
+               mean: sum / n, box: [x, y, w, h] };
+    },
+
+    // Подать сообщение тем же путём, каким его подаёт провод: net._onMessage
+    // — это ровно то, что вызывает ws.onmessage. Никаких обходов разбора.
+    wire: (s) => { app.net._onMessage({ data: s }); return app.world.ents.size; },
+
+    // Стоимость кадра: каждое значение — один настоящий кадр, а не выборка
+    // опросом из питона.
+    msRecord: (on) => { app.msRec = !!on; app.msRing = []; return app.msRec; },
+    msSamples: () => app.msRing.slice(),
   };
 }
 
