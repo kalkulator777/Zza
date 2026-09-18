@@ -106,7 +106,8 @@ class Floor(object):
     __slots__ = ("grid", "spawns", "stairs", "rooms", "entry", "seed",
                  "floor", "theme", "repairs", "passable",
                  "entry_room", "stairs_room", "stairs_dist",
-                 "altar", "altar_room", "altar_slots", "altar_detour")
+                 "altar", "altar_room", "altar_slots", "altar_detour",
+                 "altars", "boss_room")
 
     def __init__(self, grid, spawns, stairs, rooms, entry, seed, floor, theme):
         self.grid = grid
@@ -127,7 +128,17 @@ class Floor(object):
         self.altar = None           # (tx,ty) — центр алтаря
         self.altar_room = -1        # номер комнаты с алтарём
         self.altar_slots = []       # [(x,y)] — куда класть предметы
-        self.altar_detour = -1      # крюк в клетках пути (см. _pick_altar)
+        self.altar_detour = -1      # крюк в клетках пути (см. _pick_altars)
+        # 8.4: алтарей на этаж 1 + (живых - 1) // 2, то есть ДО ЧЕТЫРЁХ при
+        # потолке room.MAX_PLAYERS = 8. Генератор готовит все четыре места
+        # сразу и всегда: сколько из них займут предметы, решает
+        # items.populate по числу живых — карта от состава группы зависеть не
+        # имеет права (8.7: один сид — одна карта).
+        # Каждый элемент: ((tx,ty), номер комнаты, [(x,y) слоты], крюк).
+        # altar/altar_room/altar_slots/altar_detour — первый из них.
+        self.altars = []
+        # 8.1: арена босса на каждом пятом этаже, -1 на остальных
+        self.boss_room = -1
 
 
 # --- карта расстояний ------------------------------------------------------
@@ -342,11 +353,28 @@ def _spawn_points(grid, room, n):
     return pts[:n]
 
 
-def _pick_stairs(grid, rooms, dist, entry_idx):
+ARENA_MIN_SIDE = 8
+# ВЫВОД ARENA_MIN_SIDE. «Обвал» босса накрывает круг 3.65 + 0.35 = 4.00
+# клетки от его центра (server/boss.py), а единственный ответ на круг —
+# разорвать дистанцию. В комнате со стороной меньше 8 игроку до стены
+# меньше 4.00, то есть уйти от обвала, не выбежав из комнаты, нельзя вовсе.
+# 8 — ровно тот размер, при котором из центра комнаты до стены ровно один
+# радиус обвала. Замерено на 180 этажах: комната с минимальной стороной >= 8
+# есть на КАЖДОМ (медиана лучшей комнаты 11, минимум 8), так что запасной
+# ветке ниже работы не остаётся; она стоит потому, что «на минимальной карте
+# 24x18 может» — тот же довод, что у _pick_altars.
+
+
+def _pick_stairs(grid, rooms, dist, entry_idx, arena_min=0):
     """Лестница — в самой дальней от входа комнате, на клетке пола.
 
     Выбирается по карте расстояний, то есть по РЕАЛЬНОМУ пути, а не по
     прямой: замурованной или недостижимой она оказаться не может.
+
+    arena_min > 0 (этаж босса, 8.1) — сначала среди комнат со стороной не
+    меньше arena_min, и только если таких нет — как обычно. Лестница на
+    этаже босса это АРЕНА: босс стоит на ней, и в чулане 5x5 бой с ним был
+    бы не боем, а казнью.
     """
     w = grid.w
     best_room = entry_idx
@@ -354,11 +382,15 @@ def _pick_stairs(grid, rooms, dist, entry_idx):
     for i, r in enumerate(rooms):
         if i == entry_idx:
             continue
+        if arena_min and min(r[2] - r[0] + 1, r[3] - r[1] + 1) < arena_min:
+            continue
         cx, cy = _center(r)
         d = dist[cy * w + cx]
         if d > best_d:
             best_d = d
             best_room = i
+    if arena_min and best_d < 0:
+        return _pick_stairs(grid, rooms, dist, entry_idx, 0)
     r = rooms[best_room]
     cx, cy = _center(r)
     best = None
@@ -420,8 +452,28 @@ def _altar_slots(grid, room, n, avoid=None):
     return out
 
 
-def _pick_altar(grid, rooms, dist, dist_st, entry_idx, stairs_room, base, n):
-    """Комната алтаря — та, что дороже всего обходится с дороги вниз.
+ALTAR_ROOMS_MAX = 5
+# ВЫВОД: 8.4 даёт алтарей по числу живых (items.altar_count), потолок живых —
+# room.MAX_PLAYERS = 8, значит 1 + 8 // 2 = 5. Больше мест готовить незачем,
+# меньше — значит запереть восьмерых на четырёх алтарях.
+
+
+def _pick_altars(grid, rooms, dist, dist_st, entry_idx, stairs_room, base,
+                 n, k=ALTAR_ROOMS_MAX):
+    """До k комнат под алтари, самые дорогие с дороги вниз — первыми.
+
+    Алтарей на этаж 1 + (живых - 1) // 2 (8.4), и это ЧИСЛО ЖИВЫХ, а не
+    свойство карты: карта обязана быть одной и той же при одном сиде (8.7).
+    Поэтому генератор готовит ВСЕ k мест всегда, а сколько занять —
+    решает items.populate. Порядок фиксирован (крюк по убыванию, при равном
+    крюке — номер комнаты), так что второй алтарь у одного сида всегда один
+    и тот же.
+
+    Комнаты РАЗНЫЕ: два алтаря в одной комнате — это шесть предметов в одном
+    месте, то есть не «разделяться выгодно» (4.4), а «подошли вдвоём и взяли
+    по одному, не расходясь».
+
+    Правило выбора каждой комнаты — прежнее и целиком ниже.
 
     КРЮК = путь(вход -> алтарь) + путь(алтарь -> лестница) - путь(вход ->
     лестница). Это ровно те лишние клетки, которые группа пробежит в темноте
@@ -442,10 +494,8 @@ def _pick_altar(grid, rooms, dist, dist_st, entry_idx, stairs_room, base, n):
     обещанной не ломает ничего, цена больше обещанной ломает выбор.
     """
     w = grid.w
-    best = -1
-    best_detour = -1
-    fallback = -1
-    fallback_detour = -1
+    inside = []          # крюк не больше дороги вниз: эти и нужны
+    outside = []         # остальные: запасная скамейка
     for i, r in enumerate(rooms):
         if i == entry_idx or i == stairs_room:
             continue
@@ -457,29 +507,26 @@ def _pick_altar(grid, rooms, dist, dist_st, entry_idx, stairs_room, base, n):
             continue
         detour = de + ds - base
         if detour <= base:
-            if detour > best_detour:
-                best_detour = detour
-                best = i
-        elif fallback < 0 or detour < fallback_detour:
-            fallback_detour = detour
-            fallback = i
-    if best < 0 and fallback >= 0:
-        best = fallback
-        best_detour = fallback_detour
-    if best < 0:
+            inside.append((-detour, i, detour))   # самый дорогой первым
+        else:
+            outside.append((detour, i, detour))   # самый дешёвый первым
+    inside.sort()
+    outside.sort()
+    order = [(i, d) for _, i, d in inside] + [(i, d) for _, i, d in outside]
+    if not order and stairs_room != entry_idx:
         # комнат всего две (стартовая и с лестницей) — такой этаж генератор
         # на 64x48 не делает, но на минимальной карте 24x18 может. Тогда
         # алтарь идёт в комнату лестницы: крюк нулевой, зато выбор есть.
-        if stairs_room != entry_idx:
-            best = stairs_room
-            best_detour = 0
-        else:
-            return None, -1, [], -1
-    slots = _altar_slots(grid, rooms[best], n)
-    if not slots:
-        return None, -1, [], -1
-    cx, cy = _center(rooms[best])
-    return (cx, cy), best, slots, best_detour
+        order = [(stairs_room, 0)]
+    out = []
+    for i, detour in order:
+        if len(out) >= k:
+            break
+        slots = _altar_slots(grid, rooms[i], n)
+        if not slots:
+            continue
+        out.append((_center(rooms[i]), i, slots, detour))
+    return out
 
 
 # --- сторож связности ------------------------------------------------------
@@ -551,8 +598,16 @@ def generate(seed=1, floor=1, w=ROOM_W, h=ROOM_H, theme=DEFAULT_THEME):
     entry_idx = rnd.randrange(len(rooms))
     entry = _center(rooms[entry_idx])
 
+    # 8.1: босс на каждом пятом этаже. Импорт внутри функции сознательно:
+    # boss.py тянет за собой combat -> items -> world -> ai, а ai тянет
+    # boss, и на уровне модуля это кольцо. Зовётся generate раз на этаж, в
+    # тике её нет, так что поиск в sys.modules здесь ничего не стоит.
+    from . import boss as boss_mod
+    arena = boss_mod.on_floor(floor)
+
     dist = distance_map(grid, [entry])
-    stairs, stairs_room = _pick_stairs(grid, rooms, dist, entry_idx)
+    stairs, stairs_room = _pick_stairs(grid, rooms, dist, entry_idx,
+                                       ARENA_MIN_SIDE if arena else 0)
 
     keep_out = set()
     if stairs is not None:
@@ -563,6 +618,17 @@ def generate(seed=1, floor=1, w=ROOM_W, h=ROOM_H, theme=DEFAULT_THEME):
     for dy in range(-2, 3):
         for dx in range(-2, 3):
             keep_out.add((ex + dx, ey + dy))
+    if arena:
+        # АРЕНА БЕЗ СТОЛБОВ (8.1). Столб в арене ломает обе атаки босса
+        # сразу: за ним не достаёт «Обвал» (круг), об него гибнет «Залп»
+        # (прямая), и бой с боссом превращается в хоровод вокруг столба —
+        # ровно та одна тактика, против которой боссу и даны две атаки.
+        # Заодно это и есть видимая разница этажа: спуск стережёт пустой
+        # зал, а не такая же комната с колоннами.
+        ar = rooms[stairs_room]
+        for ty in range(ar[1], ar[3] + 1):
+            for tx in range(ar[0], ar[2] + 1):
+                keep_out.add((tx, ty))
     _pillars(grid, rnd, th, rooms, keep_out)
 
     # столбы могли перекрыть отдельные клетки — карта расстояний пересчитана
@@ -578,21 +644,22 @@ def generate(seed=1, floor=1, w=ROOM_W, h=ROOM_H, theme=DEFAULT_THEME):
     # посчитать нечем, а крюк и есть цена апгрейда. Стоит она столько же,
     # сколько первая (замер — tests/items_check.py, раздел «генератор»), и
     # платится РАЗ НА ЭТАЖ, в тике её нет.
-    altar = altar_room = None
-    altar_slots = []
-    altar_detour = -1
+    altars = []
     if stairs is not None:
         dist_st = distance_map(grid, [stairs])
         base = dist[stairs[1] * w + stairs[0]]
-        altar, altar_room, altar_slots, altar_detour = _pick_altar(
+        altars = _pick_altars(
             grid, rooms, dist, dist_st, entry_idx, stairs_room, base,
             ALTAR_ITEMS)
 
     fl = Floor(grid, spawns, stairs, rooms, entry, int(seed), int(floor), th.name)
-    fl.altar = altar
-    fl.altar_room = altar_room if altar_room is not None else -1
-    fl.altar_slots = altar_slots
-    fl.altar_detour = altar_detour
+    fl.altars = altars
+    first = altars[0] if altars else (None, -1, [], -1)
+    fl.altar = first[0]
+    fl.altar_room = first[1]
+    fl.altar_slots = first[2]
+    fl.altar_detour = first[3]
+    fl.boss_room = stairs_room if (arena and stairs is not None) else -1
     fl.repairs = fl_repairs
     fl.entry_room = entry_idx
     fl.stairs_room = stairs_room

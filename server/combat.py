@@ -289,10 +289,11 @@ def resolve(w, dt=DT):
                 swings = []
             swings.append(e)
         if e.shot_q:
+            q = e.shot_q
             e.shot_q = 0
             if born is None:
                 born = []
-            born.append(e)
+            born.append((e, q))
         if e.dash_end and e.ups:
             # Таран (8.4). Условие стоит двумя сравнениями с нулём: у того,
             # кто не в рывке или ничего не собрал, дальше ничего не считается.
@@ -328,16 +329,36 @@ def resolve(w, dt=DT):
         for i in gone:
             w.remove(i)
     if born:
-        for e in born:
-            _make_shot(w, e)
+        # shot_q — либо 1 («выстрел как у всех»), либо СПИСОК (угол, урон):
+        # веер босса (8.1). Список, а не своя очередь и не спавн из ИИ:
+        # состав мира меняется только здесь, после прохода по словарю, и это
+        # то же правило, по которому здесь рождается снаряд игрока.
+        for e, q in born:
+            if q == 1:
+                make_shot(w, e)
+            else:
+                for da, dmg in q:
+                    make_shot(w, e, facing=e.facing + da, dmg=dmg)
 
 
 def _land_melee(w, e):
-    """Удар по дуге перед собой. Направление — то, что замерло на замахе."""
+    """Удар по дуге перед собой. Направление — то, что замерло на замахе.
+
+    Дальность, дуга и урон берутся У СУЩНОСТИ, а числа 4.2 остаются
+    значением по умолчанию: ноль в поле — значит «как у всех». Это ровно та
+    правка, которую 4.2 сам называет недостающей («другой баланс — это
+    правка сюда и поле в сущности»), и она одна на всех: боссу (8.1) нужен
+    удар по КРУГУ (atk_cos = -1.0: косинус половины дуги 360 градусов), а не
+    вторая ближняя атака рядом с этой. У игрока, рубаки и стрелка поля
+    нулевые, и ни одно число здесь не меняется.
+    """
     e.atk_hit = 0
     e.flags &= ~world_mod.F_WINDUP
     if e.flags & world_mod.F_DEAD:
         return 0
+    reach = e.atk_r or MELEE_REACH
+    cos_half = e.atk_cos or MELEE_COS
+    dmg = e.atk_dmg or MELEE_DMG
     fx = math.cos(e.facing)
     fy = math.sin(e.facing)
     n = 0
@@ -348,15 +369,15 @@ def _land_melee(w, e):
             continue
         dx = t.x - e.x
         dy = t.y - e.y
-        rr = MELEE_REACH + t.r
+        rr = reach + t.r
         d2 = dx * dx + dy * dy
         if d2 > rr * rr:
             continue
-        if d2 > 1e-12:
+        if d2 > 1e-12 and cos_half > -1.0:
             d = math.sqrt(d2)
-            if (dx * fx + dy * fy) / d < MELEE_COS:
+            if (dx * fx + dy * fy) / d < cos_half:
                 continue                 # за спиной или сбоку — мимо дуги
-        if damage(w, t, MELEE_DMG, e):
+        if damage(w, t, dmg, e):
             n += 1
     return n
 
@@ -373,17 +394,25 @@ def _shot_target(w, s):
     return None
 
 
-def _make_shot(w, e):
-    """Снаряд рождается у края тела и летит по прямой (4.2a)."""
-    ca = math.cos(e.facing)
-    sa = math.sin(e.facing)
+def make_shot(w, e, facing=None, dmg=None):
+    """Снаряд рождается у края тела и летит по прямой (4.2a).
+
+    facing/dmg — параметры, а не константы внутри: веер босса (8.1) — это
+    три вызова с разными углами, а не третий вид снаряда.
+    """
+    if facing is None:
+        facing = e.facing
+    if dmg is None:
+        dmg = SHOT_DMG
+    ca = math.cos(facing)
+    sa = math.sin(facing)
     off = e.r + SHOT_R + SHOT_MUZZLE
     x = e.x + ca * off
     y = e.y + sa * off
     if physics.circle_hits(w.grid, x, y, SHOT_R):
         return None                      # ствол упёрт в стену — выстрела нет
     s = w.spawn(world_mod.K_SHOT, x, y, r=SHOT_R, team=e.team, owner=e.id,
-                dmg=SHOT_DMG, ttl=SHOT_TICKS, facing=e.facing, hp=1, hp_max=1,
+                dmg=dmg, ttl=SHOT_TICKS, facing=facing, hp=1, hp_max=1,
                 # Рикошет (8.4): сколько раз этот снаряд переживёт стену.
                 # Считается при рождении, а не в полёте: апгрейд стрелявшего
                 # снаряду уже не догнать, если тот умрёт на лету.
@@ -393,3 +422,6 @@ def _make_shot(w, e):
     w.event("shot", a=e.id, b=s.id, x=proto.r3(x), y=proto.r3(y))
     w.make_noise(x, y, world_mod.NOISE_SHOT, e.team)         # 8.2
     return s
+
+
+_make_shot = make_shot          # прежнее имя: звалось только отсюда

@@ -40,6 +40,7 @@ import math
 import os
 import random
 
+from . import boss as boss_mod
 from . import combat
 from . import nav
 from . import physics
@@ -48,6 +49,7 @@ from . import world as world_mod
 
 K_ENEMY = world_mod.K_ENEMY                  # рубака
 K_ENEMY_RANGED = world_mod.K_ENEMY_RANGED    # стрелок
+K_BOSS = world_mod.K_BOSS                    # босс (8.1, server/boss.py)
 K_PLAYER = world_mod.K_PLAYER
 F_DEAD = world_mod.F_DEAD
 F_OFFLINE = world_mod.F_OFFLINE
@@ -59,6 +61,12 @@ TICK_HZ = world_mod.TICK_HZ
 AI_NONE = 0
 AI_MELEE = 1        # прёт в ближний бой
 AI_RANGED = 2       # держит дистанцию и стреляет
+# Босс (boss.AI_BOSS = 3) в этом перечне НЕ дублируется и в AI_KIND не
+# заводится: kind K_BOSS он получает прямо в boss.make, а поведение его
+# живёт в server/boss.py. Читать boss.AI_BOSS здесь, на уровне модуля,
+# нельзя — кольцо импортов (ai -> boss -> combat -> items -> world -> ai)
+# отдаёт сюда недособранный модуль; поэтому обращение к нему только в тике,
+# по имени модуля.
 
 # Вид поведения (AI_*) — серверный, на проводе его нет. На провод уходит
 # world.K_ENEMY (рубака) или world.K_ENEMY_RANGED (стрелок): 4.2 требует
@@ -138,12 +146,25 @@ RANGED_EVERY = 3        # каждый третий — стрелок
 ENEMIES_ON = os.environ.get("ZZA_ENEMIES", "1") != "0"
 
 
+# На этаже с боссом (8.1) рядовых ВДВОЕ МЕНЬШЕ, и это не поблажка, а
+# сохранение той же цены этажа. Считается по суммарному здоровью: рядовой в
+# среднем 35 hp (две трети рубак по 40, треть стрелков по 25, RANGED_EVERY),
+# босс — 400. Пятый этаж без босса: 24 * 35 = 840. Пятый этаж с боссом:
+# 12 * 35 + 400 = 820, то есть та же цена, но собранная в одном теле, а не
+# размазанная по этажу. Без этого правила пятый этаж был бы обычным этажом
+# ПЛЮС босс, то есть скачком вдвое на ровном месте.
+BOSS_FLOOR_SHARE = 2
+
+
 def count_for(floor):
-    """Сколько врагов на этаже глубины floor."""
+    """Сколько РЯДОВЫХ врагов на этаже глубины floor."""
     if not ENEMIES_ON:
         return 0
     n = ENEMY_BASE + ENEMY_PER_FLOOR * (int(floor) - 1)
-    return max(0, min(ENEMY_CAP, n))
+    n = max(0, min(ENEMY_CAP, n))
+    if boss_mod.on_floor(floor):
+        n //= BOSS_FLOOR_SHARE
+    return n
 
 
 def make_enemy(w, x, y, ai_kind):
@@ -178,7 +199,13 @@ def populate(w, fl, rnd=None):
     if rnd is None:
         rnd = random.Random(((int(getattr(fl, "seed", 0)) & 0x3FFFFFFF) * 2654435761
                              ^ (floor_n * 40503) ^ 0x5EED))
-    rooms = [r for i, r in enumerate(rooms_all) if i != entry_room]
+    # 8.1: арена босса — не комната для рядовых. Иначе этаж с боссом это
+    # обычный этаж, в углу которого стоит толстый враг, а не бой с боссом.
+    boss_room = getattr(fl, "boss_room", -1)
+    if not boss_mod.on_floor(floor_n):
+        boss_room = -1
+    rooms = [r for i, r in enumerate(rooms_all)
+             if i != entry_room and i != boss_room]
     if not rooms:
         return []
     want = count_for(floor_n)
@@ -202,6 +229,11 @@ def populate(w, fl, rnd=None):
         e = make_enemy(w, x, y, kind)
         e.facing = rnd.random() * 6.283
         out.append(e)
+    if ENEMIES_ON:
+        b = boss_mod.spawn_on(w, fl)
+        if b is not None:
+            b.facing = rnd.random() * 6.283
+            out.append(b)
     return out
 
 
@@ -297,7 +329,7 @@ def step(w, dt):
     # один проход по сущностям на всё: и цели, и исполнители
     for e in ents.values():
         k = e.kind
-        if k == K_ENEMY or k == K_ENEMY_RANGED:
+        if k == K_ENEMY or k == K_ENEMY_RANGED or k == K_BOSS:
             if e.ai and not (e.flags & F_DEAD):
                 if enemies is None:
                     enemies = [e]
@@ -367,10 +399,15 @@ def step(w, dt):
             continue
         d = math.sqrt(bd2)
 
-        if e.ai == AI_RANGED:
+        if e.ai == AI_MELEE:
+            _melee(w, e, best, d, tick, step_dir)
+        elif e.ai == AI_RANGED:
             _ranged(w, e, best, d, tick, grid, step_dir)
         else:
-            _melee(w, e, best, d, tick, step_dir)
+            # 8.1: босс ходит теми же списками — та же волна (8.3), тот же
+            # байт тумана (4.4), тот же слух (8.2). Своё у него только
+            # поведение, и оно живёт в server/boss.py.
+            boss_mod.step(w, e, best, d, tick, grid, step_dir, line_clear)
     return awake
 
 
