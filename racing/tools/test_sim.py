@@ -37,6 +37,7 @@ import gc
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -313,6 +314,25 @@ def check_generated(report):
     report.check(_rh.RAPIER in _rh.BACKENDS and _rh.backend() == _rh.CLASSIC,
                  'умолчание флага физики — classic, значение rapier объявлено',
                  'флаг сейчас %r' % _rh.backend())
+    # Цена деления байта высоты (§12.30). Два числа, обязанные быть взаимно
+    # обратными: сервер квантует, браузер разжимает. Разъедутся — чужая
+    # машина будет прыгать вдвое выше или вдвое ниже, чем на самом деле,
+    # и заметить это можно будет только глазами.
+    js_proto = open(os.path.join(BASE_DIR, 'static', 'js', 'protocol.js'),
+                    encoding='utf-8').read()
+    found = re.search(r'HEIGHT_SCALE = 1 / (\d+)', js_proto)
+    js_per_meter = float(found.group(1)) if found else 0.0
+    report.check(js_per_meter == protocol.HEIGHT_PER_METER,
+                 'цена деления высоты одна в game/protocol.py и protocol.js',
+                 'сервер %g делений на метр, браузер %g; потолок %.2f м'
+                 % (protocol.HEIGHT_PER_METER, js_per_meter,
+                    255.0 / protocol.HEIGHT_PER_METER))
+    # Потолок обязан покрывать самый высокий прыжок каталога. Порог выведен
+    # из ЗАМЕРА (§12.30): 3,72 м на industrial под Rapier, 2,84 м у классики.
+    report.check(255.0 / protocol.HEIGHT_PER_METER >= 3.72 * 1.25,
+                 'потолок высоты покрывает самый высокий прыжок с запасом',
+                 'потолок %.2f м против замеренных 3,72 м (Rapier) и '
+                 '2,84 м (классика)' % (255.0 / protocol.HEIGHT_PER_METER))
     # Настройки машин каталога: под оба режима у всех пяти, имена полей —
     # поля CarTuning выпущенной раскладки (проверяет game/cars.py при загрузке).
     from game import cars as _cars
@@ -1657,7 +1677,95 @@ def check_road_rapier(report):
             os.environ[rapier_host.ENV_VAR] = saved
 
 
+def check_traffic_wall_probe(report):
+    """Проверка «болванка не встаёт стеной» обязана краснеть на СТЕНЕ (§12.30).
+
+    Проверку, охраняющую редкое событие, нельзя сдать зелёным прогоном: за
+    проект это уже стоило одной дословно перенесённой проверки, которая
+    зеленела на заведомо сломанном барьере. Поэтому стена подсаживается
+    руками: одну болванку прибиваем к месту — каждый тик возвращаем ей позу
+    и обнуляем скорость, — и смотрим, что мера это ловит.
+
+    Контроль чувствительности рядом: тот же прогон без гвоздя обязан дать
+    ноль. Без него «поймали» ничего не значило бы.
+    """
+    report.section('Траффик: подсаженная стена')
+    from game import rapier_host
+    from game import traffic as traffic_mod
+
+    settle = 240                 # тиков на разгон потока
+    hold = int((traffic_mod.STUCK_RESCUE + 3.0) * 60)   # держим дольше порога
+
+    def run(pin):
+        track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                        'office.json'))
+        sim = _road_sim(track, 2, 'dense', 'off')
+        bots = make_bots(track, sim, seed=11)
+        box = _count_rescues(sim.traffic)
+        unit = sim.traffic.cars[0]
+        nailed = None
+        worst = 0.0
+        for tick in range(settle + hold):
+            for index, car in enumerate(sim.cars):
+                if car.removed:
+                    continue
+                sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+            sim.tick()
+            if pin and tick == settle:
+                nailed = (unit.state.x, unit.state.z, unit.state.yaw,
+                          unit.arc, unit.lateral)
+            if nailed is not None:
+                unit.state.x, unit.state.z, unit.state.yaw = nailed[:3]
+                unit.state.vx = unit.state.vz = 0.0
+                unit.arc, unit.lateral = nailed[3], nailed[4]
+                unit.speed = 0.0
+            worst = max(worst, unit.stuck_time)
+            if box[0]:
+                break
+        return box[0], worst, tick
+
+    saved = os.environ.get(rapier_host.ENV_VAR)
+    os.environ[rapier_host.ENV_VAR] = rapier_host.RAPIER
+    try:
+        clean, clean_worst, _t = run(False)
+        report.check(clean == 0,
+                     'метод даёт ноль на честном прогоне',
+                     'спасений %d, худший stuck_time %.2f с за %.1f с гонки'
+                     % (clean, clean_worst, (settle + hold) / 60.0))
+        caught, worst, tick = run(True)
+        report.check(caught > 0,
+                     'подсаженная стена поймана: болванку пришлось спасать',
+                     'гвоздь на %d-м тике, спасение на %d-м — через %.2f с '
+                     'стояния при пороге потока %.1f с'
+                     % (settle, tick, worst, traffic_mod.STUCK_RESCUE))
+    except rapier_host.HostError as exc:
+        report.note('ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)
+    finally:
+        if saved is None:
+            os.environ.pop(rapier_host.ENV_VAR, None)
+        else:
+            os.environ[rapier_host.ENV_VAR] = saved
+
+
+def _count_rescues(system):
+    """Обернуть спасение болванки счётчиком. Возвращает [число] (§12.30).
+
+    Подменяется ЭКЗЕМПЛЯР, а не класс: стенд не должен оставлять следов в
+    игре. Сигнатура та же, что у ``TrafficSystem._rescue``.
+    """
+    box = [0]
+    original = system._rescue
+
+    def counted(car, sim):
+        box[0] += 1
+        return original(car, sim)
+
+    system._rescue = counted
+    return box
+
+
 def _road_rapier_body(report, events, strict):
+    from game import traffic as traffic_mod
     window = 30                  # тиков в скользящем окне, полсекунды
     worst_sust = 1e9
     worst_inst = 1e9
@@ -1665,6 +1773,8 @@ def _road_rapier_body(report, events, strict):
     samples = [0, 0]
     stuck_total = 0
     longest_stop = 0
+    worst_stuck = 0.0
+    rescues = []
     finished_all = True
     grew = 0
     events_seen = 0
@@ -1678,6 +1788,10 @@ def _road_rapier_body(report, events, strict):
             rapier_everywhere = False
         bots = make_bots(track, sim, seed=11)
         system = sim.traffic
+        # Спасение болванки перестановкой — это и есть признание «встала
+        # стеной»: водитель сам себя вытащить не смог, и её убирают с трассы
+        # телепортом. Считаем такие случаи поимённо (§12.30).
+        rescues.append(_count_rescues(system))
         half = system._shw
         count = system.count
         ring = [[1e9] * window for _ in range(count)]
@@ -1707,6 +1821,8 @@ def _road_rapier_body(report, events, strict):
                     samples[0] += 1
                     if unit.state.offtrack:
                         samples[1] += 1
+                    if unit.stuck_time > worst_stuck:
+                        worst_stuck = unit.stuck_time
                     if unit.speed < 1.0:
                         stuck_total += 1
                         stop[k] += 1
@@ -1760,17 +1876,38 @@ def _road_rapier_body(report, events, strict):
 
     # Тяжёлый режим. Порога «просвет 4,6 м» здесь нет — он выведен для
     # `dense`/`off` и при включённых ДТП не выполняется и у классики
-    # (4,07 м, замерено спина к спине). Зато у «болванка не встала» порог
-    # остаётся, только он теперь про ДЛИТЕЛЬНОСТЬ: мимо завала протискиваются
-    # медленно, и это честная езда, а вот остановка дольше секунды — уже
-    # стена поперёк трассы. Порог тот же, что у узкого просвета в 12.20.
+    # (4,07 м, замерено спина к спине).
+    #
+    # «БОЛВАНКА НЕ ВСТАЁТ СТЕНОЙ» МЕРЯЕТСЯ НЕ СКОРОСТЬЮ (§12.30). До 4i
+    # проверка звучала «ниже 1 м/с не дольше секунды», и это меряло не то,
+    # что утверждало: болванку, которую ВЫДАВЛИВАЮТ из кучи, такой прокси
+    # объявляет стеной, хотя она в это время разгоняется и через полторы
+    # секунды уезжает (замерено на serpentine: 0,46 -> 0,95 м/с монотонно,
+    # сдвиг вдоль трассы 1,3 м). Это та же болезнь, что в §12.25 с
+    # перекладкой заряда: перенесли формулу, а не утверждение.
+    #
+    # Утверждение здесь одно: болванка ВЫБИРАЕТСЯ. И у потока для этого есть
+    # собственный механизм с собственными числами (game/traffic.py): ниже
+    # STUCK_SPEED = 1,6 м/с водитель считает себя стоящим, через
+    # STUCK_PATIENCE = 1,5 с сдаёт назад, а через STUCK_RESCUE = 7,0 с
+    # безнадёжного стояния поток УБИРАЕТ болванку с трассы перестановкой.
+    # Значит «встала стеной» — это ровно «дошла до перестановки»: сама не
+    # выбралась, и её унесли. Порог берётся у самого потока, а не подбирается
+    # под прогон, а мера — его же счётчик stuck_time.
     report.note('устойчивый просвет %.2f м (у классики в этом же режиме '
                 '4,07 м — порог 4,6 выведен для ДТП «off»)' % worst_sust)
-    report.check(longest_stop < 60,
-                 'болванка не встаёт стеной: остановка короче секунды',
-                 'самая длинная остановка %d тиков (%.2f с), всего таких '
-                 'тиков %d из %d' % (longest_stop, longest_stop / 60.0,
-                                     stuck_total, samples[0]))
+    saved = sum(box[0] for box in rescues)
+    report.check(saved == 0,
+                 'болванка не встаёт стеной: ни одну не пришлось спасать',
+                 'спасений перестановкой %d, худший stuck_time %.2f с при '
+                 'пороге потока STUCK_RESCUE %.1f с (запас %.1fx)'
+                 % (saved, worst_stuck, traffic_mod.STUCK_RESCUE,
+                    traffic_mod.STUCK_RESCUE / max(worst_stuck, 1e-9)))
+    report.note('для истории: самая долгая просадка ниже 1 м/с — %.2f с '
+                '(%d тиков из %d). Порогом она быть не может: ниже 1,6 м/с '
+                'водитель ещё только считает себя стоящим, и оттуда он '
+                'выбирается сам' % (longest_stop / 60.0, stuck_total,
+                                    samples[0]))
     report.check(events_seen >= 15,
                  'происшествия при Rapier рождаются, а не молчат',
                  'за пять гонок %d штук' % events_seen)
@@ -2134,6 +2271,7 @@ def main(argv=None):
     check_road_settings(report)
     check_js_modules(report)
     check_road_rapier(report)
+    check_traffic_wall_probe(report)
     measure_tick(report, collect_tick_times(laps=args.laps, seed=args.seed))
     measure_traffic_tick(report)
 

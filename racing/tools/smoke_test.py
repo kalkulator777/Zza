@@ -97,6 +97,11 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ---------------------------------------------------------------------------
 
 RACE_TRACK = 'office'          # самая короткая и простая трасса, 1374 м
+# Ключ --track подменяет её. Заведён по образцу --items и --road и по той же
+# причине (§12.30): на «Офисном» трамплинов нет, значит без него браузерный
+# путь трамплинов — постройка коробок в static/js/rapier_host.js и полёт со
+# своей машиной в предсказании — не выполняется НИ РАЗУ. Трассы с
+# трамплинами: serpentine, industrial, ridge.
 RACE_LAPS = 1                  # один круг: весь прогон должен уложиться в ~1,5 мин
 HOST_CAR = 'hatch'
 GUEST_CAR = 'buggy'
@@ -1971,6 +1976,9 @@ def parse_args(argv=None):
                         help='включить бонусы в приёмочной гонке: гонка '
                              'перестаёт быть предсказуемой, зато браузерный '
                              'путь бонусов и снарядов выполняется')
+    parser.add_argument('--track', default=None,
+                        help='трасса приёмочной гонки; с трамплинами — '
+                             'serpentine, industrial, ridge (§12.30)')
     parser.add_argument('--road', action='store_true',
                         help='включить плотный поток машин и частые '
                              'происшествия: выполняется браузерный путь '
@@ -1995,6 +2003,9 @@ def main(argv=None):
             print('Не смог создать каталог для скриншотов: %s' % exc, file=sys.stderr)
             return 2
 
+    if args.track:
+        global RACE_TRACK
+        RACE_TRACK = args.track
     port = args.port or free_port()
     server = Server(port, args.verbose, args.physics)
     broken = None

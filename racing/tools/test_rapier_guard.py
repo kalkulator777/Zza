@@ -720,6 +720,23 @@ def report_eps_sync(report):
 # есть это «поимённо»: она поднимает НАСТОЯЩУЮ симуляцию с настройками, где
 # всё четыре механики попрошены включёнными, и смотрит, что вышло.
 
+def _throttle_distance(sim, slot, ticks=180):
+    """Путь машины за ``ticks`` тиков полного газа, м.
+
+    Мир пересобирается вместе с гандикапом, поэтому машины стоят на тех же
+    местах решётки и замер «до» и «после» сравним: разница — это только
+    характеристики.
+    """
+    from game.protocol import BTN_THROTTLE
+    car = sim.car_by_slot[slot]
+    x0, z0 = car.state.x, car.state.z
+    for t in range(ticks):
+        for other in sim.cars:
+            sim.set_input(other.slot, t + 1, BTN_THROTTLE)
+        sim.tick()
+    return math.hypot(car.state.x - x0, car.state.z - z0)
+
+
 def report_restrictions(report):
     print('  перенастройки при physics=rapier:')
     from game.sim import Simulation
@@ -810,8 +827,16 @@ def report_restrictions(report):
         report.check('handicap' not in [row[0] for row in rh.RESTRICTED],
                      'гандикап больше не в списке опущенного')
         names = ('engine_force', 'max_speed', 'boost_speed')
-        car = sim.cars[0]
+        # Берём ПОСЛЕДНЮЮ машину: шаблон настроек после сборки мира хранит
+        # то, что прочитала последняя spawn_car, и читать его для первой
+        # машины значило бы читать чужие числа.
+        car = sim.cars[-1]
         base_tuning = dict(rh.car_tuning(car.stats_base, sim.rapier.mode))
+        # Замер «до» — на ОТДЕЛЬНОЙ симуляции: после первого тика мир
+        # пересобрать уже нельзя (и это не мелочь, а защита: пересборка
+        # посреди гонки телепортировала бы всех на решётку).
+        base_dist = _throttle_distance(Simulation(track(), dict(wanted),
+                                                  players), car.slot)
         sim.apply_handicap(car.slot, 0.97, names)
         live = sim.rapier.host.tuning_values()
         # 1. Тело пересоздано с замедленными настройками. Читаем ШАБЛОН,
@@ -838,14 +863,28 @@ def report_restrictions(report):
                      'множитель %.4f, engine_force %.3f -> %.3f'
                      % (car.handicap, car.stats_base.engine_force,
                         car.stats.engine_force))
-        # 3. Трамплины при rapier ЕДУТ клиенту (§12.30): их больше не
-        #    вычищают из race_init, потому что в мире они теперь есть.
-        ramps = sim.track.to_client().get('ramps') or []
-        report.check(sim.rapier.ramp_boxes == 0 if not ramps else
-                     sim.rapier.ramp_boxes > 0,
-                     'трамплины трассы стоят в мире гонки',
-                     'трамплинов %d, коробок %d'
-                     % (len(ramps), sim.rapier.ramp_boxes))
+        # И главное: машина РЕАЛЬНО поехала медленнее. Ровно этого не было
+        # видно по настройке, когда гандикап молчал. Мера — путь за три
+        # секунды полного газа с одного и того же места.
+        slow_dist = _throttle_distance(sim, car.slot)
+        report.check(slow_dist < base_dist * 0.995,
+                     'машина с гандикапом едет медленнее — замер, а не флаг',
+                     '%.2f м против %.2f м за 3 с полного газа (-%.1f %%)'
+                     % (slow_dist, base_dist,
+                        100.0 * (1.0 - slow_dist / base_dist)))
+        # 3. Трамплины в НАСТОЯЩЕЙ гонке, а не на стенде: поднимаем вторую
+        #    симуляцию на трассе с трамплином и смотрим, что коробки в её
+        #    мире стоят и что запись трассы их везёт. Проверять это на
+        #    avenue было бы проверкой нуля: трамплинов там нет.
+        jump_track = ramp_track()
+        jump = Simulation(jump_track, dict(wanted, track=RAMP_TRACK), players)
+        ramps = jump.track.to_client().get('ramps') or []
+        expect = sum(len(r['boxes']) // RAMP_BOX_FLOATS for r in ramps)
+        report.check(len(ramps) > 0 and expect > 0
+                     and jump.rapier.ramp_boxes == expect,
+                     'трамплины трассы стоят в мире настоящей гонки',
+                     '%s: трамплинов %d, коробок %d из %d ожидаемых'
+                     % (RAMP_TRACK, len(ramps), jump.rapier.ramp_boxes, expect))
     finally:
         if saved is None:
             os.environ.pop(rh.ENV_VAR, None)
@@ -1429,6 +1468,36 @@ def _report_road(report, ev):
 # Чтобы «отдельная команда» не держалась на памяти, здесь стоит сторож md5:
 # модуль пересобрали — проверка краснеет и называет команду.
 
+def report_handicap_fields(report):
+    """Список полей гандикапа один и тот же в трёх местах (§12.30).
+
+    ``server/config.HANDICAP_STATS`` — источник; ``static/js/rapier_host.js``
+    режет по нему настройки модуля, ``static/js/main.js`` — характеристики
+    предсказания классики. Разошлись бы — своя машина ехала бы у сервера и
+    у клиента по-разному, и реконсиляция тянула бы её назад всю гонку.
+    """
+    print('  список полей гандикапа:')
+    sys.path.insert(0, BASE_DIR)
+    from server import config
+    want = tuple(config.HANDICAP_STATS)
+    host_js = open(os.path.join(BASE_DIR, 'static', 'js', 'rapier_host.js'),
+                   encoding='utf-8').read()
+    found = re.search(r"HANDICAP_STATS\s*=\s*\[([^\]]*)\]", host_js)
+    names = tuple(re.findall(r"'([a-z_]+)'", found.group(1))) if found else ()
+    report.check(names == want, 'браузерный хозяин режет те же поля',
+                 'config %s, rapier_host.js %s' % (list(want), list(names)))
+    main_js = open(os.path.join(BASE_DIR, 'static', 'js', 'main.js'),
+                   encoding='utf-8').read()
+    body = main_js.split('function applyHandicap')[1][:1200]
+    camel = {'engine_force': 'engineForce', 'max_speed': 'maxSpeed',
+             'boost_speed': 'boostSpeed'}
+    missing = [n for n in want
+               if ('stats.%s *= factor' % camel.get(n, n)) not in body]
+    report.check(not missing,
+                 'предсказание классики в браузере режет те же поля',
+                 'не нашлось: %s' % (', '.join(missing) or 'ничего'))
+
+
 def report_module(report, wasm_parity=True):
     print('  модуль и движки:')
     path = rh.WASM_PATH
@@ -1442,16 +1511,26 @@ def report_module(report, wasm_parity=True):
     if not wasm_parity:
         print('    [   ] сверка движков пропущена (--no-wasm-parity)')
         return
-    proc = subprocess.run(
-        [sys.executable, os.path.join(BASE_DIR, 'tools', 'test_wasm_parity.py'),
-         '--engines', 'wasmtime,node'],
-        cwd=BASE_DIR, capture_output=True, text=True)
-    tail = [line for line in proc.stdout.splitlines() if line.strip()]
-    report.check(proc.returncode == 0,
-                 'один .wasm — один результат (wasmtime, Node)',
-                 tail[-1].strip() if tail else 'стенд ничего не напечатал')
-    if proc.returncode != 0:
-        print('      ' + '\n      '.join(tail[-12:]))
+    # Два сценария. Первый — прежний, avenue: его хэши записаны в §12.27, и
+    # трогать его нельзя. Второй — ridge (§12.30): восемь машин разложены
+    # поперёк трамплина и летят с него. Он проверяет ровно то, чего первый
+    # проверить не может, — что коробки трамплина у СЕРВЕРА (wasmtime) и у
+    # БРАУЗЕРА (V8 через static/js/rapier_host.js) одни и те же. Замерено,
+    # что проверка способна покраснеть: сдвиг ОДНОЙ коробки из 38 на 1 мм
+    # разводит движки начиная с 200-го тика.
+    for track_id, what in (('avenue', 'один .wasm — один результат'),
+                           ('ridge', 'коробки трамплина у сервера и у '
+                                     'браузера одни и те же')):
+        proc = subprocess.run(
+            [sys.executable,
+             os.path.join(BASE_DIR, 'tools', 'test_wasm_parity.py'),
+             '--engines', 'wasmtime,node', '--track', track_id],
+            cwd=BASE_DIR, capture_output=True, text=True)
+        tail = [line for line in proc.stdout.splitlines() if line.strip()]
+        report.check(proc.returncode == 0, '%s (wasmtime, Node)' % what,
+                     tail[-1].strip() if tail else 'стенд ничего не напечатал')
+        if proc.returncode != 0:
+            print('      ' + '\n      '.join(tail[-12:]))
     print('      браузеры сверяются отдельно: python3 tools/test_wasm_parity.py')
 
 
@@ -1474,14 +1553,14 @@ def report_module(report, wasm_parity=True):
 #   трамплине, а не на догадке.
 
 RAMP_TRACK = 'industrial'      # самый высокий трамплин каталога: rise 1,25 м
-RAMP_CAR = 'hatch'             # самая низкая машина: у неё просвет 0,284 м
 
 # Потолок расхождения профиля. ВЫВЕДЕН: лесенка скоса даёт ступеньку
-# rise/steps, и точка следа отстоит от истинного профиля не дальше её
-# половины. Плюс допуск на то, что полотно под трамплином — ломаная по
-# точкам оцифровки (шаг 2 м), а профиль классики считает surface() своей
-# доводкой: замерено 0,015 м. Итого половина ступеньки плюс 0,02 м.
-RAMP_PROFILE_SLACK = 0.02
+# rise/steps, и точка следа отстоит от коробки не дальше её половины. Всё
+# остальное — сверх этого: полотно под трамплином ломаное по точкам
+# оцифровки (шаг 2 м), а верх коробки — плоскость через въезд и кромку.
+# Замерено по одной сердцевине, где лесенки нет вовсе: 0,0032 м (ridge).
+# Берём с троекратным запасом.
+RAMP_PROFILE_SLACK = 0.01
 
 _RAMP_TRACKS = {}
 
@@ -1877,7 +1956,6 @@ def charge_release(in_air):
     """
     car = RampCar()
     tr = car.tr
-    lip = car.ramp['s0'] + car.ramp['length']
     paid, left, armed = 0.0, 0.0, False
     for _ in range(int(14.0 / DT)):
         rec = car.run(40.0, seconds=DT)
@@ -1929,6 +2007,7 @@ def main(argv=None):
         report_effects(report)
         report_road(report)
         report_ramps(report)
+        report_handicap_fields(report)
         report_module(report, wasm_parity=not args.no_wasm_parity)
     except rh.HostError as exc:
         print('  ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)
