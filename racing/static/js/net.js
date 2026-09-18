@@ -367,6 +367,8 @@ export class NetClient {
         this.roadHalfWidth = new Float64Array(MAX_ROAD_EVENTS);
         this.roadStamp = 0;        // подпись состава: меняется — пересобрать зону
         this._poseLat = 0;         // выход _roadPose: смещение от оси, м
+        this._roadOut = new Float64Array(5);   // выход roadSolve: x, z, vx, vz, затухание
+        this._roadDose = new Float64Array(6);  // доза CarEffect: grip, shift xz, push xz, speed
         // Скользкая копия характеристик своей машины: ею подменяется
         // localStats на шагах в масле и на обломках. Создаётся при первой
         // надобности и переиспользуется — в кадре ноль аллокаций.
@@ -1061,18 +1063,46 @@ export class NetClient {
 
     /**
      * Обломки и твёрдые препятствия — зеркало RoadEvents.apply_after_step.
-     * Зовётся ПОСЛЕ шага физики. Препятствие ведёт себя как стена трассы
-     * (шаг 14): выталкивание по оси меньшего перекрытия плюс гашение
-     * нормальной составляющей скорости.
+     * Тонкая обёртка над roadSolve: механика там, здесь присваивание.
      */
     roadAfterStep(state) {
-        if (this.roadCount === 0) return;
+        const out = this._roadOut;
+        if (!this.roadSolve(state, out)) return;
+        state.x = out[0];
+        state.z = out[1];
+        const damp = out[4];
+        if (damp < 1) {
+            state.vx = out[2] * damp;
+            state.vz = out[3] * damp;
+        } else {
+            state.vx = out[2];
+            state.vz = out[3];
+        }
+    }
+
+    /**
+     * Механика обломков и препятствий БЕЗ правки состояния — зеркало
+     * RoadEvents.solid_resolve. Пишет в out итоговые x, z, vx, vz и
+     * множитель затухания, возвращает true, если считать было что.
+     * Препятствие ведёт себя как стена трассы (шаг 14): выталкивание по
+     * оси меньшего перекрытия плюс гашение нормальной составляющей.
+     *
+     * Итоговые значения, а не приращения: классике нужны первые, а
+     * Rapier — вторые (доза shift_*/push_*, §12.28). Разность считает тот,
+     * кому она нужна; общий код один на обе физики, как и на сервере.
+     */
+    roadSolve(state, out) {
+        if (this.roadCount === 0) return false;
         const idx = state.sampleIdx;
-        if (idx < 0 || !this.roadZone[idx]) return;
+        if (idx < 0 || !this.roadZone[idx]) return false;
         const track = this.track;
         let arc = this._roadPose(state, idx);
         let lat = this._poseLat;
         let damp = 1;
+        let x = state.x;
+        let z = state.z;
+        let vx = state.vx;
+        let vz = state.vz;
         for (let i = 0; i < this.roadCount; i++) {
             const kind = this.roadKind[i];
             const phase = this.roadPhase[i];
@@ -1096,28 +1126,67 @@ export class NetClient {
                 const sign = dLat >= 0 ? 1 : -1;
                 nx = track.cnx[idx] * sign;
                 nz = track.cnz[idx] * sign;
-                state.x += nx * penL;
-                state.z += nz * penL;
+                x += nx * penL;
+                z += nz * penL;
                 lat += sign * penL;
             } else {
                 const sign = ds >= 0 ? 1 : -1;
                 nx = track.ctx[idx] * sign;
                 nz = track.ctz[idx] * sign;
-                state.x += nx * penS;
-                state.z += nz * penS;
+                x += nx * penS;
+                z += nz * penS;
                 arc += sign * penS;
             }
-            const vn = state.vx * nx + state.vz * nz;
+            const vn = vx * nx + vz * nz;
             if (vn < 0) {
                 const k = vn * (1 + ROAD_SOLID_BOUNCE);
-                state.vx -= nx * k;
-                state.vz -= nz * k;
+                vx -= nx * k;
+                vz -= nz * k;
             }
         }
-        if (damp < 1) {
-            state.vx *= damp;
-            state.vz *= damp;
+        out[0] = x;
+        out[1] = z;
+        out[2] = vx;
+        out[3] = vz;
+        out[4] = damp;
+        return true;
+    }
+
+    /**
+     * Дорога -> доза CarEffect на этот шаг. Зеркало того, что делает
+     * RapierRace._write_effect на сервере (§12.28): покрытие в grip_drop,
+     * тряска по обломкам в speed_drop, выталкивание из завала в
+     * shift_*/push_*. Возвращает буфер из шести чисел или null, если
+     * дороге сказать нечего.
+     *
+     * Чего здесь НЕТ и не будет: удара о болванку потока и вспышки взрыва.
+     * Первое клиент не предсказывает и у классики (§12.20) — болванок в
+     * его кольце нет вовсе; второе считает только сервер, клиент узнаёт о
+     * раскрутке флагом снапшота. Считать их здесь значило бы предсказывать
+     * то, чего у предсказателя нет.
+     */
+    roadDose(state) {
+        const dose = this._roadDose;
+        dose[0] = 0; dose[1] = 0; dose[2] = 0;
+        dose[3] = 0; dose[4] = 0; dose[5] = 0;
+        if (this.roadCount === 0) return null;
+        let any = false;
+        const scale = this.roadGrip(state);
+        if (scale < 1) {
+            dose[0] = 1 - scale;
+            any = true;
         }
+        const out = this._roadOut;
+        if (this.roadSolve(state, out)) {
+            dose[1] = out[0] - state.x;
+            dose[2] = out[1] - state.z;
+            dose[3] = out[2] - state.vx;
+            dose[4] = out[3] - state.vz;
+            if (out[4] < 1) dose[5] = 1 - out[4];
+            if (dose[1] !== 0 || dose[2] !== 0 || dose[3] !== 0
+                || dose[4] !== 0 || dose[5] !== 0) any = true;
+        }
+        return any ? dose : null;
     }
 
     /** (дуга, смещение) машины по её же sampleIdx. Смещение — в _poseLat. */

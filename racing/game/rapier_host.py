@@ -73,22 +73,17 @@ def race_enabled() -> bool:
     return backend() == RAPIER
 
 
-# --- что Rapier пока не считает (§12.24, §12.25) -----------------------------
+# --- что Rapier пока не считает (§12.24, §12.27, §12.28) ---------------------
 #
-# Поток машин и происшествия живут в game/traffic.py и game/events.py и
-# написаны под состояние старой физики: они правят x/z/vx/vz и подменяют
-# характеристики между шагами. У Rapier состояние машины лежит внутри
-# модуля, менять его снаружи между шагами нечем, а на половину перенесённой
-# механике играть хуже, чем без неё. Поэтому при physics=rapier эти
-# настройки честно опускаются, и комната об этом СООБЩАЕТ.
-#
-# БОНУСЫ ИЗ ЭТОГО СПИСКА УШЛИ (§12.25): дверь «внешнее воздействие на
-# машину» в ABI теперь есть — буфер EFFECTS и структура CarEffect. Через
-# неё же поедут покрытие и выталкивание происшествий: grip_drop уже
-# множит сцепление колёс, push_* и shift_* уже двигают тело. Здесь остались
-# только те две настройки, которым нужна не дверь, а тела в мире —
-# болванки потока и корпуса твёрдых препятствий, — и та, что не про
-# воздействие вовсе.
+# ПОТОК И ПРОИСШЕСТВИЯ ИЗ ЭТОГО СПИСКА УШЛИ (§12.28), как до них ушли
+# бонусы (§12.27). Дверь «внешнее воздействие на машину» — буфер EFFECTS и
+# структура CarEffect — оказалась достаточной и для них: масло и обломки
+# едут в grip_drop и speed_drop, выталкивание из завала и удар о болванку —
+# в shift_* и push_*. Тел в мире модуля при этом не появилось: болванка
+# по-прежнему считается старой физикой у хозяина, а её контакт с гонщиком
+# переводится в дозу. Почему не настоящие тела — замер в §12.28: восемь
+# машин в модуле стоят 122 мкс на тик, шестнадцать — 258, а болванок надо
+# двенадцать, то есть двадцать тел, которые в MAX_CARS не влезают вовсе.
 #
 # Столкновения в этом списке с другой стороны: их Rapier считает ВНУТРИ
 # шага, и выключить их нечем — групп столкновений в ABI нет. Галочка
@@ -96,8 +91,6 @@ def race_enabled() -> bool:
 #
 # (имя поля настроек, во что оно ставится, что сказать игроку)
 RESTRICTED = (
-    ('traffic', 'off', 'поток машин выключен'),
-    ('events', 'off', 'происшествия выключены'),
     ('collisions', True, 'столкновения включены всегда'),
     # Гандикап подменяет ХАРАКТЕРИСТИКИ машины уже после того, как мир
     # создан и тела расставлены, а перенастроить живую машину модуль не
@@ -517,6 +510,7 @@ from .protocol import (BTN_THROTTLE, BTN_BRAKE, BTN_LEFT,   # noqa: E402
 # места, где они записаны, в проекте быть не должно. Браузерный хозяин
 # берёт те же шесть чисел из static/js/physics.js — это и есть их
 # единственная пара объявлений, ровно как у WEATHER_GRIP.
+from . import physics                                  # noqa: E402
 from .physics import (DRIFT_CHARGE_L1, DRIFT_CHARGE_L2,   # noqa: E402
                       DRIFT_CHARGE_L3, DRIFT_BOOST_L1,
                       DRIFT_BOOST_L2, DRIFT_BOOST_L3, BOOST_ACCEL,
@@ -693,8 +687,7 @@ class RapierRace(object):
         # Погода правится ТРЕНИЕМ СЕТКИ полотна: она одна на всю трассу и
         # на обе стороны, ей персональная доза не нужна. Покрытие ПОД
         # ОТДЕЛЬНОЙ МАШИНОЙ — масло и обломки — едет другой дорогой:
-        # CarEffect.grip_drop (§12.25). Пока происшествия выключены
-        # (RESTRICTED), потому что им нужны ещё и тела в мире.
+        # CarEffect.grip_drop и speed_drop, см. _write_effect (§12.28).
         margin, height, friction = mesh_params(track)
         self.host.build_track(track, margin, height, friction * sim.grip_mul)
         self.host.free_track_mesh()
@@ -715,10 +708,14 @@ class RapierRace(object):
             idx = self.host.spawn_car(state.x, ground + rest_y, state.z, state.yaw)
             self.slots.append([car, idx, idx * abi.CarInput.FLOATS,
                                idx * abi.CarOut.FLOATS, rest_y, 1.0 / steer_max,
-                               idx * abi.CarEffect.FLOATS])
+                               idx * abi.CarEffect.FLOATS,
+                               [0.0, 0.0, 0.0, 0.0]])
 
         self.ticks = 0
         self.micros = []
+        # Выход RoadEvents.solid_resolve: x, z, vx, vz, затухание.
+        self._solid = [0.0, 0.0, 0.0, 0.0, 1.0]
+        self._coll_rows = []     # что было у гонщиков до прохода столкновений
         self._settle()
 
     # --- расстановка ----------------------------------------------------
@@ -886,6 +883,69 @@ class RapierRace(object):
         if want > out[entry[3] + abi.CarOut.BOOST_TIME]:
             effects[e + E.BOOST_ADD] = want
 
+        # --- дорога: покрытие, завалы, болванки (§12.28) -------------------
+        #
+        # Сопоставление один в один с тем, что классика делает ВОКРУГ шага
+        # в Simulation._step_cars: grip_scale до шага -> grip_drop, тряска
+        # по обломкам -> speed_drop (то же поле, что «Гроза»), выталкивание
+        # из завала -> shift_* плюс push_*. Ни одного нового числа: все они
+        # живут в game/events.py и приезжают сюда готовыми.
+        #
+        # Отличие от классики ровно одно, и оно намеренное: та считает
+        # выталкивание ПОСЛЕ шага и правит состояние сразу, а здесь доза
+        # выписывается ДО шага по позе, снятой в конце предыдущего. То есть
+        # поправка опаздывает на тик. Перекрытие пересчитывается каждый тик,
+        # пока оно есть, поэтому машина всё равно выходит из завала — просто
+        # на 17 мс позже. Считать «после» нечем: состояние лежит в модуле,
+        # и единственный способ его тронуть — доза на следующий шаг.
+        solid = self._solid
+        road = self.sim.road
+        drop = 0.0
+        shift_x = shift_z = push_x = push_z = 0.0
+        if road.enabled:
+            scale = road.grip_scale(state)
+            if scale < 1.0:
+                effects[e + E.GRIP_DROP] = 1.0 - scale
+            if road.solid_resolve(state, solid):
+                shift_x = solid[0] - state.x
+                shift_z = solid[1] - state.z
+                push_x = solid[2] - state.vx
+                push_z = solid[3] - state.vz
+                if solid[4] < 1.0:
+                    drop = 1.0 - solid[4]
+            # Вспышка взрыва — те же две строки, что в _step_cars классики,
+            # включая щит и призрака. Раскрутку выпишет следующий тик: у
+            # классики она тоже начинается со следующего шага.
+            spin_add = road.blast_spin(state, car.slot)
+            if spin_add > 0.0 and state.shield_time <= 0.0 and not car.ghost:
+                if spin_add > state.spin_time:
+                    state.spin_time = spin_add
+
+        # Удар о болванку потока посчитан прошлым тиком в resolve_collisions:
+        # там гонщик уже в модуле, а болванка — нет, поэтому её половину
+        # применили сразу, а его половину отложили в дозу.
+        pend = entry[7]
+        if pend[0] or pend[1] or pend[2] or pend[3]:
+            shift_x += pend[0]
+            shift_z += pend[1]
+            push_x += pend[2]
+            push_z += pend[3]
+            pend[0] = 0.0
+            pend[1] = 0.0
+            pend[2] = 0.0
+            pend[3] = 0.0
+
+        if shift_x or shift_z:
+            effects[e + E.SHIFT_X] = shift_x
+            effects[e + E.SHIFT_Z] = shift_z
+        if push_x or push_z:
+            effects[e + E.PUSH_X] = push_x
+            effects[e + E.PUSH_Z] = push_z
+        # Одно поле на «Грозу» и на обломки: берём БОЛЬШУЮ дозу, а не сумму
+        # — ровно правило 6.3 для буста, и по той же причине.
+        if drop > effects[e + E.SPEED_DROP]:
+            effects[e + E.SPEED_DROP] = drop
+
     def _read_all(self, events=None):
         """Поза из модуля -> CarState, затем шаг 16 из game/track.py."""
         host = self.host
@@ -941,14 +1001,60 @@ class RapierRace(object):
             # Шаг 16 — слово в слово прежний, в f64 и в game/track.py.
             advance(state, i)
 
-    def noop_collisions(self):
-        """Подменяет ``Simulation._resolve_collisions``: считать нечего.
+    def resolve_collisions(self):
+        """Подменяет ``Simulation._resolve_collisions``: остались болванки.
 
-        Столкновения машина-машина Rapier делает внутри шага. Болванок
-        потока в его мире нет — поток при этом режиме выключен (RESTRICTED),
-        поэтому и второго участника у прохода не осталось.
+        Машина против машины считается ВНУТРИ шага модуля, повторять её
+        здесь нельзя — толкнуло бы дважды. Болванка потока в мире модуля
+        не живёт (§12.28): она идёт старой физикой у хозяина, поэтому её
+        контакт с гонщиком обязан посчитать хозяин. Считает его тот же
+        ``physics.resolve_collisions`` и по тем же правилам, что у классики
+        (капсула 4,00 x 1,90 м), только пары «гонщик-гонщик» пропущены
+        через ``skip_before``.
+
+        Половину удара, доставшуюся болванке, применяем сразу — болванка
+        наша. Половину гонщика откладываем в дозу: его состояние на
+        следующем шаге всё равно перепишет модуль, поэтому подвинуть надо
+        ТЕЛО, а не копию. Разницу снимаем здесь, потому что
+        ``resolve_collisions`` правит состояние на месте и другого способа
+        узнать, сколько именно он насчитал, нет.
+
+        Правку состояния при этом НЕ откатываем: до конца тика её ещё
+        читает снапшот, и игрок видит толчок сразу, как у классики, а не
+        тиком позже.
         """
-        return
+        traffic = self.sim.traffic
+        if not traffic.enabled:
+            return
+        sim = self.sim
+        states = sim._coll_states
+        stats = sim._coll_stats
+        rows = self._coll_rows
+        del rows[:]
+        count = 0
+        for entry in self.slots:
+            car = entry[0]
+            if car.removed:
+                continue
+            state = car.state
+            states[count] = state
+            stats[count] = car.stats
+            rows.append((entry, state, state.x, state.z, state.vx, state.vz))
+            count += 1
+        first = count
+        count = traffic.collect(states, stats, count)
+        if count <= first:
+            return
+        physics.resolve_collisions(states, stats, count, first)
+        for entry, state, x, z, vx, vz in rows:
+            dx = state.x - x
+            if dx == 0.0 and state.z == z and state.vx == vx and state.vz == vz:
+                continue
+            pend = entry[7]
+            pend[0] += dx
+            pend[1] += state.z - z
+            pend[2] += state.vx - vx
+            pend[3] += state.vz - vz
 
     # --- замеры ---------------------------------------------------------
 
@@ -979,10 +1085,10 @@ def attach(sim):
         world = RapierRace(sim)
         sim._step_cars = world.step_cars
         # Столкновения машина-машина Rapier делает ВНУТРИ шага (§8.6
-        # разведки). Прежний отдельный проход обязан замолчать: он работает
-        # по состоянию, которое модуль на следующем шаге всё равно перепишет,
-        # то есть только тратил бы тик и врал бы клиенту.
-        sim._resolve_collisions = world.noop_collisions
+        # разведки). Прежнему отдельному проходу остались только болванки
+        # потока: их тел в модуле нет, и без этого прохода въехать в поток
+        # было бы нечем (§12.28).
+        sim._resolve_collisions = world.resolve_collisions
         return world
     world = ShadowWorld(sim)
     world._classic = sim._step_cars

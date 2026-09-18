@@ -257,6 +257,10 @@ class RoadEvents(object):
 
         self._car_scratch = []
         self._weight_total = sum(w for _kind, w in KIND_WEIGHTS)
+        # Выход solid_resolve: x, z, vx, vz, множитель затухания. Список
+        # переиспользуется — за тик его заполняют до восьми раз, и мусорить
+        # кортежем на горячем пути незачем.
+        self._solid = [0.0, 0.0, 0.0, 0.0, 1.0]
 
     # --- жизненный цикл ------------------------------------------------------
 
@@ -528,19 +532,52 @@ class RoadEvents(object):
     def apply_after_step(self, state, dt):
         """Обломки и твёрдые препятствия. Зовётся ПОСЛЕ ``physics.step``.
 
+        Тонкая обёртка над ``solid_resolve``: всю механику считает она,
+        здесь только присваивание. Так у классики и у Rapier одно
+        вычисление на двоих, а не две копии, которые разъедутся.
+        """
+        out = self._solid
+        if not self.solid_resolve(state, out):
+            return
+        state.x = out[0]
+        state.z = out[1]
+        damp = out[4]
+        if damp < 1.0:
+            state.vx = out[2] * damp
+            state.vz = out[3] * damp
+        else:
+            state.vx = out[2]
+            state.vz = out[3]
+
+    def solid_resolve(self, state, out):
+        """Механика обломков и препятствий БЕЗ правки состояния машины.
+
+        Пишет в ``out`` пять чисел — итоговые ``x``, ``z``, ``vx``, ``vz`` и
+        множитель затухания — и возвращает True, если считать было что.
+
         Твёрдое препятствие ведёт себя как стена трассы (шаг 14): машина
         выталкивается по той оси, по которой перекрытие меньше, а
         нормальная составляющая скорости гасится с ``SOLID_BOUNCE``.
         Считается в координатах трассы, поэтому и на сервере, и на клиенте
         выходит одно и то же число.
+
+        Почему итоговые значения, а не приращения. Классике нужно первое
+        (она просто присваивает), Rapier — второе: состояние машины лежит
+        в модуле, и хозяин выписывает ДОЗУ ``shift_*``/``push_*`` (§12.27).
+        Разность считает тот, кому она нужна; общий код остаётся один, и
+        у классики он побитово тот же, что был до разделения.
         """
         if not self.live:
-            return
+            return False
         flags = self._zone[state.sample_idx]
         if not (flags & (ZONE_DEBRIS | ZONE_SOLID)):
-            return
+            return False
         arc, lateral = self._pose(state)
         damp = 1.0
+        x = state.x
+        z = state.z
+        vx = state.vx
+        vz = state.vz
         for event in self.live:
             kind = event.kind
             phase = event.phase
@@ -566,25 +603,28 @@ class RoadEvents(object):
                 sign = 1.0 if d_lat >= 0.0 else -1.0
                 nx = self._snx[i] * sign
                 nz = self._snz[i] * sign
-                state.x += nx * pen_l
-                state.z += nz * pen_l
+                x += nx * pen_l
+                z += nz * pen_l
                 lateral += sign * pen_l
             else:
                 # выталкивание вдоль трассы, по касательной
                 sign = 1.0 if _wrap_delta(arc - event.arc, self.length) >= 0.0 else -1.0
                 nx = self._stx[i] * sign
                 nz = self._stz[i] * sign
-                state.x += nx * pen_s
-                state.z += nz * pen_s
+                x += nx * pen_s
+                z += nz * pen_s
                 arc += sign * pen_s
-            vn = state.vx * nx + state.vz * nz
+            vn = vx * nx + vz * nz
             if vn < 0.0:
                 k = vn * (1.0 + SOLID_BOUNCE)
-                state.vx -= nx * k
-                state.vz -= nz * k
-        if damp < 1.0:
-            state.vx *= damp
-            state.vz *= damp
+                vx -= nx * k
+                vz -= nz * k
+        out[0] = x
+        out[1] = z
+        out[2] = vx
+        out[3] = vz
+        out[4] = damp
+        return True
 
     def blast_spin(self, state, token):
         """Вспышка взрыва: секунды раскрутки или 0. Считает только сервер.
