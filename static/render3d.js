@@ -37,7 +37,7 @@
 
 import * as THREE from '../vendor/three.module.min.js';
 
-import { K_PLAYER, K_ENEMY, K_ENEMY_RANGED, K_PROP, K_SHOT,
+import { K_PLAYER, K_ENEMY, K_ENEMY_RANGED, K_BOSS, K_PROP, K_SHOT,
          F_DEAD, F_OFFLINE, F_WINDUP, F_DASH,
          FX_HIT, FX_DIE, FX_SHOT, FX_BOOM,
          TILE_WALL, TILE_STAIRS, VIS_DARK, VIS_LIT }
@@ -130,6 +130,7 @@ const KIND = {};
 KIND[K_PLAYER] = { r: 0.35, rgb: [127, 209, 138], bar: 1, body: 'player' };
 KIND[K_ENEMY] = { r: 0.35, rgb: [209, 106, 106], bar: 1, body: 'melee' };
 KIND[K_ENEMY_RANGED] = { r: 0.35, rgb: [209, 86, 140], bar: 1, body: 'ranged' };
+KIND[K_BOSS] = { r: 0.50, rgb: [194, 90, 58], bar: 1, body: 'melee' };
 KIND[K_PROP] = { r: 0.30, rgb: [139, 127, 90], body: 'prop' };
 KIND[K_SHOT] = { r: 0.12, rgb: [255, 226, 122], body: 'shot' };
 const KIND_DEF = { r: 0.30, rgb: [139, 147, 161], body: 'unknown' };

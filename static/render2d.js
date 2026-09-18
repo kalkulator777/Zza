@@ -16,7 +16,7 @@
 // Объём подделывается: тень эллипсом под объектом, у стен — вертикальный
 // выступ вверх (рисуется в статическом слое, то есть бесплатно).
 
-import { K_PLAYER, K_ENEMY, K_ENEMY_RANGED, K_PROP, K_SHOT,
+import { K_PLAYER, K_ENEMY, K_ENEMY_RANGED, K_BOSS, K_PROP, K_SHOT,
          F_DEAD, F_OFFLINE,
          F_WINDUP, F_DASH, FX_HIT, FX_DIE, FX_SHOT, FX_BOOM,
          TILE_WALL, TILE_STAIRS, VIS_DARK, VIS_LIT }
@@ -188,6 +188,7 @@ KIND[K_PLAYER] = { r: 0.35, css: '#7fd18a', ring: '#dff3e2', aim: 1, bar: 1 };
 KIND[K_ENEMY] = { r: 0.35, css: '#d16a6a', ring: '#f5cccc', aim: 1, bar: 1 };
 KIND[K_ENEMY_RANGED] = { r: 0.35, css: '#d1568c', ring: '#f6c3d6',
                          arrow: 1, bar: 1 };
+KIND[K_BOSS] = { r: 0.50, css: '#c25a3a', ring: '#f0c0a8', aim: 1, bar: 1 };
 KIND[K_PROP] = { r: 0.30, css: '#8b7f5a', ring: '#cfc49c' };
 KIND[K_SHOT] = { r: 0.12, css: '#ffe27a', ring: '#fff6cf' };
 // Незнакомый kind не имеет права ронять клиент: сервер может начать слать

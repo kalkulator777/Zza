@@ -40,7 +40,8 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from server import ai, boss, combat, gen, items, physics, proto    # noqa: E402
+from server import ai, boss, combat, gen, items, nav, physics, proto  # noqa: E402
+from server import vis as vis_mod                                  # noqa: E402
 from server import world as world_mod                              # noqa: E402
 from server.room import Player, Room, RoomSettings                 # noqa: E402
 
@@ -420,6 +421,52 @@ def t_physics():
              statistics.median(ticks_to) if ticks_to else -1, stuck or "нет"))
 
 
+# --- 4b. чувства босса: те же, что у рядового ------------------------------
+
+def t_senses():
+    print("\n--- 4b. босс видит туманом (4.4) и слышит волной (8.2) ---")
+    # ЗРЕНИЕ: клетка босса освещена -> он поднят, без единого луча
+    g = hall(30, 12)
+    w = make_world(g)
+    p = add_player(w, 4.5, 5.5, hp=10 ** 7)
+    b = boss.make(w, 9.5, 5.5)
+    b.ai_alert = 0
+    # ДВА тика, и это не подгонка: world.step зовёт ai.step ДО движения, а
+    # туман обновляет ПОСЛЕ. На первом тике тумана ещё нет ни у кого.
+    w.step()
+    b.ai_alert = 0
+    w.step()
+    lit = w.fog.state[int(b.y) * g.w + int(b.x)]
+    check(b.ai_alert > w.tick and lit == vis_mod.VIS_LIT,
+          "босс поднят чтением байта тумана, как рядовой (4.4)",
+          "клетка босса %d (VIS_LIT=%d), ai_alert %d при тике %d — луч не "
+          "бросался ни один" % (lit, vis_mod.VIS_LIT, b.ai_alert, w.tick))
+
+    # СЛУХ: за стеной, вне видимости. Выстрел слышно (18), ближний удар нет (6)
+    for loud, name, hear in ((W.NOISE_SHOT, "выстрел", True),
+                             (W.NOISE_MELEE, "ближняя атака", False)):
+        g2 = split_hall(w=26, h=12, wx=13, door_y=1)
+        w2 = make_world(g2)
+        p2 = add_player(w2, 10.5, 5.5, hp=10 ** 7)
+        b2 = boss.make(w2, 16.5, 5.5)
+        # по прямой 6 клеток, по полу — через единственную дверь наверху
+        path = nav.distance_map(g2, [(int(p2.x), int(p2.y))])[
+            int(b2.y) * g2.w + int(b2.x)]
+        b2.ai_alert = 0
+        w2.step()
+        b2.ai_alert = 0                   # если успел увидеть — сбросить
+        w2.make_noise(p2.x, p2.y, loud, p2.team)
+        w2.step()
+        got = b2.ai_alert > w2.tick
+        check(got == hear,
+              "босс %s за стеной %s (громкость %d, по полу %d клеток, "
+              "по прямой %.0f)"
+              % ("слышит" if hear else "НЕ слышит", name, loud, path,
+                 abs(b2.x - p2.x)),
+              "ai_alert %d при тике %d; круг по радиусу услышал бы ОБА"
+              % (b2.ai_alert, w2.tick))
+
+
 # --- 5. босса можно убить -------------------------------------------------
 
 def t_killable():
@@ -670,6 +717,7 @@ def main():
     t_readable()
     t_two_answers()
     t_physics()
+    t_senses()
     t_killable()
     t_stairs_locked()
     t_altars()
