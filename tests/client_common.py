@@ -33,6 +33,18 @@ os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers")
 # получают одинаковое время, и любой замер по времени вырождается.
 BROWSER_ARGS = ["--use-gl=swiftshader", "--disable-gpu-vsync"]
 
+# Скорость бега берётся из контракта (4.2), а не переписывается числом:
+# приёмки клиента считают по ней и пути, и время удержания клавиши, и
+# поднятый темп обязан доехать до них сам.
+sys.path.insert(0, ROOT)
+from server import world as _world                      # noqa: E402
+SPEED_RUN = _world.SPEED_RUN
+
+# Предохранитель на дорогу до разбега: путь по этажу по 8.1 медиана 86
+# клеток, это 11 с на 7.5 кл/с. 40 с — запас вчетверо, и это именно
+# предохранитель, а не порог: walk_to кончает дорогу по ПРОГРЕССУ.
+RUNWAY_BUDGET_S = 40.0
+
 FAILS = []
 
 
@@ -254,13 +266,65 @@ def pick_run(level, x, y, need):
 OPP_KEY = {"KeyW": "KeyS", "KeyS": "KeyW", "KeyA": "KeyD", "KeyD": "KeyA"}
 
 
-def ensure_runway(tab, level, need, speed=5.0):
+def longest_run(level, need, avoid=()):
+    """Самый длинный прямой коридор бега НА ВСЕЙ КАРТЕ, а не из своей точки.
+
+    ЗАЧЕМ ЭТО ЕСТЬ. Разбег искали только из точки спавна, а карта случайная:
+    на одном сиде нужные 11 клеток есть, на другом максимум 7.8 — и приёмка
+    интерполяции краснела на исправном клиенте (замерено, прогон от
+    2025-09-18). С поднятым темпом (4.2: 7.5 кл/с) разбега нужно ещё
+    больше, то есть лотерея стала бы правилом. Ищем по всей карте: ряд
+    (или столбец) открытых клеток длиной L даёт чистый разбег L клеток по
+    его средней линии — тело радиуса 0.35 из своей полосы не выходит.
+
+    Возвращает (название, (dx,dy), клавиши, длина, клетка старта) или None.
+    """
+    w, h, t = level["w"], level["h"], level["tiles"]
+    avoid = set(avoid)
+    best = None                      # (длина, старт, направление)
+
+    def scan(cells, horiz):
+        nonlocal best
+        run = []
+        for c in cells + [None]:
+            if c is not None and t[c[1] * w + c[0]] != TILE_WALL \
+                    and c not in avoid:
+                run.append(c)
+                continue
+            if len(run) >= 2:
+                ln = len(run) - 1.0    # от центра первой до центра последней
+                for start, d in ((run[0], (1, 0) if horiz else (0, 1)),
+                                 (run[-1], (-1, 0) if horiz else (0, -1))):
+                    if best is None or ln > best[0]:
+                        best = (ln, start, d)
+            run = []
+
+    for y in range(h):
+        scan([(x, y) for x in range(w)], True)
+    for x in range(w):
+        scan([(x, y) for y in range(h)], False)
+    if best is None:
+        return None
+    ln, start, d = best
+    title = {(1, 0): "вправо", (-1, 0): "влево",
+             (0, 1): "вниз", (0, -1): "вверх"}[d]
+    keys = {(1, 0): ["KeyD"], (-1, 0): ["KeyA"],
+            (0, 1): ["KeyS"], (0, -1): ["KeyW"]}[d]
+    return title, d, keys, ln, start
+
+
+def ensure_runway(tab, level, need, speed=None, avoid=()):
     """Встать так, чтобы впереди было не меньше need клеток чистого бега.
 
-    На карте из комнат и коридоров (этап 1) разбег может не влезть в
-    комнату целиком, зато влезает, если сначала отойти к дальней стене.
+    Три попытки по возрастанию цены, и дальше следующей не идём:
+      1) разбег прямо из своей точки;
+      2) отойти к дальней стене и померить снова (комната может не влезать
+         целиком, зато влезает от стены);
+      3) дойти до самого длинного прямого коридора карты (longest_run) и
+         встать в его начало.
     Возвращает (название, (dx,dy), клавиши, чистая длина).
     """
+    speed = SPEED_RUN if speed is None else speed
     me = tab.self_pos()
     best = pick_run(level, me["x"], me["y"], need)
     if best[3] >= need:
@@ -271,7 +335,22 @@ def ensure_runway(tab, level, need, speed=5.0):
         tab.hold([OPP_KEY[k] for k in keys], back / speed + 0.25)
         time.sleep(0.25)
     me = tab.self_pos()
-    return pick_run(level, me["x"], me["y"], need)
+    best = pick_run(level, me["x"], me["y"], need)
+    if best[3] >= need:
+        return best
+    far = longest_run(level, need, avoid)
+    if far is None:
+        return best
+    title, d, keys, ln, start = far
+    k = Keys(tab)
+    walk_to(tab, level, start, k, RUNWAY_BUDGET_S, avoid=avoid, near=0.45)
+    k.release()
+    time.sleep(0.2)
+    me = tab.self_pos()
+    got = clear_dist(level, me["x"], me["y"], d[0], d[1], need + 2.0)
+    if got >= need:
+        return title, d, keys, got
+    return max([best, (title, d, keys, got)], key=lambda r: r[3])
 
 
 # --- ходьба по карте (общая для client_fog.py и client_combat.py) ---------

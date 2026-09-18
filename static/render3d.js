@@ -390,7 +390,7 @@ export function createRenderer() {
     name: 'three.js',
     canvas: null, gl: null, renderer: null,
     scene: null, camera: null, hudScene: null, hudCamera: null,
-    w: 0, h: 0, tilePx: 48, quality: 'high',
+    w: 0, h: 0, tilePx: 64, quality: 'high',
 
     // Окно инстансов тайлов — то же понятие, что статический слой 2D (7.2):
     // перестраивается не каждый кадр, а когда камера уехала за край запаса,
@@ -423,7 +423,7 @@ export function createRenderer() {
     init(canvas, opts) {
       opts = opts || {};
       this.canvas = canvas;
-      this.tilePx = opts.tilePx || 48;
+      this.tilePx = opts.tilePx || 64;   // 4.1, тот же масштаб, что у 2D
       this.quality = opts.quality || 'high';
 
       const r = new THREE.WebGLRenderer({

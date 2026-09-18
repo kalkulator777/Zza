@@ -48,6 +48,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from server import ai, combat, gen, items, physics, proto   # noqa: E402
+from server import boss as boss_mod                         # noqa: E402
 from server import world as world_mod                       # noqa: E402
 from server.room import Player, Room, RoomSettings          # noqa: E402
 
@@ -379,6 +380,25 @@ def measure_ricochet(stacks):
     return behind.hp_max - behind.hp, booms
 
 
+def measure_run(stacks, ticks=30):
+    """Скорость бега НА САМОМ ДЕЛЕ: пройденный путь за ticks тиков мира.
+
+    Мерка прямая и через настоящий тик (world.step), а не через вызов
+    items.run_speed: «апгрейд не применился» — это как раз тот случай, когда
+    функция считает верно, а мир её не спрашивает. Комната длинная, стен на
+    пути нет, поэтому путь равен скорости, умноженной на время.
+    """
+    w = make_world(open_room(60, 8))
+    e = add_player(w, 3.5, 4.5,
+                   ups=[(items.U_HASTE, stacks)] if stacks else [])
+    x0 = e.x
+    e.mv = (1.0, 0.0)
+    for _ in range(ticks):
+        w.step()
+    e.mv = (0.0, 0.0)
+    return (e.x - x0) / (ticks * DT)
+
+
 def test_each_upgrade():
     print("\n--- 3. каждый апгрейд: что было, что стало, во сколько раз ---")
 
@@ -467,6 +487,52 @@ def test_each_upgrade():
           "Рикошет СКЛАДЫВАЕТСЯ: отскоков у снаряда %d -> %d"
           % (items.RICO_BOUNCES, shot[0].bounce if shot else -1),
           "%s" % ratio(items.RICO_BOUNCES, shot[0].bounce if shot else 0))
+
+    # --- Скороход (пятый апгрейд, 8.4)
+    #
+    # МЕРКА ПРЯМАЯ — ПУТЬ ЗА ТИКИ, а не возврат items.run_speed: 8.4 требует
+    # проверять складывание по самой величине, и ровно эта мерка краснеет
+    # на обеих подсадках, которыми проверка проверялась (см. отчёт):
+    # «апгрейд не применяется» (world.step берёт e.speed напрямую) и
+    # «не складывается» (второй стак не удваивает прибавку).
+    v0 = measure_run(0)
+    v1 = measure_run(1)
+    v2 = measure_run(2)
+    note("Скороход: +%.1f кл/с к бегу за стак (треть базовых %.1f)"
+         % (items.HASTE_ADD, W.SPEED_RUN),
+         "для сравнения бестиарий 4.2: рубака %.1f, стрелок %.1f, босс %.1f"
+         % (ai.MELEE_SPEED, ai.RANGED_SPEED, boss_mod.BOSS_SPEED))
+    check(abs(v0 - W.SPEED_RUN) < 0.05,
+          "без Скорохода бег ровно базовый: %.2f кл/с" % v0)
+    check(abs(v1 - (W.SPEED_RUN + items.HASTE_ADD)) < 0.05,
+          "Скороход: скорость бега  %.2f -> %.2f кл/с  (%s)"
+          % (v0, v1, ratio(v0, v1)),
+          "мерено путём за %d тиков настоящего мира, а не возвратом функции"
+          % 30)
+    check(abs((v2 - v1) - (v1 - v0)) < 0.05 and v2 > v1,
+          "Скороход СКЛАДЫВАЕТСЯ: два стака  %.2f -> %.2f кл/с (прибавка "
+          "+%.2f и +%.2f — ровно вдвое к базе)"
+          % (v1, v2, v1 - v0, v2 - v1),
+          "%s к голому" % ratio(v0, v2))
+    check(v1 / boss_mod.BOSS_SPEED >= W.SPEED_RUN / ai.MELEE_SPEED,
+          "один стак поднимает игрока над САМЫМ быстрым телом бестиария так "
+          "же, как база поднимает его над рубакой",
+          "с боссом %.2f (%.1f против %.1f), база с рубакой %.2f"
+          % (v1 / boss_mod.BOSS_SPEED, v1, boss_mod.BOSS_SPEED,
+             W.SPEED_RUN / ai.MELEE_SPEED))
+    v_cap = measure_run(10)
+    check(abs(v_cap - W.SPEED_RUN * items.HASTE_CAP_K) < 0.05,
+          "у Скорохода есть потолок, и он достижим: десять стаков дают "
+          "%.1f кл/с, а не %.1f" % (v_cap, W.SPEED_RUN + 10 * items.HASTE_ADD),
+          "потолок %.1f базы = %.1f кл/с; выше бег отменял бы рывок "
+          "(%.1f кл/с) и обгонял бы обзор 10 клеток быстрее замаха врага"
+          % (items.HASTE_CAP_K, W.SPEED_RUN * items.HASTE_CAP_K,
+             combat.DASH_SPEED))
+    check(v_cap < combat.DASH_SPEED,
+          "бег даже на потолке остаётся медленнее рывка (иначе рывок — это "
+          "только неуязвимость)",
+          "потолок бега %.1f против рывка %.1f кл/с (%.0f%%)"
+          % (v_cap, combat.DASH_SPEED, 100.0 * v_cap / combat.DASH_SPEED))
     return True
 
 
@@ -596,7 +662,7 @@ def crowd_fight(ups, n_enemies, max_ticks=3600, dash=True):
 
     ВРАГИ НЕ ОТСТАЮТ: каждый тик они переставляются на кольцо радиуса
     MELEE_STOP вокруг игрока. Это НАРОЧНО худший случай, а не модель ИИ:
-    настоящий рубака (3.2 кл/с) медленнее игрока (5.0) и в реальном бою
+    настоящий рубака (4.8 кл/с) медленнее игрока (7.5) и в реальном бою
     отстаёт, а рывок от него и вовсе уносит. Если бы враги стояли на месте,
     игрок с Тараном просто улетал бы из кольца и добивал их поодиночке —
     проверка «не становится ли он неуязвимым» мерила бы кайтинг, а не

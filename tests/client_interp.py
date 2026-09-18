@@ -60,14 +60,19 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client_common import (BROWSER_ARGS, CHROMIUM, OPP_KEY, Server, Tab,   # noqa: E402
-                           check, ensure_runway, note, summary, uptime)
+from client_common import (BROWSER_ARGS, CHROMIUM, OPP_KEY, SPEED_RUN,  # noqa: E402
+                           Server, Tab, TILE_STAIRS, check, ensure_runway,
+                           note, summary, uptime)
 
 FRAMES = 100          # столько кадров записывает приёмка
 SETTLE_S = 0.4        # разгон до равномерной скорости перед записью
 RATIO_MAX = 2.0       # см. вывод в шапке
 ZERO_MAX = 0.05
-NEED_CELLS = 11.0     # 0.4 c разгона + 100 кадров при 60 fps = 10.3 клетки + запас
+# Сколько клеток чистого бега нужно записи. Считается ОТ СКОРОСТИ, а не
+# стоит числом: при 7.5 кл/с (4.2) 0.4 с разгона плюс 100 кадров при 60 fps
+# — это (0.4 + 1.67) * 7.5 = 15.5 клетки, при прежних 5.0 было 10.3.
+# Запас 1.1 — на то, что кадры могут идти реже 60 в секунду.
+NEED_CELLS = round((SETTLE_S + FRAMES / 60.0) * SPEED_RUN * 1.1, 1)
 
 
 def measure(samples):
@@ -139,7 +144,11 @@ def main():
     print("=== этап 0c, пункты 2 и 3: интерполяция (DESIGN.md 6.1) ===")
     uptime()
 
-    with Server() as srv, sync_playwright() as pw:
+    # Враги выключены осознанно (раздел 10: стенд обязан уметь выключать то,
+    # чего он не меряет). Здесь меряется плавность интерполяции, а разбег
+    # теперь ищется по всей карте — одинокий ходок под обстрелом до него
+    # просто не дойдёт, и красной станет исправная интерполяция.
+    with Server(env={"ZZA_ENEMIES": "0"}) as srv, sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=CHROMIUM, headless=True,
                                      args=BROWSER_ARGS)
         t = Tab(browser, "A").open(srv.url)
@@ -171,7 +180,12 @@ def main():
         # есть столбы, и упереться в столб посреди замера — это испортить
         # замер, а не поймать баг.
         level = t.js("window.__zza.level()")
-        title, (dx, dy), keys, dist = ensure_runway(t, level, NEED_CELLS)
+        # Лестница обходится стороной: встать на неё — сменить этаж, то есть
+        # мерить уже не то, что начинали (та же причина, что в client_fog).
+        stairs = [(i % level["w"], i // level["w"])
+                  for i, v in enumerate(level["tiles"]) if v == TILE_STAIRS]
+        title, (dx, dy), keys, dist = ensure_runway(t, level, NEED_CELLS,
+                                                    avoid=stairs)
         me = t.self_pos()
         note("разбег", "%s от (%.2f, %.2f): чисто %.1f клетки (нужно %.1f)"
              % (title, me["x"], me["y"], dist, NEED_CELLS))
@@ -202,7 +216,8 @@ def main():
         t.js("window.__zza.setInterp(false)")
         t.hold([OPP_KEY[k] for k in keys], SETTLE_S + on["dur"] + 0.2)
         time.sleep(0.3)
-        title2, _, keys2, dist2 = ensure_runway(t, level, NEED_CELLS)
+        title2, _, keys2, dist2 = ensure_runway(t, level, NEED_CELLS,
+                                                avoid=stairs)
         me2 = t.self_pos()
         note("разбег для красного прогона", "%s от (%.2f, %.2f): чисто %.1f клетки"
              % (title2, me2["x"], me2["y"], dist2))

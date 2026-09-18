@@ -253,7 +253,7 @@ export function createRenderer() {
   return {
     name: 'Canvas2D',
     canvas: null, ctx: null,
-    w: 0, h: 0, tilePx: 48, quality: 'high',
+    w: 0, h: 0, tilePx: 64, quality: 'high',
 
     // статический слой карты
     st: null, stCtx: null,
@@ -291,7 +291,17 @@ export function createRenderer() {
       opts = opts || {};
       this.canvas = canvas;
       this.ctx = canvas.getContext('2d', { alpha: false });
-      this.tilePx = opts.tilePx || 48;       // 4.1: базовый масштаб
+      this.tilePx = opts.tilePx || 64;
+    // 4.1: базовый масштаб 64 px/клетку (было 48).
+      // ЗАЧЕМ: тело игрока 0.35 клетки — это 34 px при 48 и 45 px при 64.
+      // На экране 1920 первое читается как точка, и движение точки глаз
+      // меряет В ДОЛЯХ ЭКРАНА: кадр при 48 — 40x22.5 клетки, при 64 —
+      // 30x16.9. Тот же самый бег пересекает кадр на треть быстрее, и
+      // стоит это ноль: зум — ручка клиента, на симуляцию он не влияет
+      // (4.1 прямо называет его ручкой «если нужно больше поля» вместо
+      // радиуса обзора, который на сервере стоит r^2).
+      // Побочно чинится и тёмная рамка: диск обзора 10 клеток (20 в
+      // поперечнике) занимал половину ширины кадра, теперь две трети.
       this.quality = opts.quality || 'high';
       this.resize(canvas.width || 960, canvas.height || 540);
     },

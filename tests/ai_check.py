@@ -48,10 +48,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from server import ai, combat, gen, nav, physics, proto            # noqa: E402
+from server import boss as boss_mod                               # noqa: E402
 from server import vis as vis_mod                                 # noqa: E402
 from server import world as world_mod                             # noqa: E402
 
 W = world_mod
+# Базовый масштаб рендера (4.1): нужен только чтобы напечатать «экран
+# пересекается за столько-то секунд». На симуляцию он не влияет.
+TILE_PX = 64
 FAILS = []
 CLOCK = time.perf_counter
 
@@ -117,6 +121,49 @@ def add_player(w, x, y, hp=100):
 def wake(e, w, ticks=10 ** 6):
     e.ai_alert = w.tick + ticks
     return e
+
+
+# --- 0. темп: враги медленнее игрока ---------------------------------------
+
+def t_tempo():
+    """Главное обещание бестиария 4.2: «убежать можно всегда, опасна толпа».
+
+    Проверяется не словами, а порядком чисел, и проверяется ПО МИРУ, а не по
+    константам модуля: скорость берётся у настоящей заведённой сущности
+    (ai.make_enemy, boss.make, world.spawn_player), потому что «в таблице
+    4.8, а в мир уходит 8.0» — это ровно та поломка, которую здесь и ждут.
+
+    Красное здесь означает, что игру нельзя пройти бегством ни при каких
+    руках: догоняющий враг отменяет весь бестиарий, а не балансирует его.
+    """
+    print("\n--- 0. темп: враги медленнее игрока (4.2) ---")
+    w = make_world(hall(20, 12))
+    p = add_player(w, 4.5, 6.5)
+    rows = [("игрок", p.speed, 1.0)]
+    for title, e in (("рубака", ai.make_enemy(w, 8.5, 6.5, ai.AI_MELEE)),
+                     ("стрелок", ai.make_enemy(w, 9.5, 6.5, ai.AI_RANGED)),
+                     ("босс", boss_mod.make(w, 12.5, 6.5))):
+        rows.append((title, e.speed, e.speed / p.speed))
+    frame = 1920.0 / TILE_PX
+    print("    %-9s %8s %10s %14s" % ("кто", "кл/с", "к игроку", "экран, с"))
+    for title, sp, k in rows:
+        print("    %-9s %8.1f %9.2f %13.1f" % (title, sp, k, frame / sp))
+    note("экран", "%.0f px / %d px на клетку = %.0f клеток в кадре (4.1)"
+         % (1920.0, TILE_PX, frame))
+    fastest = max(rows[1:], key=lambda r: r[1])
+    check(all(sp < p.speed for _t, sp, _k in rows[1:]),
+          "каждый враг бестиария медленнее игрока: убежать можно всегда",
+          "самый быстрый — %s, %.1f против %.1f кл/с (%.0f%% скорости игрока)"
+          % (fastest[0], fastest[1], p.speed, 100.0 * fastest[2]))
+    check(p.speed - fastest[1] >= 1.0,
+          "запас скорости над самым быстрым врагом не меньше 1 кл/с",
+          "%.1f кл/с: за замах врага (%d тиков) игрок отыгрывает %.2f клетки"
+          % (p.speed - fastest[1], ai.MELEE_WIND,
+             (p.speed - fastest[1]) * ai.MELEE_WIND / 30.0))
+    # Порог 1.0 кл/с выведен из дальности удара: удар достаёт на 1.55 (4.2),
+    # и за 12 тиков замаха отрыв обязан набежать хотя бы на треть этого
+    # расстояния, иначе «убежал» превращается в «оторвался на полшага».
+    # 1.0 кл/с даёт 0.40 клетки за замах — 26% дальности удара.
 
 
 # --- 1. градиент ----------------------------------------------------------
@@ -517,21 +564,30 @@ def t_windup():
         saw = 0
         pressed = 0
         hit_at = 0
+        # Дистанция снимается В ТОТ ТИК, КОГДА УДАР РАЗРЕШАЕТСЯ (бит WINDUP
+        # погас), а не в конце прогона. Раньше печаталось последнее
+        # состояние на 60-м тике, а к этому времени убежавший игрок уже
+        # упёрся в стену зала и его догоняет враг — число получалось про
+        # длину зала, а не про уход из-под замаха.
+        at_swing = None
         for t in range(60):
             if saw and dodge and not pressed:
                 p.btn = 2                      # BTN_DASH
                 p.mv = (1.0, 0.0)              # прочь от врага
                 pressed = w.tick + 1
+            was_wind = bool(e.flags & W.F_WINDUP)
             w.step()
             p.btn = 0
             if not saw and (e.flags & W.F_WINDUP):
                 saw = w.tick
+            if was_wind and not (e.flags & W.F_WINDUP) and at_swing is None:
+                at_swing = math.hypot(p.x - e.x, p.y - e.y)
             if p.hp < 100:
                 hit_at = w.tick
                 break
-        return saw, pressed, hit_at, p, e
+        return saw, pressed, hit_at, p, e, at_swing
 
-    saw, _, hit_at, p, e = duel(False)
+    saw, _, hit_at, p, e, _sw = duel(False)
     check(saw > 0 and hit_at > 0, "неподвижный игрок удар получает",
           "бит WINDUP с тика %d, урон на тике %d — это %d тиков форы"
           % (saw, hit_at, hit_at - saw))
@@ -540,10 +596,11 @@ def t_windup():
           "фактически %d (замах %d, минус тик на появление бита)"
           % (hit_at - saw, ai.MELEE_WIND))
 
-    saw2, pressed2, hit2, p2, e2 = duel(True)
-    dist = math.hypot(p2.x - e2.x, p2.y - e2.y)
+    saw2, pressed2, hit2, p2, e2, dist_sw = duel(True)
+    dist = dist_sw if dist_sw is not None else math.hypot(p2.x - e2.x,
+                                                          p2.y - e2.y)
     check(hit2 == 0, "игрок, нажавший рывок по биту WINDUP, удар не получает",
-          "нажал на тике %d (бит с %d), к удару отъехал на %.2f клетки при "
+          "нажал на тике %d (бит с %d), НА ТИКЕ УДАРА был в %.2f клетки при "
           "дальности удара %.2f" % (pressed2, saw2, dist,
                                     combat.MELEE_REACH + W.R_PLAYER))
     note("запас на реакцию",
@@ -677,6 +734,7 @@ def main():
     print("=" * 70)
     print("Приёмка врагов: 8.3 путь, 8.2 шум, 4.4 зрение, 4.2 замах.")
     print("=" * 70)
+    t_tempo()
     t_gradient()
     t_reach(n_floors)
     t_wave_cost()

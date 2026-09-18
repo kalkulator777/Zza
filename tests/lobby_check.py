@@ -523,7 +523,13 @@ async def section_build(port, rooms):
     items.grant(ent, items.U_RAM, 1)
     items.grant(ent, items.U_WIND, 2)
     await a.wait(lambda: ups()[items.U_WIND] == 2)
-    check(ups() == [0, 2, 0, 2],
+    # Ожидаемое собирается ИЗ items.N_UP, а не пишется списком: апгрейдов
+    # стало пять (8.4, «Скороход»), и список-константа краснел бы на каждом
+    # новом апгрейде, ничего при этом не охраняя.
+    want = [0] * items.N_UP
+    want[items.U_RAM] = 2
+    want[items.U_WIND] = 2
+    check(ups() == want,
           "набор СКЛАДЫВАЕТСЯ и приходит целиком, а не приращением",
           "ups=%s" % (a.builds.get(ent_id),))
 
@@ -540,7 +546,7 @@ async def section_build(port, rooms):
 
     # 5.2 запрещает держать состояние на событиях — здесь это видно числом:
     # события pick за весь опыт не было НИ ОДНОГО, а набор у клиента верный.
-    check(ups() == [0, 2, 0, 2],
+    check(ups() == want,
           "набор верен, хотя события pick не приходило ни разу",
           "ups=%s, сообщений build всего %d"
           % (a.builds.get(ent_id), a.build_msgs))

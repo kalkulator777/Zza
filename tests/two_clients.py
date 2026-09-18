@@ -278,7 +278,8 @@ async def scenario_together(a, b):
           (b0[0], b0[1], b_in_b[0], b_in_b[1], db))
     print("    A глазами B: (%.3f, %.3f), путь %.3f клетки" % (a_in_b[0], a_in_b[1], da_moved))
     print("    B глазами A: (%.3f, %.3f), путь %.3f клетки" % (b_in_a[0], b_in_a[1], db_moved))
-    print("    ожидание пути при 5.0 кл/с за %d тиков: %.3f клетки" % (t1 - t0, expect))
+    print("    ожидание пути при %.1f кл/с за %d тиков: %.3f клетки"
+          % (SPEED, t1 - t0, expect))
 
     check(da_moved > 1.0, "B видит движение A", "прошёл %.3f клетки" % da_moved)
     check(db_moved > 1.0, "A видит движение B", "прошёл %.3f клетки" % db_moved)
@@ -286,7 +287,7 @@ async def scenario_together(a, b):
           "оба зеркала совпадают по координатам",
           "расхождение %.4f и %.4f" % (math.dist(a_in_a, a_in_b), math.dist(b_in_b, b_in_a)))
     check(abs(da_moved - expect) < 0.5 and abs(db_moved - expect) < 0.5,
-          "путь совпадает со скоростью 4.2 (5.0 кл/с)",
+          "путь совпадает со скоростью 4.2 (%.1f кл/с)" % SPEED,
           "A %.3f, B %.3f, ждали %.3f" % (da_moved, db_moved, expect))
 
 

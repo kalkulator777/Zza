@@ -480,7 +480,7 @@ async function setBackend(name) {
       make = createRenderer;
     }
     const opts = { quality: app.render.quality || 'high',
-                   tilePx: app.render.tilePx || 48 };
+                   tilePx: app.render.tilePx || 64 };
     const oldCanvas = app.canvas;
     const canvas = name === '3d' ? $('c3') : $('c');
 
@@ -521,10 +521,10 @@ export function boot() {
   // трогает: без параметров всё ровно как было — 2D и quality 'high'.
   //   ?backend=3d   поднять трёхмерный сразу
   //   ?q=low        минимальные настройки (сглаживание выключено)
-  //   ?tile=64      другой масштаб (4.1: зум — ручка клиента)
+  //   ?tile=48      другой масштаб (4.1: зум — ручка клиента)
   const qs = new URLSearchParams(location.search);
   const quality = qs.get('q') === 'low' ? 'low' : 'high';
-  const tilePx = Math.max(8, Math.min(192, parseInt(qs.get('tile'), 10) || 48));
+  const tilePx = Math.max(8, Math.min(192, parseInt(qs.get('tile'), 10) || 64));
   app.render = createRenderer();
   const canvas = $('c');
   app.canvas = canvas;

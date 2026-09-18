@@ -40,17 +40,23 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from server import combat                     # noqa: E402
 from server import physics                    # noqa: E402
+from server import world as world_mod         # noqa: E402
 
 TICK_HZ = 30                 # 4.1
 DT = 1.0 / TICK_HZ
-SPEED = 5.0                  # 4.2, бег игрока
+# Скорости берутся ИЗ КОНТРАКТНЫХ КОНСТАНТ, а не переписываются сюда
+# числом: это проверка физики на тех скоростях, на которых игра идёт, и
+# поднятый темп обязан её ломать, если он что-то сломал.
+SPEED = world_mod.SPEED_RUN          # 4.2, бег игрока: 7.5 кл/с
+DASH = combat.DASH_SPEED             # 4.2, рывок: 21 кл/с
 R = 0.35                     # 4.1/4.3, радиус тела игрока
 BUDGET_S = 5.0               # потолок на одну попытку
 STEPS = int(BUDGET_S * TICK_HZ)
 
 # Промахи поперёк: вся клетка проёма, от края до края, шагом 0.05.
-# 0.05 клетки = 2.4 пикселя при 48 px/клетка (4.1) — мельче, чем видно
+# 0.05 клетки = 3.2 пикселя при 64 px/клетка (4.1) — мельче, чем видно
 # глазом, и в 3.3 раза мельче старой полосы прохода 0.30.
 OFFSETS = [round(0.025 + 0.05 * i, 3) for i in range(20)]
 
@@ -139,13 +145,14 @@ def crossed(d, x, y):
     return y < WALL_AT
 
 
-def run(grid, d, across, steps=STEPS):
+def run(grid, d, across, steps=STEPS, speed=None):
     """Одна зажатая клавиша. Возвращает (прошёл, секунды, x, y)."""
+    speed = SPEED if speed is None else speed
     dx, dy = d
     x, y = start_point(d, across)
     if physics.circle_hits(grid, x, y, R):
         return None, 0.0, x, y          # старт в стене — попытка не считается
-    vx, vy = dx * SPEED, dy * SPEED
+    vx, vy = dx * speed, dy * speed
     for i in range(steps):
         x, y, hit = physics.move_circle(grid, x, y, vx * DT, vy * DT, R)
         # ровно то, что делает world.step: упор в стену гасит ось
@@ -154,13 +161,13 @@ def run(grid, d, across, steps=STEPS):
         if hit & 2:
             vy = 0.0
         # клавиша зажата — ввод восстанавливает скорость на следующем тике
-        vx, vy = dx * SPEED, dy * SPEED
+        vx, vy = dx * speed, dy * speed
         if crossed(d, x, y):
             return True, (i + 1) * DT, x, y
     return False, steps * DT, x, y
 
 
-def sweep(grid, offsets=OFFSETS, steps=STEPS):
+def sweep(grid, offsets=OFFSETS, steps=STEPS, speed=None):
     """Все четыре стороны подхода на всех промахах. (ок, всего, времена)."""
     ok = 0
     total = 0
@@ -170,7 +177,7 @@ def sweep(grid, offsets=OFFSETS, steps=STEPS):
         vertical_wall = bool(d[0])
         for off in offsets:
             g = grid(vertical_wall)
-            res, secs, x, y = run(g, d, off, steps)
+            res, secs, x, y = run(g, d, off, steps, speed)
             if res is None:
                 continue
             total += 1
@@ -189,6 +196,9 @@ def main():
           % (1.0 - 2 * R))
     print("  попыток на сторону %d, потолок попытки %.0f с (%d тиков)"
           % (len(OFFSETS), BUDGET_S, STEPS))
+    print("  скорости: бег %.1f кл/с (%.3f клетки за тик), рывок %.1f "
+          "(%.3f за тик при радиусе %.2f)"
+          % (SPEED, SPEED * DT, DASH, DASH * DT, R))
 
     # --- 1. проём проходится ---------------------------------------------
     ok, total, times, worst = sweep(lambda v: make_map(gap=True, vertical=v))
@@ -205,6 +215,35 @@ def main():
     ok2, total2, _t, _ = sweep(lambda v: make_map(gap=False, vertical=v))
     check(ok2 == 0, "глухая стена не пропускает за %.0f с" % BUDGET_S,
           "прошло %d из %d попыток" % (ok2, total2))
+
+    # --- 2б. и сквозь стену НА СКОРОСТИ РЫВКА тоже не пролезает ----------
+    # Шаг за тик на рывке — 21/30 = 0.70 клетки, ВДВОЕ больше радиуса тела.
+    ok2d, total2d, _t, _ = sweep(lambda v: make_map(gap=False, vertical=v),
+                                 speed=DASH)
+    check(ok2d == 0,
+          "глухая стена не пропускает и на скорости рывка (%.0f кл/с)" % DASH,
+          "прошло %d из %d попыток; шаг за тик %.2f клетки при радиусе %.2f"
+          % (ok2d, total2d, DASH * DT, R))
+
+    # --- 2в. ЗАПАС ПО СКОРОСТИ: тут и работает нарезка на подшаги ---------
+    # ЧЕСТНО ПРО ПУНКТ 2б: на 21 кл/с стену держит не нарезка, а геометрия.
+    # Полоса, в которой круг «видит» стену толщиной в клетку, равна
+    # 1 + 2R = 1.70 клетки, и перепрыгнуть её шагом 0.70 нельзя никак —
+    # выключи нарезку, и 2б всё равно останется зелёным (проверено).
+    # Нарезка становится единственной защитой выше 1.5 клетки за тик:
+    # ЗАМЕРЕНО на этой же карте — без нарезки 45 кл/с уже пролетает сквозь
+    # стену за 4 тика, 30 кл/с ещё нет. Поэтому проверка гоняет стену на
+    # СКОРОСТИ ВТРОЕ ВЫШЕ РЫВКА: это и есть запас на будущие правки темпа и
+    # апгрейдов, и ровно здесь подсадка steps = 1 даёт красное.
+    fast = DASH * 3.0
+    ok2f, total2f, _t, _ = sweep(lambda v: make_map(gap=False, vertical=v),
+                                 speed=fast)
+    check(ok2f == 0,
+          "глухая стена не пропускает и втрое быстрее рывка (%.0f кл/с) — "
+          "здесь стену держит нарезка шага на подшаги" % fast,
+          "прошло %d из %d попыток; шаг за тик %.2f клетки, полоса «видно "
+          "стену» 1 + 2R = %.2f, то есть без нарезки тело перескочило бы её"
+          % (ok2f, total2f, fast * DT, 1.0 + 2 * R))
 
     # --- 3. углы не срезаются --------------------------------------------
     ok3, total3, _t, _ = sweep(lambda v: make_map(pinch=True, vertical=v))

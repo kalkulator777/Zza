@@ -44,16 +44,19 @@ SEED = 4242
 DIFF_EASY = 0            # «Прогулка» — room.DIFF_HP[0]
 HP_EASY = 140            # room.DIFF_HP[0]; расходятся — красное, и правильно
 
-# Предметы на алтаре: kind 6..9 (items.K_ITEM_BASE .. K_ITEM_LAST, 4.3).
-ITEM_KIND_LO, ITEM_KIND_HI = 6, 9
+# Предметы на алтаре: список kind берётся У СЕРВЕРА (items.ITEM_KINDS, 4.3),
+# а не переписывается диапазоном. Диапазон 6..9 был верен ровно до пятого
+# апгрейда: его kind — 11 (десятка занята боссом), и «предметы — это 6..9»
+# молча перестало бы находить треть алтаря.
+from server import items as items_mod                                # noqa: E402
+ITEM_KINDS = set(items_mod.ITEM_KINDS)
 
 WALK_BUDGET = 90.0       # ПРЕДОХРАНИТЕЛЬ, не порог: дорога кончается по
                          # приходу или по отсутствию прогресса (10).
 
 
 def find_items(tab):
-    return [e for e in tab.others()
-            if ITEM_KIND_LO <= e["kind"] <= ITEM_KIND_HI]
+    return [e for e in tab.others() if e["kind"] in ITEM_KINDS]
 
 
 def stairs_cells(level):
@@ -209,7 +212,7 @@ def main():
 
         # --- [6] HUD набора при ПОТЕРЯННОМ событии pick (11.7) -------------
         print("\n[6] HUD набора: событие pick потеряно, набор всё равно верен")
-        check(a.js("window.__zza.myBuild()").count(0) == 4,
+        check(a.js("window.__zza.myBuild()").count(0) == items_mod.N_UP,
               "в начале забега набор пуст, и клиент это знает из build",
               "ups=%s" % a.js("window.__zza.myBuild()"))
 
