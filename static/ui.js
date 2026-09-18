@@ -337,10 +337,22 @@ async function setBackend(name) {
 
 export function boot() {
   app.world = new WorldState();
+  // ЗАЧЕМ ЗДЕСЬ АДРЕСНАЯ СТРОКА. Планок частоты кадров в 2.1 две — q=low
+  // (>=100 fps) и q=high (>=60), — и меряются они на ЦЕЛЕВОЙ машине, куда
+  // ни playwright, ни стендов не завезти. Без этих трёх строк владелец
+  // может запустить только q=high и только двумерный бэкенд, то есть
+  // половину того, что 2.1 требует замерить. Значений по умолчанию это не
+  // трогает: без параметров всё ровно как было — 2D и quality 'high'.
+  //   ?backend=3d   поднять трёхмерный сразу
+  //   ?q=low        минимальные настройки (сглаживание выключено)
+  //   ?tile=64      другой масштаб (4.1: зум — ручка клиента)
+  const qs = new URLSearchParams(location.search);
+  const quality = qs.get('q') === 'low' ? 'low' : 'high';
+  const tilePx = Math.max(8, Math.min(192, parseInt(qs.get('tile'), 10) || 48));
   app.render = createRenderer();
   const canvas = $('c');
   app.canvas = canvas;
-  app.render.init(canvas, { quality: 'high', tilePx: 48 });
+  app.render.init(canvas, { quality: quality, tilePx: tilePx });
   app.input = new Input(canvas, (sx, sy) => app.render.screenToWorld(sx, sy)).attach();
   app.net = new Net(makeHandlers());
 
@@ -363,6 +375,7 @@ export function boot() {
   window.addEventListener('resize', resize);
   resize();
   show('menu');
+  if (qs.get('backend') === '3d') setBackend('3d');
   setStatus('подключаемся…');
   app.net.connect();
   requestAnimationFrame(frame);

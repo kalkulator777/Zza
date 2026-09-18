@@ -63,14 +63,15 @@ TILE_WALL, TILE_FLOOR, TILE_STAIRS = 0, 1, 2
 
 # --- ПОРОГ ПАДЕНИЯ ЧЕРНОТЫ: ВЫВОД -----------------------------------------
 #
-# Камера трёхмерного бэкенда ортографическая под углом 52°, поэтому клетка
-# на экране занимает 48 x 48*sin(52°) = 48 x 37.8 = 1814 пикселей, то есть
-# 1814/(1920*1080) = 0.0875 п.п. кадра. Порог падения 5 п.п. — это 57
-# клеток; проверка не уходит с маршрута, пока в кадре исходной точки не
-# откроется ENOUGH_NEW клеток, и запас тут полуторный (не тройной, как в
-# 2D: там часть новых клеток гасила виньетка, а здесь виньетки нет вовсе).
+# Камера трёхмерного бэкенда ортографическая под углом 57°, поэтому клетка
+# на экране занимает 48 x 48*sin(57°) = 48 x 40.3 = 1932 пикселя, то есть
+# 1932/(1920*1080) = 0.093 п.п. кадра. Порог падения 5 п.п. — это 54
+# клетки; проверка не уходит с маршрута, пока в кадре исходной точки не
+# откроется ENOUGH_NEW клеток, то есть запас 8.4/5.0 = 1.68 (не тройной,
+# как в 2D: там часть новых клеток гасила виньетка, а здесь её нет вовсе).
 DROP_MIN = 0.05
 ENOUGH_NEW = 90
+CELL_PP = 0.093                # процентных пункта кадра на одну клетку
 
 # 7.3 называет 40 целью для ЛЮБОГО числа сущностей.
 DRAW_CALLS_MAX = 40
@@ -303,18 +304,39 @@ def main():
         def enough():
             return state["n"] >= ENOUGH_NEW
 
-        # Цель — самая дальняя клетка в 18 шагах, лестницу обходим: наступить
-        # на неё значит сменить этаж посреди замера (туман обнулится, карта
+        # Цели — всё дальше и дальше от дома, лестницу обходим: наступить на
+        # неё значит сменить этаж посреди замера (туман обнулится, карта
         # станет другой, кадр исходной точки исчезнет вместе с этажом).
+        #
+        # ЦЕЛЕЙ НЕСКОЛЬКО, И ЭТО ЛЕЧЕНИЕ МИГАНИЯ, А НЕ ЗАПАС ПО ВРЕМЕНИ.
+        # Одна цель в 18 шагах иногда открывает меньше ENOUGH_NEW клеток
+        # В КАДРЕ ИСХОДНОЙ ТОЧКИ — не потому что туман сломан, а потому что
+        # коридор увёл ходока за край этого кадра (поймано прогоном: 136
+        # клеток на одной карте и меньше 90 на другой). Условие выхода —
+        # ПРОГРЕСС (открылось достаточно), а перебор целей конечен.
         dist = bfs_dist(level, home, stairs)
-        far = max(dist.items(), key=lambda kv: min(kv[1], 18))
-        target = far[0]
-        ok_out, d_out, s_out, _n = walk_to(t, level, target, keys, WALK_BUDGET,
-                                           probe=probe, enough=enough,
-                                           avoid=stairs)
-        probe()
-        note("разведка", "ушли к (%d,%d), %.1f с, открылось в кадре %d клеток"
-             % (target[0], target[1], s_out, state["n"]))
+        by_d = sorted(dist.items(), key=lambda kv: kv[1])
+        targets = []
+        for want in (16, 26, 38, 55):
+            cand = [c for c, d in by_d if d >= want]
+            if cand and cand[0] not in targets:
+                targets.append(cand[0])
+        if not targets:
+            targets = [by_d[-1][0]]
+        s_out = 0.0
+        target = targets[0]
+        for target in targets:
+            ok_out, d_out, dt, _n = walk_to(t, level, target, keys, WALK_BUDGET,
+                                            probe=probe, enough=enough,
+                                            avoid=stairs)
+            s_out += dt
+            probe()
+            if enough():
+                break
+        note("разведка", "ушли к (%d,%d), %.1f с, целей пройдено до %d, "
+             "открылось в кадре %d клеток"
+             % (target[0], target[1], s_out, targets.index(target) + 1,
+                state["n"]))
         ok_back, d_back, s_back, _n2 = walk_to(t, level, home, keys,
                                                WALK_BUDGET, avoid=stairs)
         keys.release()
@@ -326,8 +348,9 @@ def main():
         check(state["n"] >= ENOUGH_NEW,
               "разведано достаточно клеток В КАДРЕ исходной точки",
               "открылось %d при нужных %d (порог падения выведен из этого "
-              "числа: %d клеток * 0.0875 п.п. = %.1f п.п.)"
-              % (state["n"], ENOUGH_NEW, ENOUGH_NEW, ENOUGH_NEW * 0.0875))
+              "числа: %d клеток * %.3f п.п. = %.1f п.п. при пороге %.1f)"
+              % (state["n"], ENOUGH_NEW, ENOUGH_NEW, CELL_PP,
+                 ENOUGH_NEW * CELL_PP, 100.0 * DROP_MIN))
         check(drop >= DROP_MIN,
               "доля чёрных пикселей упала после разведки",
               "%.1f%% -> %.1f%%, падение %.1f п.п. при пороге %.1f"
@@ -352,7 +375,21 @@ def main():
             elif v == VIS_SEEN:
                 seen_b.append(b)
             else:
-                dark_b.append(b)
+                # НЕРАЗВЕДАННУЮ КЛЕТКУ БЕРЁМ ТОЛЬКО ТОГДА, КОГДА ПЕРЕД НЕЙ
+                # (со стороны камеры, то есть на +y) ТОЖЕ ТЕМНОТА. Причина
+                # не в тумане, а в том, что высота в 3D настоящая: стена
+                # ростом WALL_H поднимается на экране на 48*1.25*cos(57°) =
+                # 34 px, то есть 0.84 ряда, и честно закрывает собой часть
+                # клетки ЗА собой. Если эта клетка неразведана, её пиксели
+                # занимает не «свет из темноты», а бок стоящей перед ней
+                # стены — той самой, которую группа уже видела. Ничего про
+                # тёмную клетку это не сообщает (5.2 не нарушено), но
+                # мерить черноту надо там, где перед ней ничего не стоит.
+                # В 2D этой заботы нет: там выступ стены поддельный, и
+                # render2d гасит его маской (FOG_RISE).
+                jj = i + level["w"]
+                if jj < len(tiles) and fogn["cells"][jj] == VIS_DARK:
+                    dark_b.append(b)
         if lit_b and seen_b:
             res = t.js("window.__zza.boxesMean(%s,%d)"
                        % (json.dumps(lit_b[:200] + seen_b[:200] + dark_b[:200]),
@@ -378,7 +415,8 @@ def main():
 
         # --- пункт 2б: враг в темноте в кадр не попадает (5.2) -------------
         print()
-        cells3 = screen_cells(t, margin=2.0, hgt=0.30)
+        aim_y = t.js("window.__zza.app.render.aimY")
+        cells3 = screen_cells(t, margin=2.0, hgt=aim_y)
         me = t.self_pos()
         dark_pick = lit_pick = None
         for i, sx, sy in cells3:
@@ -436,6 +474,56 @@ def main():
                   "клетка (%d,%d): самый яркий красный %d -> %d "
                   "(рубака #d16a6a это r=209)"
                   % (tx2, ty2, before2["maxR"], after2["maxR"]))
+
+        # --- 7.3, последний пункт: стены гасятся, а не режутся -------------
+        #
+        # Проверка ДЕТЕРМИНИРОВАННАЯ, и это принципиально. Ходить и ждать,
+        # пока персонаж случайно встанет вплотную к стене с нужной стороны,
+        # значит завести проверку, которая иногда просто не успевает
+        # сработать — такая не краснеет, она мигает. Поэтому берётся
+        # разведанная клетка, у которой сосед СО СТОРОНЫ КАМЕРЫ (на +y) —
+        # стена, рисованная позиция своей сущности на один кадр ставится
+        # туда, и кадр рисуется заново. Мир при этом не меняется: dx/dy это
+        # то, что buildView пересчитывает каждый кадр, а draw() по 7.1
+        # состояние трогать не имеет права и не трогает.
+        print()
+        pick = None
+        for i, _sx, _sy in cells2:
+            tx, ty = i % level["w"], i // level["w"]
+            j = (ty + 1) * level["w"] + tx
+            if ty + 1 >= level["h"] or tiles[i] == TILE_WALL:
+                continue
+            if tiles[j] != TILE_WALL:
+                continue
+            if fogn["cells"][i] == VIS_DARK or fogn["cells"][j] == VIS_DARK:
+                continue
+            pick = (tx, ty, j)
+            break
+        if pick is None:
+            check(False, "нашлась разведанная клетка со стеной со стороны камеры")
+        else:
+            tx, ty, widx = pick
+            res = t.js("""(() => {
+              const a = window.__zza.app, r = a.render;
+              const v = a.world.buildView(performance.now());
+              const me = v.self; if (!me) return null;
+              const ox = me.dx, oy = me.dy;
+              me.dx = %f; me.dy = %f;
+              r.draw(v, 0);
+              const out = {fade: Array.from(r._fade), n: r._batches.wallFade.n,
+                           wall: r._batches.wall.n, calls: r.stats().drawCalls};
+              me.dx = ox; me.dy = oy;
+              r.draw(v, 0);
+              return out;
+            })()""" % (tx + 0.5, ty + 0.6))
+            check(res is not None and widx in res["fade"] and res["n"] >= 1,
+                  "стена, закрывающая игрока, уходит в ПРОЗРАЧНУЮ пачку, "
+                  "а не вырезается",
+                  "игрок поставлен в (%.1f,%.1f), стена (%d,%d): гасимых %d, "
+                  "непрозрачных стен в окне %d, вызовов %d"
+                  % (tx + 0.5, ty + 0.6, widx % level["w"], widx // level["w"],
+                     (res or {}).get("n", -1), (res or {}).get("wall", -1),
+                     (res or {}).get("calls", -1)))
 
         # --- пункт 3: вызовы отрисовки (7.3) --------------------------------
         print()
@@ -515,10 +603,14 @@ def main():
         t.js("window.__zza.setBackend('3d')")
         t.page.wait_for_function("window.__zza.getBackend()==='3d'", timeout=10000)
         time.sleep(0.3)
+        # Высоту плоскости прицела спрашиваем у рендера (r.aimY), а не
+        # пишем числом: списанное число разошлось бы с моделью тела при
+        # первой же правке, и проверка покраснела бы, ничего не сказав про
+        # прицел. Один раз уже разошлось — на 3.1 px.
         aim = t.js("(() => { const r = window.__zza.app.render;"
                    " const c = window.__zza.canvasSize();"
                    " const w = r.screenToWorld(c.w/2, c.h/2);"
-                   " const s = r.worldToScreen(w[0], w[1], 0.30);"
+                   " const s = r.worldToScreen(w[0], w[1], r.aimY);"
                    " return [w[0], w[1], s[0], s[1], c.w/2, c.h/2]; })()")
         check(abs(aim[2] - aim[4]) < 1.0 and abs(aim[3] - aim[5]) < 1.0,
               "прицел обратим: экран -> мир -> экран возвращается в ту же точку",
