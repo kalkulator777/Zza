@@ -283,6 +283,35 @@ def main():
         check(ok, "%3dx%3d: комнат %2d, пола %5d, связно, %.1f мс"
               % (w, h, len(f2.rooms), pas, ms))
 
+    print("\n--- тема как параметр (8.6): вторая тема без единой строки кода ---")
+    # Регистрируем вторую тему прямо здесь, только числами. Если бы темы
+    # требовали копии генератора, этот кусок было бы не написать.
+    gen.THEMES["caves"] = gen.Theme("caves", min_leaf=10, min_room=4,
+                                    max_room=8, room_shrink=0.55,
+                                    corridor_w=2, loops=0.9,
+                                    pillar_rate=0.03, max_depth=6)
+    try:
+        bad = 0
+        rooms2 = []
+        pass2 = []
+        for k in range(50):
+            f2 = gen.generate(500 + k * 104729, 1, MAP_W, MAP_H, "caves")
+            seen = flood(f2.grid, f2.entry)
+            pas = sum(1 for v in f2.grid.tiles if v != gen.TILE_WALL)
+            rea = sum(1 for i, v in enumerate(f2.grid.tiles)
+                      if v != gen.TILE_WALL and seen[i])
+            if pas != rea or f2.repairs or f2.stairs is None:
+                bad += 1
+            rooms2.append(len(f2.rooms))
+            pass2.append(pas)
+        check(bad == 0, "вторая тема (широкие коридоры, много петель) связна на 50 этажах",
+              "комнат медиана %d, пола медиана %d"
+              % (statistics.median(rooms2), statistics.median(pass2)))
+        check(gen.get_theme("нет такой").name == gen.DEFAULT_THEME,
+              "неизвестная тема с провода откатывается к основной (8.7)")
+    finally:
+        del gen.THEMES["caves"]
+
     print("\n" + "=" * 70)
     if _fails:
         print("ПРОВАЛЕНО: %s" % ", ".join(_fails))
