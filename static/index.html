@@ -1,0 +1,59 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Zza — сервер жив</title>
+<!-- ЗАГЛУШКА ЭТАПА 0a. Клиент пишется на этапе 0c и перепишет этот файл
+     целиком. Здесь ровно столько, чтобы руками убедиться: сервер отвечает,
+     WebSocket открывается, снапшоты идут. -->
+<style>
+  body { background:#14161a; color:#d8dde5; font:14px/1.5 system-ui,sans-serif;
+         margin:0; padding:24px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:#8b93a1; margin:0 0 16px; }
+  #log { background:#0d0f12; border:1px solid #262b33; border-radius:6px;
+         padding:10px; height:50vh; overflow:auto; white-space:pre-wrap;
+         font:12px/1.45 ui-monospace,Consolas,monospace; }
+  button { background:#2b3442; color:#d8dde5; border:1px solid #3a4655;
+           border-radius:5px; padding:6px 12px; margin-right:6px; cursor:pointer; }
+  b.ok { color:#7fd18a; }
+</style>
+<h1>Zza — <b class="ok">сервер жив</b>, клиента ещё нет</h1>
+<p class="sub">Этап 0a: каркас сервера. Игра появится на этапе 0c.
+Кнопки ниже — ручная проверка WebSocket.</p>
+<button id="go">Подключиться и войти в комнату</button>
+<button id="mv">Подвигаться 1 с</button>
+<a href="/download"><button>Скачать папку игры</button></a>
+<div id="log"></div>
+<script>
+const log = (s) => { const d = document.getElementById('log');
+  d.textContent += s + "\n"; d.scrollTop = d.scrollHeight; };
+let ws = null, pid = 0, seq = 0, snaps = 0, bytes = 0;
+document.getElementById('go').onclick = () => {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => { log('открыто'); ws.send(JSON.stringify({t:'hello', name:'проверка', ver:1}));
+                      ws.send(JSON.stringify({t:'join', room:''})); };
+  ws.onclose = () => log('закрыто');
+  ws.onerror = (e) => log('ошибка сокета');
+  ws.onmessage = (e) => {
+    bytes += e.data.length;
+    const m = JSON.parse(e.data);
+    if (m.t === 'snap') { snaps++;
+      if (snaps % 30 === 0) { const me = (m.e||[]).find(a => a[0] === pid);
+        log('снапшотов ' + snaps + ', байт ' + bytes + ', tick ' + m.tick +
+            (me ? (', я в ' + me[2].toFixed(2) + ',' + me[3].toFixed(2)) : '')); }
+      return; }
+    if (m.t === 'welcome') pid = m.pid;
+    if (m.t === 'joined') { pid = m.pid; log('комната ' + m.room + ', я pid ' + m.pid); return; }
+    if (m.t === 'level') { log('этаж ' + m.floor + ', карта ' + m.w + 'x' + m.h); return; }
+    log(e.data.slice(0, 200));
+  };
+};
+document.getElementById('mv').onclick = () => {
+  if (!ws || ws.readyState !== 1) { log('сначала подключись'); return; }
+  let n = 0;
+  const id = setInterval(() => {
+    ws.send(JSON.stringify({t:'input', seq:++seq, mv:[1,0], aim:[0,0], btn:0}));
+    if (++n >= 30) { clearInterval(id);
+      ws.send(JSON.stringify({t:'input', seq:++seq, mv:[0,0], aim:[0,0], btn:0})); }
+  }, 33);
+};
+</script>
