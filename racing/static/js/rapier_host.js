@@ -451,8 +451,11 @@ export class RapierLocal {
      * таймеры бонусов. Таймеры тикают ЗДЕСЬ, а не в модуле, потому что при
      * откате их надо восстанавливать, а кольцо net.js их уже хранит
      * (SF_SPIN, SF_SLOW) — то же решение, что на сервере (§12.25).
+     *
+     * ``road`` — доза от происшествий на дороге (net.roadDose) либо null.
+     * Считает её net.js: происшествия приезжают снапшотом и живут там же.
      */
-    step(buttons, btn, state) {
+    step(buttons, btn, state, road = null) {
         const host = this.host;
         host._sync();
         const a = this.abi.CarInput;
@@ -468,7 +471,7 @@ export class RapierLocal {
         if (buttons & btn.RIGHT) steer -= 1;
         inputs[base + a.STEER] = steer;
         inputs[base + a.HANDBRAKE] = (buttons & btn.DRIFT) ? 1 : 0;
-        this._writeEffect(state);
+        this._writeEffect(state, road);
         host.x.rp_step(1);
     }
 
@@ -482,7 +485,7 @@ export class RapierLocal {
      * только флаг. Продление по флагу делает applyAuthoritative — там же,
      * где классика делает свой HOLDOVER.
      */
-    _writeEffect(state) {
+    _writeEffect(state, road = null) {
         const host = this.host;
         const E = this.abi.CarEffect;
         const e = this.idx * E.FLOATS;
@@ -507,6 +510,22 @@ export class RapierLocal {
             shield -= DT;
             state.shieldTime = shield > 0 ? shield : 0;
         }
+
+        // Дорога (§12.28): [grip_drop, shift_x, shift_z, push_x, push_z,
+        // speed_drop] — те же шесть чисел, что выписывает серверный
+        // RapierRace._write_effect, и посчитаны они тем же кодом в net.js.
+        if (road === null) return;
+        if (road[0] > 0) eff[e + E.GRIP_DROP] = road[0];
+        if (road[1] !== 0 || road[2] !== 0) {
+            eff[e + E.SHIFT_X] = road[1];
+            eff[e + E.SHIFT_Z] = road[2];
+        }
+        if (road[3] !== 0 || road[4] !== 0) {
+            eff[e + E.PUSH_X] = road[3];
+            eff[e + E.PUSH_Z] = road[4];
+        }
+        // Одно поле на «Грозу» и на обломки: берём БОЛЬШУЮ дозу, как сервер.
+        if (road[5] > eff[e + E.SPEED_DROP]) eff[e + E.SPEED_DROP] = road[5];
     }
 
     /**

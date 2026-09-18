@@ -46,6 +46,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
+from game import physics                        # noqa: E402
 from game import rapier_host as rh              # noqa: E402
 from game.cars import load_cars                 # noqa: E402
 from game.track import Track                    # noqa: E402
@@ -742,7 +743,7 @@ def report_restrictions(report):
             report.check(settings.get(name) == value, 'настройка %s' % label,
                          'просили %r, стало %r'
                          % (wanted[name], settings.get(name)))
-        report.check(len(sim.disabled_features) >= 4,
+        report.check(len(sim.disabled_features) == 2,
                      'комната сообщает игрокам, что опущено',
                      '%d фраз: %s'
                      % (len(sim.disabled_features),
@@ -764,11 +765,34 @@ def report_restrictions(report):
         report.check('items_enabled' not in [row[0] for row in rh.RESTRICTED],
                      'бонусы больше не в списке опущенного',
                      'опущено: %s' % ', '.join(row[0] for row in rh.RESTRICTED))
+        # Поток и происшествия — с той же стороны, что бонусы: их попросили
+        # включёнными, и они обязаны РАБОТАТЬ (§12.28), а не быть тихо
+        # опущенными. Мало флага: та же ошибка гандикапа читалась бы как
+        # «включено и молчит», поэтому смотрим на живые болванки и на то,
+        # что проход столкновений с ними в симуляции действительно стоит.
         traffic = getattr(sim, 'traffic', None)
-        report.check(traffic is None or not getattr(traffic, 'cars', None),
-                     'болванок потока в гонке нет',
-                     'traffic=%r' % (None if traffic is None
-                                     else len(getattr(traffic, 'cars', ()) or ()),))
+        dummies = 0 if traffic is None else len(getattr(traffic, 'cars', ()) or ())
+        report.check(traffic is not None and traffic.enabled and dummies > 0,
+                     'поток машин в гонке включён и расставлен',
+                     'traffic=%r, болванок %d'
+                     % (sim.settings.get('traffic'), dummies))
+        road = getattr(sim, 'road', None)
+        report.check(road is not None and road.enabled,
+                     'происшествия в гонке включены',
+                     'events=%r, enabled=%r'
+                     % (sim.settings.get('events'),
+                        None if road is None else road.enabled))
+        for name in ('traffic', 'events'):
+            report.check(name not in [row[0] for row in rh.RESTRICTED],
+                         'настройка %s больше не в списке опущенного' % name,
+                         'опущено: %s' % ', '.join(row[0] for row in rh.RESTRICTED))
+        # Болванок в мире модуля нет, поэтому удар о них обязан считать
+        # хозяин: проход столкновений подменён на рапировский, а не на
+        # пустышку. Пустышка означала бы поток, сквозь который проезжают.
+        resolver = getattr(sim._resolve_collisions, '__func__', None)
+        report.check(resolver is rh.RapierRace.resolve_collisions,
+                     'удар о болванку считает проход RapierRace',
+                     sim._resolve_collisions.__qualname__)
         report.check(sim.rapier is not None
                      and sim.rapier.__class__.__name__ == 'RapierRace',
                      'мир гонки — RapierRace',
@@ -974,9 +998,9 @@ def report_effects(report):
                  'просили 10 %%, сняло %.1f %% (с %.2f до %.2f м/с)'
                  % (took * 100.0, v0, v_dosed))
 
-    # 8. push и shift двигают тело на заказанное. Пока их никто не зовёт —
-    #    они ждут происшествий и трамплинов (§12.25), — но мёртвый код в
-    #    ABI хуже отсутствующего: проверка держит их живыми.
+    # 8. push и shift двигают тело на заказанное. С 12.28 их зовут завалы
+    #    и удар о болванку, но проверка остаётся здесь и на самих числах:
+    #    выше по тексту она одна умеет сказать, что метр — это метр.
     car = Car()
     px0 = car.g(OUT.PX)
     car.dose(push_x=5.0)
@@ -1029,6 +1053,323 @@ def report_effects(report):
                  and 'rp_effects_ptr' in py and 'rp_effects_ptr' in js,
                  'обе половины берут раскладку у генератора, а не руками',
                  'смещений руками ни там, ни там')
+
+
+# ---------------------------------------------------------------------------
+# Дорога: поток и происшествия через ту же дверь (§12.28)
+# ---------------------------------------------------------------------------
+# Болванок и корпусов в мире модуля нет и не появилось. Всё, что дорога
+# делает с гонщиком, переводится в дозу CarEffect: покрытие в grip_drop,
+# тряска по обломкам в speed_drop, завал и удар о болванку в shift_*/push_*.
+# Значит проверять надо не механику модуля (её держит report_effects), а
+# ПЕРЕВОД: что хозяин дозу действительно выписывает и что в игре от неё
+# что-то меняется. У каждой проверки рядом стоит прогон, где перевод
+# сломан нарочно, — иначе она была бы неотличима от проверки, которая
+# зеленеет на пустом месте (§12.20, урок про шаткую проверку).
+
+def _road_scene(events='rare', traffic='off', count=1):
+    """Гонка при physics=rapier с управляемой дорогой."""
+    from game.sim import Simulation
+    players = [{'slot': i, 'name': 'ABCDEFGH'[i], 'car': CAR_ID}
+               for i in range(count)]
+    sim = Simulation(track(), {
+        'track': TRACK_ID, 'laps': 9, 'mirror': False, 'items_enabled': False,
+        'collisions': True, 'traffic': traffic, 'events': events,
+        'handicap': False, 'weather': 'dry', 'physics': 'arcade'}, players)
+    # Сами происшествия расставляем руками: случайные тут только мешали бы.
+    sim.road._cooldown = 1e9
+    return sim
+
+
+def _place(sim, kind, arc, lateral, phase, slot_no=0):
+    """Зажечь происшествие в заданной точке. Габариты — из game/events.py."""
+    from game import events as ev
+    road = sim.road
+    slot = road.pool[slot_no]
+    half_len, half_width, _lane = ev.GEOMETRY[kind]
+    slot.kind = kind
+    slot.phase = phase
+    slot.arc = arc % sim.track.length
+    slot.lateral = lateral
+    slot.half_len = half_len
+    slot.half_width = half_width
+    slot.track_half_width = 7.0
+    slot.timer = 1e6
+    slot.hit_mask = 0
+    slot.alive = True
+    if slot not in road.live:
+        road.live.append(slot)
+    road._rebuild_zone()
+    return slot
+
+
+def _hold(sim, buttons, ticks, slot=0):
+    for _ in range(ticks):
+        sim.set_input(slot, sim.tick_no + 1, buttons)
+        sim.tick()
+
+
+def _speed(state):
+    return math.hypot(state.vx, state.vz)
+
+
+def _spin_up(sim, speed, guard=1500):
+    state = sim.cars[0].state
+    n = 0
+    while _speed(state) < speed and n < guard:
+        _hold(sim, rh.BTN_THROTTLE, 1)
+        n += 1
+    return _speed(state)
+
+
+def report_road(report):
+    print('  дорога: покрытие, завалы и поток (§12.28):')
+    from game import events as ev
+    saved = os.environ.get(rh.ENV_VAR)
+    os.environ[rh.ENV_VAR] = rh.RAPIER
+    try:
+        _report_road(report, ev)
+    finally:
+        if saved is None:
+            os.environ.pop(rh.ENV_VAR, None)
+        else:
+            os.environ[rh.ENV_VAR] = saved
+
+
+def _report_road(report, ev):
+    # 1. МАСЛО. Мерить надо ПОВОРОТ, а не тормозной путь. Тормозной путь на
+    #    масле НЕ МЕНЯЕТСЯ — и это не особенность Rapier, а свойство обеих
+    #    физик: масло режет grip_step и drift_grip_step, то есть БОКОВОЕ
+    #    сцепление, а тормоз считается отдельно. Замерено спина к спине:
+    #    классика теряет 19,01 м/с за 40 тиков и по сухому, и на масле;
+    #    Rapier — 9,05 и там и там. Проверка, построенная на торможении,
+    #    зеленела бы на сломанной двери, то есть охраняла бы ничего.
+    #
+    #    Поворот же от сцепления зависит целиком, и тем же замером мерили
+    #    дозу в §12.27: за 1,5 с руля 1,93 рад по сухому против 0,92 на
+    #    масле. Порог отсюда: сцепление падает в OIL_GRIP = 0,45 раза,
+    #    значит поворот обязан упасть заметно ниже сухого; с запасом —
+    #    меньше 0,75 от него.
+    #
+    #    Пятно масла настоящее, из GEOMETRY, а не дорисованное: шесть штук
+    #    (два ряда по три) кроют 28 м дуги и всю ширину полотна, дальше
+    #    машина за секунду руля не уедет.
+    def turn_run(oil, sabotage=False):
+        sim = _road_scene()
+        state = sim.cars[0].state
+        _spin_up(sim, 20.0)
+        arc, lat = sim.road._pose(state)
+        if oil:
+            k = 0
+            for ds in (3.0, 17.0):
+                for dl in (-4.5, 0.0, 4.5):
+                    _place(sim, ev.KIND_OIL, arc + ds, lat + dl,
+                           ev.PHASE_ACTIVE, k)
+                    k += 1
+        if sabotage:
+            # Дверь закрыта нарочно: покрытие под машиной есть, дозы нет.
+            sim.road.grip_scale = lambda st: 1.0
+        yaw0 = state.yaw
+        _hold(sim, rh.BTN_THROTTLE | rh.BTN_LEFT, 60)
+        turned = state.yaw - yaw0
+        while turned > math.pi:
+            turned -= 2.0 * math.pi
+        while turned < -math.pi:
+            turned += 2.0 * math.pi
+        return abs(turned)
+
+    dry = turn_run(False)
+    wet = turn_run(True)
+    broken = turn_run(True, sabotage=True)
+    report.check(wet < dry * 0.75,
+                 'на масле машина не доворачивает: grip_drop доехал до колёс',
+                 'за секунду руля по сухому %.3f рад, на масле %.3f '
+                 '(доля %.2f при потолке 0,75)' % (dry, wet, wet / dry))
+    report.check(abs(broken - dry) < 0.02 * dry,
+                 'та же проверка краснеет, если дозу не выписывать',
+                 'с закрытой дверью на масле доворот %.3f рад — тот же, '
+                 'что по сухому (%.3f)' % (broken, dry))
+
+    # 2. ОБЛОМКИ. Тряска снимает долю ПРОДОЛЬНОЙ скорости за шаг
+    #    (DEBRIS_DAMP = 0,9960), поэтому катящаяся машина обязана потерять
+    #    за 60 тиков примерно 1 - 0,996^60 = 21 % сверх обычного наката.
+    #    Порог: не меньше половины этого, то есть 10 %.
+    def coast_run(debris):
+        sim = _road_scene()
+        state = sim.cars[0].state
+        v0 = _spin_up(sim, 30.0)
+        arc, lat = sim.road._pose(state)
+        if debris:
+            for k in range(4):
+                _place(sim, ev.KIND_EXPLOSION, arc + k * 10.0 - 4.0, lat,
+                       ev.PHASE_DEBRIS, k)
+        _hold(sim, 0, 60)
+        return v0, _speed(state)
+
+    v0_clean, clean = coast_run(False)
+    v0_deb, deb = coast_run(True)
+    lost = (clean - deb) / v0_deb
+    report.check(lost > 0.10,
+                 'по обломкам машина теряет ход: speed_drop доехал',
+                 'накат с %.1f м/с: чисто %.2f, по обломкам %.2f — '
+                 'на %.1f %% скорости больше (расчётный потолок 21 %%)'
+                 % (v0_deb, clean, deb, lost * 100.0))
+
+    # 3. ТВЁРДОЕ ПРЕПЯТСТВИЕ. Проверка одна и грубая нарочно: машина, которая
+    #    едет в завал, обязана в нём ОСТАНОВИТЬСЯ, а не проехать сквозь.
+    #    Меряем дугу относительно центра завала: с механикой нос упирается
+    #    примерно за полдлины машины плюс полдлины завала (4,4 м), без неё
+    #    машина оказывается далеко за ним.
+    def ram_run(sabotage=False):
+        sim = _road_scene()
+        state = sim.cars[0].state
+        _spin_up(sim, 16.0)
+        arc, lat = sim.road._pose(state)
+        wreck_arc = arc + 30.0
+        _place(sim, ev.KIND_WRECK, wreck_arc, lat, ev.PHASE_ACTIVE)
+        if sabotage:
+            sim.road.solid_resolve = lambda st, out: False
+        _hold(sim, rh.BTN_THROTTLE, 180)
+        now, _lat = sim.road._pose(state)
+        return now - wreck_arc
+
+    stopped = ram_run()
+    through = ram_run(sabotage=True)
+    report.check(stopped < 0.0,
+                 'завал не пускает: shift_* и push_* доехали до тела',
+                 'нос встал на %.2f м ОТ центра завала (габарит 4,4 м)'
+                 % stopped)
+    report.check(through > 20.0,
+                 'та же проверка краснеет, если выталкивание не выписывать',
+                 'с закрытой дверью машина уезжает на %.1f м ЗА завал'
+                 % through)
+
+    # 4. ПОТОК. Болванки в мире модуля нет, её удар считает хозяин и кладёт
+    #    в отложенную дозу. Проверяем обе половины сразу: болванку толкнуло
+    #    на месте, гонщику записалось в дозу.
+    sim = _road_scene(events='off', traffic='dense', count=2)
+    race = sim.rapier
+    car = sim.cars[0]
+    unit = sim.traffic.cars[0]
+    _hold(sim, rh.BTN_THROTTLE, 30)
+    st = car.state
+    unit.state.x = st.x + 1.2
+    unit.state.z = st.z
+    unit.state.yaw = st.yaw
+    unit.state.vx = 0.0
+    unit.state.vz = 0.0
+    unit_before = (unit.state.x, unit.state.z)
+    pend = race.slots[0][7]
+    pend[0] = pend[1] = pend[2] = pend[3] = 0.0
+    sim._resolve_collisions()
+    unit_moved = math.hypot(unit.state.x - unit_before[0],
+                            unit.state.z - unit_before[1])
+    report.check(unit_moved > 1e-6 and (pend[0] or pend[1]),
+                 'въехал в болванку: её толкнуло, гонщику записалась доза',
+                 'болванку сдвинуло на %.3f м, гонщику отложено '
+                 '%.3f м сдвига и %.3f м/с толчка'
+                 % (unit_moved, math.hypot(pend[0], pend[1]),
+                    math.hypot(pend[2], pend[3])))
+
+    # 5. ...а гонщик против гонщика через этот проход НЕ считается: их уже
+    #    посчитал солвер внутри шага, и второй раз означал бы двойной толчок.
+    #    Эта проверка охраняет аргумент skip_before и обязана краснеть, если
+    #    его убрать, — проверено подстановкой skip_before=0 ниже.
+    other = sim.cars[1]
+    other.state.x = st.x + 1.0
+    other.state.z = st.z
+    other.state.yaw = st.yaw
+    for u in sim.traffic.cars:          # болванок убрать с дороги совсем
+        u.state.x = st.x + 900.0
+    pend[0] = pend[1] = pend[2] = pend[3] = 0.0
+    sim._resolve_collisions()
+    quiet = not (pend[0] or pend[1] or pend[2] or pend[3])
+    states = [sim.cars[0].state, sim.cars[1].state]
+    stats = [sim.cars[0].stats, sim.cars[1].stats]
+    before_x = states[0].x
+    physics.resolve_collisions(states, stats, 2, 0)
+    report.check(quiet and abs(states[0].x - before_x) > 1e-9,
+                 'гонщик против гонщика через хозяина не считается дважды',
+                 'проход хозяина молчит, а тот же код при skip_before=0 '
+                 'сдвинул бы на %.5f м за тик' % abs(states[0].x - before_x))
+
+    # 6. Доза от болванки живёт ОДИН шаг и не складывается: её забирает
+    #    первый же _write_effect и обнуляет запись.
+    entry = race.slots[0]
+    e = entry[6]
+    host = race.host
+    host._sync()
+    for k in range(EFF.FLOATS):
+        host.effects[e + k] = 0.0
+    entry[7][0] = 0.5
+    entry[7][2] = 3.0
+    race._write_effect(entry, host.effects, host.outputs, DT)
+    first = (host.effects[e + EFF.SHIFT_X], host.effects[e + EFF.PUSH_X])
+    for k in range(EFF.FLOATS):
+        host.effects[e + k] = 0.0
+    race._write_effect(entry, host.effects, host.outputs, DT)
+    again = (host.effects[e + EFF.SHIFT_X], host.effects[e + EFF.PUSH_X])
+    report.check(abs(first[0] - 0.5) < 1e-6 and abs(first[1] - 3.0) < 1e-6
+                 and again == (0.0, 0.0),
+                 'отложенная доза уходит в модуль ровно один раз',
+                 'первый шаг %.3f м / %.3f м/с, второй %.3f / %.3f'
+                 % (first[0], first[1], again[0], again[1]))
+
+    # 8. СЕТЬ ПОД ПЕРЕВЁРНУТОЙ МАШИНОЙ. Она появилась вместе с потоком и
+    #    не является его частью: кузов у Rapier настоящий, после жёсткого
+    #    удара он ложится на крышу или на бок, и оттуда не выбраться ни
+    #    игроку, ни боту. До 12.28 это не всплывало, потому что в замерах
+    #    кувырка не случалось; с потоком на дороге две гонки из пяти висли
+    #    до конца восьмиминутного потолка. Проверка кладёт машину на крышу
+    #    руками и требует, чтобы она вернулась — и чтобы вернулась НЕ
+    #    РАНЬШЕ срока, иначе сеть срабатывала бы на каждом прыжке.
+    sim = _road_scene(events='off', traffic='off')
+    race = sim.rapier
+    entry = race.slots[0]
+    host = race.host
+    st = sim.cars[0].state
+    _hold(sim, 0, 5)
+    ground = sim.track.surface(st.x, st.z, st.sample_idx)[3]
+    host._sync()
+    b = entry[1] * abi.CarSave.FLOATS
+    for k in range(abi.CarSave.FLOATS):
+        host.saves[b + k] = 0.0
+    host.saves[b + abi.CarSave.PX] = st.x
+    host.saves[b + abi.CarSave.PY] = ground + 0.6
+    host.saves[b + abi.CarSave.PZ] = st.z
+    host.saves[b + abi.CarSave.QX] = 1.0      # переворот на 180° вокруг X
+    host.car_restore(entry[1])
+    out = host.outputs
+    _hold(sim, rh.BTN_THROTTLE, 120)          # две секунды — рано
+    early = out[entry[3] + OUT.WHEELS_ON_GROUND]
+    _hold(sim, rh.BTN_THROTTLE, 150)          # ещё 2,5 с — сеть сработала
+    late = out[entry[3] + OUT.WHEELS_ON_GROUND]
+    report.check(early < 2.0,
+                 'за две секунды на крыше сеть не срабатывает: прыжок ей не '
+                 'повод', 'колёс на полотне %.0f' % early)
+    report.check(late >= 2.0,
+                 'перевёрнутая машина возвращается на ось, а не висит до '
+                 'конца гонки', 'колёс на полотне %.0f' % late)
+
+    # 9. Числа покрытия у браузера те же, что у сервера. Копия в net.js
+    #    заведена не сегодня, но с 12.28 от неё зависит уже и предсказание
+    #    под Rapier: разъедься она — машина поехала бы по разному маслу на
+    #    двух сторонах.
+    js = open(os.path.join(BASE_DIR, 'static', 'js', 'net.js'),
+              encoding='utf-8').read()
+    pairs = (('ROAD_OIL_GRIP', ev.OIL_GRIP), ('ROAD_DEBRIS_GRIP', ev.DEBRIS_GRIP),
+             ('ROAD_DEBRIS_DAMP', ev.DEBRIS_DAMP),
+             ('ROAD_SOLID_BOUNCE', ev.SOLID_BOUNCE))
+    bad = []
+    for name, want in pairs:
+        found = re.search(r'const %s = ([0-9.]+)' % name, js)
+        if found is None or abs(float(found.group(1)) - want) > 1e-12:
+            bad.append('%s: %s против %r' % (name, found and found.group(1), want))
+    report.check(not bad, 'числа покрытия у браузера те же, что у сервера',
+                 '; '.join(bad) if bad else ', '.join(n for n, _v in pairs))
+    report.check('roadSolve' in js and 'roadDose' in js,
+                 'браузерная половина дороги на месте: roadSolve и roadDose',
+                 'net.js зовёт их из stepLocal и из переигровки')
 
 
 # ---------------------------------------------------------------------------
@@ -1099,6 +1440,7 @@ def main(argv=None):
         report_eps_sync(report)
         report_restrictions(report)
         report_effects(report)
+        report_road(report)
         report_module(report, wasm_parity=not args.no_wasm_parity)
     except rh.HostError as exc:
         print('  ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)

@@ -37,7 +37,9 @@ import gc
 import math
 import os
 import random
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -1065,6 +1067,17 @@ ROAD_SEED = 4242
 # в докстринге check_traffic_free_lane.
 TRAFFIC_FREE_SUSTAINED = 4.6   # м, устойчивый просвет: 2,4 ширины машины
 TRAFFIC_FREE_INSTANT = 2.85    # м, мгновенный пол: полторы ширины машины
+# Под Rapier устойчивый просвет меряется меньшим числом, и это не регрессия
+# водителя. Замерено спина к спине, один и тот же код, seed 11, dense/off:
+# классика 4,86 м устойчивого и 4,54 м мгновенного, Rapier 4,39 и 3,37.
+# Причина в том, КАК гонщик принимает свою половину расталкивания. У
+# классики она пишется прямо в vx/vz и остаётся; у Rapier она уезжает
+# импульсом в тело, стоящее на резине, и боковое сцепление колёс её
+# частью съедает — гонщик отодвигается меньше, а болванка больше. Порог
+# для Rapier выведен из габарита, а не из прогона: две ширины машины, то
+# есть гонщик разъезжается с болванкой, оставляя себе целый корпус.
+# Замеренный запас к нему 0,59 м.
+TRAFFIC_FREE_RAPIER = 4.0 * physics.CAR_RADIUS   # 3,80 м — две ширины машины
 
 
 def _road_sim(track, laps, traffic, events, count=8, seed=ROAD_SEED):
@@ -1452,6 +1465,225 @@ def check_road_physics(report):
                  'в фазе предупреждения происшествие только видно, но не действует')
 
 
+def check_js_modules(report):
+    """Каждый файл static/js обязан разбираться как ES-модуль.
+
+    Проверка родилась из настоящей поломки, а не из осторожности. В
+    комментарии net.js стояла подпись полей дозы ``shift_*``/``push_*``,
+    написанная слитно: последовательность ``*/`` закрыла блочный
+    комментарий на середине фразы, дальше остаток текста стал кодом. В
+    браузере страница падала на загрузке модуля, а сквозной автотест
+    сообщал об этом как «клиент не подключился к серверу» — то есть
+    сорок семь секунд прогона и диагноз, указывающий в сторону сети.
+
+    Почему ``node --check static/js/net.js`` это НЕ ловит: по расширению
+    ``.js`` Node разбирает файл как СКРИПТ, и обломки комментария в нём
+    складываются в синтаксически годный мусор. Браузер грузит тот же файл
+    как модуль и падает. Поэтому здесь файл копируется в ``.mjs``.
+
+    Что проверка СПОСОБНА покраснеть, воспроизводится в две команды —
+    сломанный файл сохранён в истории::
+
+        git show 736434b:racing/static/js/net.js > /tmp/broken.mjs
+        node --check /tmp/broken.mjs      # SyntaxError: Unexpected token '*'
+    """
+    report.section('Браузерные модули: синтаксис')
+    node = shutil.which('node')
+    if node is None:
+        report.note('ПРОПУЩЕНО: node не найден, разобрать модули нечем')
+        return
+    root = os.path.join(BASE_DIR, 'static', 'js')
+    files = []
+    for base, _dirs, names in os.walk(root):
+        for name in sorted(names):
+            if name.endswith('.js'):
+                files.append(os.path.join(base, name))
+    bad = []
+    tmp = tempfile.mkdtemp(prefix='racing-esm-')
+    try:
+        for path in sorted(files):
+            copy = os.path.join(tmp, os.path.basename(path)[:-3] + '.mjs')
+            shutil.copyfile(path, copy)
+            proc = subprocess.run([node, '--check', copy],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                head = (proc.stderr or '').strip().splitlines()
+                bad.append('%s: %s' % (os.path.relpath(path, BASE_DIR),
+                                       head[-1] if head else 'не разобрался'))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    report.check(not bad,
+                 'все %d файлов static/js разбираются как ES-модули' % len(files),
+                 '; '.join(bad) if bad else 'ни одного разрыва комментария')
+
+
+def check_road_rapier(report):
+    """Поток и происшествия при physics=rapier (§12.28).
+
+    Честность потока закрыта ПОСТРОЕНИЕМ, а не физикой: расстановка,
+    коридор перед решёткой и адаптивный круиз живут в game/traffic.py и от
+    того, чем считается гонщик, не зависят. Зависит другое — доедут ли
+    восемь ботов сквозь плотный поток, когда их самих считает Rapier, а
+    болванок по-прежнему старая физика, и останется ли трасса проезжей
+    после того, как гонщик болванку толкнул.
+
+    Прогонов ДВА, и это не перестраховка. Пороги просвета выведены и
+    замерены на `dense`/`off` (см. check_traffic_free_lane), и только там
+    они что-то значат: когда на дороге ещё и завал, болванка обязана
+    протискиваться мимо него, и просвет законно меньше. Замерено спина к
+    спине на этом же коде: КЛАССИКА при `dense`/`often` даёт устойчивый
+    просвет 4,07 м, то есть ниже собственного порога 4,6 — значит порогом
+    при включённых ДТП он быть не может ни для одной физики. Поэтому
+    пороги проверяются там, где выведены, а тяжёлый режим отвечает за
+    другое: доезд, цену тика и то, что болванка нигде не встаёт надолго.
+    """
+    report.section('Rapier: поток и происшествия')
+    from game import rapier_host
+
+    saved = os.environ.get(rapier_host.ENV_VAR)
+    os.environ[rapier_host.ENV_VAR] = rapier_host.RAPIER
+    try:
+        _road_rapier_body(report, 'off', strict=True)
+        _road_rapier_body(report, 'often', strict=False)
+    except rapier_host.HostError as exc:
+        report.note('ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)
+    finally:
+        if saved is None:
+            os.environ.pop(rapier_host.ENV_VAR, None)
+        else:
+            os.environ[rapier_host.ENV_VAR] = saved
+
+
+def _road_rapier_body(report, events, strict):
+    window = 30                  # тиков в скользящем окне, полсекунды
+    worst_sust = 1e9
+    worst_inst = 1e9
+    where = ''
+    samples = [0, 0]
+    stuck_total = 0
+    longest_stop = 0
+    finished_all = True
+    grew = 0
+    events_seen = 0
+    ticks = []
+    rapier_everywhere = True
+    for track_id in TRACK_IDS:
+        track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                        '%s.json' % track_id))
+        sim = _road_sim(track, 2, 'dense', events)
+        if sim.rapier is None or sim.rapier.__class__.__name__ != 'RapierRace':
+            rapier_everywhere = False
+        bots = make_bots(track, sim, seed=11)
+        system = sim.traffic
+        half = system._shw
+        count = system.count
+        ring = [[1e9] * window for _ in range(count)]
+        head = [0] * count
+        stop = [0] * count
+        active0 = None
+        for tick in range(MAX_RACE_TICKS):
+            for index, car in enumerate(sim.cars):
+                if car.removed:
+                    continue
+                sim.set_input(car.slot, tick + 1, bots[index].drive(car, tick))
+            started = time.perf_counter()
+            sim.tick()
+            ticks.append((time.perf_counter() - started) * 1e6)
+            if tick > 150:
+                # Появлений по ходу гонки нет: состав потока задан до старта
+                # и только он. Растущий состав означал бы «выскочил перед
+                # носом» — то, чего в 12.20 нет построением.
+                active = sum(1 for u in system.cars if u.active)
+                if active0 is None:
+                    active0 = active
+                elif active > active0:
+                    grew += 1
+                for k in range(count):
+                    unit = system.cars[k]
+                    hw = half[unit.state.sample_idx]
+                    samples[0] += 1
+                    if unit.state.offtrack:
+                        samples[1] += 1
+                    if unit.speed < 1.0:
+                        stuck_total += 1
+                        stop[k] += 1
+                        if stop[k] > longest_stop:
+                            longest_stop = stop[k]
+                    else:
+                        stop[k] = 0
+                    free = hw + abs(unit.lateral) - physics.CAR_RADIUS
+                    if free < worst_inst:
+                        worst_inst = free
+                        where = track_id
+                    ring[k][head[k]] = free
+                    head[k] = (head[k] + 1) % window
+                    sustained = max(ring[k])
+                    if sustained < worst_sust:
+                        worst_sust = sustained
+            if sim.is_over():
+                break
+        events_seen += sim.road.spawned
+        if not all(car.finished for car in sim.cars):
+            finished_all = False
+
+    tag = 'плотный поток' if events == 'off' else 'плотный поток и частые ДТП'
+    report.check(rapier_everywhere,
+                 'все пять гонок (%s) считает Rapier' % tag)
+    report.check(finished_all,
+                 'восемь ботов доезжают на всех пяти трассах: %s' % tag)
+    report.check(grew == 0,
+                 'появлений по ходу гонки нет (%s): состав задан до старта'
+                 % tag, 'тиков, где состав вырос: %d' % grew)
+    report.check(worst_inst >= TRAFFIC_FREE_INSTANT,
+                 'болванка не уходит из своей полосы под толчком тела Rapier '
+                 '(%s)' % tag,
+                 'мгновенный минимум %.2f м при пороге %.2f (%s)'
+                 % (worst_inst, TRAFFIC_FREE_INSTANT, where))
+    if strict:
+        off_share = 100.0 * samples[1] / samples[0] if samples[0] else 0.0
+        report.check(off_share < 3.0,
+                     'болванка держит полосу и под Rapier',
+                     'вне асфальта %.2f %% времени (толчки гонщиков)'
+                     % off_share)
+        report.check(stuck_total == 0,
+                     'болванка нигде не встала и под Rapier',
+                     'тиков со скоростью ниже 1 м/с: %d' % stuck_total)
+        report.check(worst_sust >= TRAFFIC_FREE_RAPIER,
+                     'рядом с болванкой устойчиво остаётся проезд и под Rapier',
+                     'худший просвет за полсекунды %.2f м при пороге %.2f '
+                     '(две ширины машины; у классики на том же коде 4,86 м '
+                     'при пороге 4,6)' % (worst_sust, TRAFFIC_FREE_RAPIER))
+        return
+
+    # Тяжёлый режим. Порога «просвет 4,6 м» здесь нет — он выведен для
+    # `dense`/`off` и при включённых ДТП не выполняется и у классики
+    # (4,07 м, замерено спина к спине). Зато у «болванка не встала» порог
+    # остаётся, только он теперь про ДЛИТЕЛЬНОСТЬ: мимо завала протискиваются
+    # медленно, и это честная езда, а вот остановка дольше секунды — уже
+    # стена поперёк трассы. Порог тот же, что у узкого просвета в 12.20.
+    report.note('устойчивый просвет %.2f м (у классики в этом же режиме '
+                '4,07 м — порог 4,6 выведен для ДТП «off»)' % worst_sust)
+    report.check(longest_stop < 60,
+                 'болванка не встаёт стеной: остановка короче секунды',
+                 'самая длинная остановка %d тиков (%.2f с), всего таких '
+                 'тиков %d из %d' % (longest_stop, longest_stop / 60.0,
+                                     stuck_total, samples[0]))
+    report.check(events_seen >= 15,
+                 'происшествия при Rapier рождаются, а не молчат',
+                 'за пять гонок %d штук' % events_seen)
+    ticks.sort()
+    mean = sum(ticks) / len(ticks)
+    p99 = ticks[int(len(ticks) * 0.99)]
+    report.note('цена тика: среднее %.4f мс, p99 %.4f мс (загрузка %s)'
+                % (mean / 1000.0, p99 / 1000.0,
+                   open('/proc/loadavg').read().split()[0]))
+    report.check(mean < 2000.0 and p99 < 2000.0,
+                 'тик с плотным потоком и частыми ДТП в бюджете комнаты и '
+                 'под Rapier',
+                 '%.4f мс среднее, %.4f мс p99 из 2,0 мс'
+                 % (mean / 1000.0, p99 / 1000.0))
+
+
 def check_road_settings(report):
     """Враждебные входы на новые поля настроек комнаты."""
     report.section('Настройки: траффик и происшествия')
@@ -1796,6 +2028,8 @@ def main(argv=None):
     check_road_events(report)
     check_road_physics(report)
     check_road_settings(report)
+    check_js_modules(report)
+    check_road_rapier(report)
     measure_tick(report, collect_tick_times(laps=args.laps, seed=args.seed))
     measure_traffic_tick(report)
 

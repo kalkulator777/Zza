@@ -47,7 +47,8 @@
 рендер headless-браузера не успевает (см. LOW_GFX). Число кадров в секунду
 здесь печатается, но ничего не значит: это скорость стенда, а не игры. Также
 не проверяются звук, бонусы и снаряды (в приёмочной гонке они выключены —
-ради предсказуемого времени прогона; ключ --items их включает), больше двух игроков, переподключение
+ради предсказуемого времени прогона; ключ --items их включает), поток машин
+и происшествия (ключ --road), больше двух игроков, переподключение
 и потеря связи, обнаружение серверов по UDP, чат, правка настроек комнаты
 владельцем, зеркальные трассы, режим наблюдателя, поведение при плохой сети
 и мобильные браузеры. Физику и симуляцию проверяет tools/test_sim.py —
@@ -168,6 +169,7 @@ PREDICT_EPS_RAPIER = 0.08
 
 PHYSICS = 'classic'
 ITEMS_ENABLED = False
+ROAD_ENABLED = False
 DIVERGE_MEDIAN_MAX = 0.05
 DIVERGE_P95_MAX = 0.10
 
@@ -1139,6 +1141,11 @@ def lobby_stage(report, host, guest):
         'items_enabled': ITEMS_ENABLED,
         'collisions': True,
         'mirror': False,
+        # То же и по той же причине для дороги: ключ --road включает поток
+        # машин и происшествия. Без него браузерный путь болванок и завалов
+        # не выполняется ни разу — §12.28 проверялся именно этим ключом.
+        'traffic': 'dense' if ROAD_ENABLED else 'off',
+        'events': 'often' if ROAD_ENABLED else 'off',
     }
     host.send({'t': 'create_room', 'name': 'Приёмка', 'settings': settings})
     if not host.wait('() => window.__smoke.room && window.__smoke.room.id'):
@@ -1964,14 +1971,19 @@ def parse_args(argv=None):
                         help='включить бонусы в приёмочной гонке: гонка '
                              'перестаёт быть предсказуемой, зато браузерный '
                              'путь бонусов и снарядов выполняется')
+    parser.add_argument('--road', action='store_true',
+                        help='включить плотный поток машин и частые '
+                             'происшествия: выполняется браузерный путь '
+                             'болванок, масла и завалов')
     return parser.parse_args(argv)
 
 
 def main(argv=None):
-    global PHYSICS, ITEMS_ENABLED
+    global PHYSICS, ITEMS_ENABLED, ROAD_ENABLED
     args = parse_args(argv)
     PHYSICS = args.physics or 'classic'
     ITEMS_ENABLED = bool(args.items)
+    ROAD_ENABLED = bool(args.road)
     report = Report(args.verbose)
 
     shots_dir = None

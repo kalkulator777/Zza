@@ -1088,7 +1088,7 @@ export class NetClient {
      * оси меньшего перекрытия плюс гашение нормальной составляющей.
      *
      * Итоговые значения, а не приращения: классике нужны первые, а
-     * Rapier — вторые (доза shift_*/push_*, §12.28). Разность считает тот,
+     * Rapier — вторые (доза shift_x/z и push_x/z, §12.28). Разность считает тот,
      * кому она нужна; общий код один на обе физики, как и на сервере.
      */
     roadSolve(state, out) {
@@ -1156,7 +1156,7 @@ export class NetClient {
      * Дорога -> доза CarEffect на этот шаг. Зеркало того, что делает
      * RapierRace._write_effect на сервере (§12.28): покрытие в grip_drop,
      * тряска по обломкам в speed_drop, выталкивание из завала в
-     * shift_*/push_*. Возвращает буфер из шести чисел или null, если
+     * shift_x/z и push_x/z. Возвращает буфер из шести чисел или null, если
      * дороге сказать нечего.
      *
      * Чего здесь НЕТ и не будет: удара о болванку потока и вспышки взрыва.
@@ -1339,7 +1339,11 @@ export class NetClient {
             // реконсиляцию переигрывалась бы по сухому сцеплению и
             // расхождение не гасло бы, а копилось.
             if (rapier !== null) {
-                rapier.step(buttons[i], BTN_MASK, state);
+                // Доза дороги переигрывается вместе с вводом: машина,
+                // стоящая в масле, обязана получить его на КАЖДОМ шаге
+                // переигровки, иначе расхождение не гасло бы, а копилось.
+                rapier.step(buttons[i], BTN_MASK, state,
+                            road ? this.roadDose(state) : null);
                 rapier.readInto(state, track);
                 this._recordState(i);
                 rapier.saveRing(i);
@@ -1612,11 +1616,6 @@ export class NetClient {
         // и теми же числами, что на сервере (game/events.py): масло и
         // обломки правят сцепление до шага, твёрдое препятствие выталкивает
         // после. Порядок операций раздела 6.2 внутри шага не тронут.
-        let stats = this.localStats;
-        if (this.roadCount > 0) {
-            const scale = this.roadGrip(state);
-            if (scale < 1) stats = this._slippery(scale);
-        }
         const rapier = this.rapier;
         if (rapier !== null) {
             // Гонку считает Rapier: шаг делает модуль, прогресс и круги —
@@ -1624,9 +1623,16 @@ export class NetClient {
             // Пока мир не построен, предсказывать нечем: ввод всё равно
             // уходит, а машину ведёт авторитет сервера.
             if (!rapier.ready) return this._sendInput(buttons);
-            rapier.step(buttons, BTN_MASK, state);
+            // Покрытие и завалы едут дозой CarEffect, а не подменой
+            // характеристик: характеристик у модуля снаружи нет (§12.28).
+            rapier.step(buttons, BTN_MASK, state, this.roadDose(state));
             rapier.readInto(state, this.track);
         } else {
+            let stats = this.localStats;
+            if (this.roadCount > 0) {
+                const scale = this.roadGrip(state);
+                if (scale < 1) stats = this._slippery(scale);
+            }
             // step() включает шаги 14 (границы) и 16 (progress) — им передан track.
             physicsStep(state, stats, buttons, DT, this.track, state.sampleIdx);
             if (this.roadCount > 0) this.roadAfterStep(state);
