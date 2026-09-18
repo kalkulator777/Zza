@@ -47,7 +47,7 @@
 рендер headless-браузера не успевает (см. LOW_GFX). Число кадров в секунду
 здесь печатается, но ничего не значит: это скорость стенда, а не игры. Также
 не проверяются звук, бонусы и снаряды (в приёмочной гонке они выключены —
-ради предсказуемого времени прогона), больше двух игроков, переподключение
+ради предсказуемого времени прогона; ключ --items их включает), больше двух игроков, переподключение
 и потеря связи, обнаружение серверов по UDP, чат, правка настроек комнаты
 владельцем, зеркальные трассы, режим наблюдателя, поведение при плохой сети
 и мобильные браузеры. Физику и симуляцию проверяет tools/test_sim.py —
@@ -167,6 +167,7 @@ PREDICT_EPS = 0.05             # с какого расхождения корр
 PREDICT_EPS_RAPIER = 0.08
 
 PHYSICS = 'classic'
+ITEMS_ENABLED = False
 DIVERGE_MEDIAN_MAX = 0.05
 DIVERGE_P95_MAX = 0.10
 
@@ -1131,7 +1132,11 @@ def lobby_stage(report, host, guest):
         'track': RACE_TRACK,
         'laps': RACE_LAPS,
         'max_players': 4,
-        'items_enabled': False,     # приёмке нужна предсказуемая гонка
+        # Приёмке нужна предсказуемая гонка, поэтому по умолчанию бонусов
+        # нет. Ключ --items включает их: без него браузерный путь бонусов не
+        # выполняется НИ РАЗУ, а «проверено на стенде» и «проверено в игре» —
+        # разные утверждения (§12.25 проверялся именно этим ключом).
+        'items_enabled': ITEMS_ENABLED,
         'collisions': True,
         'mirror': False,
     }
@@ -1954,15 +1959,19 @@ def parse_args(argv=None):
     parser.add_argument('--physics', default=None,
                         help='чем сервер считает гонку: classic (умолчание), '
                              'shadow или rapier. Ключ уезжает в run.py как '
-                             'есть; при rapier бонусов в заезде нет (§12.24), '
-                             'и проверки бонусов прогон пропускает')
+                             'есть')
+    parser.add_argument('--items', action='store_true',
+                        help='включить бонусы в приёмочной гонке: гонка '
+                             'перестаёт быть предсказуемой, зато браузерный '
+                             'путь бонусов и снарядов выполняется')
     return parser.parse_args(argv)
 
 
 def main(argv=None):
-    global PHYSICS
+    global PHYSICS, ITEMS_ENABLED
     args = parse_args(argv)
     PHYSICS = args.physics or 'classic'
+    ITEMS_ENABLED = bool(args.items)
     report = Report(args.verbose)
 
     shots_dir = None
