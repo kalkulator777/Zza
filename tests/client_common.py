@@ -228,6 +228,29 @@ def pick_run(level, x, y, need):
     return best
 
 
+OPP_KEY = {"KeyW": "KeyS", "KeyS": "KeyW", "KeyA": "KeyD", "KeyD": "KeyA"}
+
+
+def ensure_runway(tab, level, need, speed=5.0):
+    """Встать так, чтобы впереди было не меньше need клеток чистого бега.
+
+    На карте из комнат и коридоров (этап 1) разбег может не влезть в
+    комнату целиком, зато влезает, если сначала отойти к дальней стене.
+    Возвращает (название, (dx,dy), клавиши, чистая длина).
+    """
+    me = tab.self_pos()
+    best = pick_run(level, me["x"], me["y"], need)
+    if best[3] >= need:
+        return best
+    title, (dx, dy), keys, _d = best
+    back = clear_dist(level, me["x"], me["y"], -dx, -dy, need)
+    if back > 0.2:
+        tab.hold([OPP_KEY[k] for k in keys], back / speed + 0.25)
+        time.sleep(0.25)
+    me = tab.self_pos()
+    return pick_run(level, me["x"], me["y"], need)
+
+
 def summary():
     print()
     if FAILS:

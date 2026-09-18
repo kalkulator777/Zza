@@ -105,7 +105,9 @@ function makeHandlers() {
       setStatus('соединение установлено');
       app.net.hello(($('name').value || '').trim());
       app.net.rooms();
-      app.net.startPump(() => app.input.sample());
+      // Ввод шлём только в игре: в меню и лобби сущности нет, и 30 Гц
+      // пустых сообщений — это трафик и работа сервера ни за что.
+      app.net.startPump(() => (app.screen === 'game' ? app.input.sample() : null));
     },
     onClose(wanted) {
       if (wanted) return;

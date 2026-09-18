@@ -49,19 +49,23 @@ class RoomSettings(object):
     Room.start(), больше нигде трогать не надо.
     """
 
-    __slots__ = ("seed", "mode", "floor", "map_w", "map_h")
+    __slots__ = ("seed", "mode", "floor", "map_w", "map_h", "theme")
 
     def __init__(self, seed=None, mode="coop", floor=1,
-                 map_w=gen.ROOM_W, map_h=gen.ROOM_H):
+                 map_w=gen.ROOM_W, map_h=gen.ROOM_H, theme=None):
         self.seed = seed if seed is not None else random.randrange(1, 1 << 30)
         self.mode = mode        # этап 5: кооп / испытание / ...
         self.floor = floor
         self.map_w = map_w
         self.map_h = map_h
+        # тема генератора (8.6). Источник истины по параметрам — сервер
+        # (8.7): присланное значение проверяется по списку допустимых, а не
+        # принимается на веру.
+        self.theme = theme if theme in gen.THEMES else gen.DEFAULT_THEME
 
     def describe(self):
         """Плоский вид для будущего протокола лобби (этап 5)."""
-        return {"seed": self.seed, "mode": self.mode,
+        return {"seed": self.seed, "mode": self.mode, "theme": self.theme,
                 "w": self.map_w, "h": self.map_h}
 
 
@@ -122,8 +126,9 @@ class Room(object):
         if self.phase != LOBBY:
             return False
         s = self.settings
-        grid, spawns = gen.generate(s.seed, s.floor, s.map_w, s.map_h)
-        self.world = world_mod.World(grid, s.seed, s.floor, spawns)
+        fl = gen.generate(s.seed, s.floor, s.map_w, s.map_h, s.theme)
+        self.world = world_mod.World(fl.grid, s.seed, s.floor,
+                                     fl.spawns, fl.stairs)
         for i, p in enumerate(self.players.values()):
             e = self.world.spawn_player(p.name, i)
             p.ent_id = e.id

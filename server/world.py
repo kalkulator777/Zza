@@ -13,6 +13,7 @@ import math
 
 from . import physics
 from . import proto
+from . import vis as vis_mod
 
 TICK_HZ = 30
 DT = 1.0 / TICK_HZ
@@ -61,11 +62,15 @@ class Entity(object):
 
 
 class World(object):
-    def __init__(self, grid, seed=1, floor=1, spawns=None):
+    def __init__(self, grid, seed=1, floor=1, spawns=None, stairs=None):
         self.grid = grid
         self.seed = seed
         self.floor = floor
         self.spawns = spawns or [(2.5, 2.5)]
+        self.stairs = stairs          # (tx,ty) лестницы вниз (8.1)
+        # Туман — ОДИН на комнату (4.4): считается здесь, в снапшот уходит
+        # одной строкой на всех, а не на каждого игрока (11.2).
+        self.fog = vis_mod.Fog(grid)
         self.tick = 0
         self.entities = {}
         self._next_id = 1
@@ -128,7 +133,16 @@ class World(object):
                     e.vx = 0.0
                 if hit & 2:
                     e.vy = 0.0
+        self.fog.update(self.viewers())
         return self.tick
+
+    def viewers(self):
+        """Кто светит в туман: живые игроки (4.4). Мёртвый не разведчик."""
+        out = []
+        for e in self.entities.values():
+            if e.kind == K_PLAYER and not (e.flags & F_DEAD):
+                out.append((e.id, e.x, e.y))
+        return out
 
     # --- снапшоты ----------------------------------------------------------
 
@@ -145,7 +159,9 @@ class World(object):
         if remember:
             self._sent = sent
             self._removed = []
-        return proto.snap_tail(self.tick, True, rows)
+        # входящему нужен весь туман целиком, а не изменения
+        return proto.snap_tail(self.tick, True, rows, None,
+                               self.fog.full_encoded())
 
     def snapshot_delta(self):
         """Дельта: изменившиеся сущности + список удалённых rm (5.2)."""
@@ -159,7 +175,9 @@ class World(object):
                 sent[eid] = a
         rm = self._removed
         self._removed = []
-        return proto.snap_tail(self.tick, False, rows, rm)
+        # дельта тумана — одна на комнату; None, если туман не менялся
+        return proto.snap_tail(self.tick, False, rows, rm,
+                               self.fog.delta_encoded())
 
     def stats(self):
         return {"tick": self.tick, "entities": len(self.entities)}

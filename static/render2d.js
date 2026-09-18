@@ -29,7 +29,7 @@ const COL = {
   grid: 'rgba(0,0,0,0.16)',
   wall: '#454d63',
   wallTop: '#666f88',
-  wallSide: 'rgba(0,0,0,0.42)',
+  wallSide: '#1b2028',        // боковина: тот же камень, но в тени
   shadow: 'rgba(0,0,0,0.40)',
 };
 
@@ -208,14 +208,22 @@ export function createRenderer() {
           const wx = tx0 + x, wy = ty0 + y;
           if (!solid(wx, wy)) continue;
           const px = x * tpx, py = y * tpx;
-          if (!solid(wx, wy + 1)) {          // выступ виден, только если снизу пол
+          // Верхняя грань — тот же тайл, поднятый на rise. Нижняя полоса
+          // тайла остаётся «боковиной» стены: вместе они закрывают клетку
+          // целиком, без щелей, а стена кажется выше пола.
+          if (!solid(wx, wy + 1)) {          // боковина видна, только если снизу пол
             g.fillStyle = COL.wallSide;
             g.fillRect(px, py + tpx - rise, tpx, rise);
           }
           g.fillStyle = COL.wall;
-          g.fillRect(px, py - rise, tpx, tpx - rise + 1);
-          g.fillStyle = COL.wallTop;
-          g.fillRect(px, py - rise, tpx, Math.max(2, tpx * 0.09));
+          g.fillRect(px, py - rise, tpx, tpx);
+          // Светлая кромка — только там, где стена ВЫГЛЯДЫВАЕТ из-за
+          // соседа сверху. Иначе сплошной массив стен превращается в
+          // полосатый забор: кромка рисуется на каждом тайле подряд.
+          if (!solid(wx, wy - 1)) {
+            g.fillStyle = COL.wallTop;
+            g.fillRect(px, py - rise, tpx, Math.max(2, tpx * 0.09));
+          }
         }
       }
     },

@@ -24,8 +24,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from client_common import (BROWSER_ARGS, CHROMIUM, Server, Tab, check, note,   # noqa: E402
-                           summary, uptime)
+from client_common import (BROWSER_ARGS, CHROMIUM, Server, Tab, check,   # noqa: E402
+                           clear_dist, note, summary, uptime)
 
 # Допуск на совпадение координат между экранами.
 #
@@ -102,7 +102,21 @@ def main():
 
         # --- движение: расходятся в разные стороны ---------------------
         a.hold(["KeyD"], 1.0)      # A вправо
-        b.hold(["KeyS"], 1.0)      # B вниз
+
+        # Пока B бежит, A обязана видеть её движение, а не замерший силуэт:
+        # снимаем два кадра прямо посреди бега.
+        b.page.keyboard.down("KeyS")
+        time.sleep(0.3)
+        seen1 = find_by_id(a.others(), sb0["id"])
+        time.sleep(0.5)
+        seen2 = find_by_id(a.others(), sb0["id"])
+        b.page.keyboard.up("KeyS")
+        moved = (seen1 and seen2 and
+                 math.hypot(seen2["x"] - seen1["x"], seen2["y"] - seen1["y"]))
+        check(bool(moved) and moved > 1.0,
+              "A видит движение B прямо во время бега, а не застывший силуэт",
+              "чужая сущность проехала %.3f клетки за 0.5 с" % (moved or 0.0))
+
         time.sleep(0.4)            # дать снапшотам и интерполяции устояться
 
         sa, sb = a.self_pos(), b.self_pos()
@@ -149,17 +163,39 @@ def main():
                   "между ними %.3f клетки" % math.hypot(sa["x"] - sb["x"], sa["y"] - sb["y"]))
 
         # --- стены держат ----------------------------------------------
+        # Сколько клеток влево можно пройти, считаем ПО КАРТЕ, которую
+        # прислал сервер: так проверка не зависит от того, какой генератор
+        # этажа стоит сегодня.
+        level = a.js("window.__zza.level()")
         before = a.self_pos()
-        a.hold(["KeyA"], 2.5)            # влево, в стену по периметру
-        time.sleep(0.4)
-        after = a.self_pos()
-        # рамка карты — тайл 0, радиус игрока 0.35 => левее 1.35 не пройти
-        check(after["x"] >= 1.30, "стена слева остановила A, а не пропустила",
-              "x: %.3f -> %.3f (предел 1.35)" % (before["x"], after["x"]))
-        check(after["x"] < before["x"] - 1.0, "A всё-таки доехала до стены",
-              "прошла %.3f клетки" % (before["x"] - after["x"]))
-        check(abs(after["y"] - before["y"]) < 0.2, "бег в стену не увёл по другой оси",
-              "y: %.3f -> %.3f" % (before["y"], after["y"]))
+        # Берём ближайшую стену по осям: так проверка и быстрая, и точная.
+        wall = None
+        for title, (wdx, wdy), wkeys in (("влево", (-1, 0), ["KeyA"]),
+                                         ("вправо", (1, 0), ["KeyD"]),
+                                         ("вверх", (0, -1), ["KeyW"]),
+                                         ("вниз", (0, 1), ["KeyS"])):
+            d = clear_dist(level, before["x"], before["y"], wdx, wdy, 18.0)
+            if d >= 1.5 and d < 18.0 and (wall is None or d < wall[3]):
+                wall = (title, (wdx, wdy), wkeys, d)
+        if wall is None:
+            check(False, "нашлась стена, в которую можно упереться")
+        else:
+            title, (wdx, wdy), wkeys, want = wall
+            a.hold(wkeys, want / 5.0 + 1.0)       # бег 5 кл/с (4.2) + запас
+            time.sleep(0.4)
+            after = a.self_pos()
+            went = (after["x"] - before["x"]) * wdx + (after["y"] - before["y"]) * wdy
+            drift = abs((after["x"] - before["x"]) * wdy - (after["y"] - before["y"]) * wdx)
+            check(after["x"] >= 1.30 and after["y"] >= 1.30 and
+                  after["x"] <= level["w"] - 1.30 and after["y"] <= level["h"] - 1.30,
+                  "A не вышла за рамку карты",
+                  "x=%.3f y=%.3f, рамка + радиус = 1.35" % (after["x"], after["y"]))
+            check(abs(went - want) < 0.30,
+                  "стена остановила A ровно там, где она нарисована",
+                  "бег %s: прошла %.3f клетки, по карте свободно %.3f"
+                  % (title, went, want))
+            check(drift < 0.2, "бег в стену не увёл по другой оси",
+                  "снос %.3f клетки" % drift)
 
         # --- отладочный оверлей ----------------------------------------
         hud = a.js("document.getElementById('hud').textContent")
@@ -173,12 +209,27 @@ def main():
             check(not errs, "в консоли вкладки %s нет ошибок (меню, лобби, игра)" % tab.label,
                   "; ".join(errs[:3]) if errs else "0 сообщений уровня error")
 
+        # --- флаг OFFLINE (4.3, бит 2) ----------------------------------
+        # Закрываем вкладку B: её сущность обязана остаться в мире A, но
+        # с битом OFFLINE, чтобы напарник гас, а не стоял столбом.
+        b.close()
+        t0 = time.time()
+        off = None
+        while time.time() - t0 < 3.0:
+            off = find_by_id(a.others(), sb["id"])
+            if off is not None and (off["flags"] & 2):
+                break
+            time.sleep(0.1)
+        check(off is not None, "сущность отвалившегося игрока не исчезла мгновенно")
+        check(off is not None and (off["flags"] & 2) != 0,
+              "A видит у B флаг OFFLINE (бит 2) и гасит его",
+              "flags=%s" % (off and off["flags"]))
+
         note("трафик", "A: снапшотов %d, тик сервера %d"
              % (a.js("window.__zza.snaps()"), a.js("window.__zza.tick()")))
         uptime()
 
         a.close()
-        b.close()
         browser.close()
 
     return summary()
