@@ -14,6 +14,10 @@ const $ = (id) => document.getElementById(id);
 
 const app = {
   net: null, world: null, input: null, render: null,
+  // Какой бэкенд рендера сейчас работает и на какой канве. ДВУМЕРНЫЙ ПО
+  // УМОЛЧАНИЮ — он принят, на нём стоят чужие проверки, и менять это
+  // молча нельзя (DESIGN.md 7.1: бэкенда два, выбор по замеру 2.1).
+  backend: '2d', canvas: null, backendBusy: false,
   screen: 'menu',
   name: '',
   room: '',
@@ -48,6 +52,19 @@ function frameHash(data) {
     h ^= data[i + 2]; h = Math.imul(h, 16777619);
   }
   return h >>> 0;
+}
+
+// Пиксели текущего кадра. У канвы ровно ОДИН контекст на всю жизнь: если
+// на ней работает WebGL, getImageData с неё не получить в принципе.
+// Поэтому пиксели спрашиваются у бэкенда, а путь двумерного остаётся
+// побитно прежним — у него readPixels нет, и ветка та же, что была.
+function readPix(x, y, w, h) {
+  if (app.render && app.render.readPixels) return app.render.readPixels(x, y, w, h);
+  return $('c').getContext('2d').getImageData(x, y, w, h).data;
+}
+
+function activeCanvas() {
+  return app.canvas || $('c');
 }
 
 // ---------------------------------------------------------------- экраны
@@ -217,8 +234,7 @@ function frame(now) {
   // нарисовано. Только для проверок; в игре выключено.
   const wt = app.watch;
   if (wt.on) {
-    const g = $('c').getContext('2d');
-    const d = g.getImageData(wt.x, wt.y, wt.w, wt.h).data;
+    const d = readPix(wt.x, wt.y, wt.w, wt.h);
     wt.out.push({ now: now, rt: view.tick, lt: app.world.latestTick,
                   h: frameHash(d) });
     if (wt.out.length >= wt.max) wt.on = false;
@@ -256,12 +272,74 @@ function updateHud(view) {
     (view.interp ? '' : '   [ИНТЕРПОЛЯЦИЯ ВЫКЛЮЧЕНА]');
 }
 
+// ------------------------------------------------------- бэкенд рендера
+//
+// DESIGN.md 7.1: бэкендов два, оба поверх одного состояния, выбор делается
+// по замеру 2.1 на целевой машине. Здесь — сам переключатель.
+//
+// ТРИ ВЕЩИ, КОТОРЫЕ ЗДЕСЬ НЕ СЛУЧАЙНЫ.
+//
+// 1. Трёхмерный бэкенд грузится ДИНАМИЧЕСКИМ import, а не обычным. three.js
+//    это 700 КБ двумя файлами; статический import тащил бы их на каждый
+//    старт игры, включая тот, где никто 3D не включит, — а 2.6 даёт на весь
+//    старт 5 секунд. Пока кнопку не нажали, эти байты не запрашиваются.
+// 2. Канва меняется вместе с бэкендом. У канвы ровно один контекст на всю
+//    жизнь элемента: getContext('2d') после getContext('webgl2') вернёт
+//    null, и наоборот. Один элемент на два бэкенда — это молча чёрный экран.
+// 3. Ввод перевешивается на новую канву. input.js берёт прицел из
+//    getBoundingClientRect() своей канвы и отбрасывает нажатия не по ней
+//    (e.target !== canvas); оставить его на спрятанной канве значит
+//    получить игру, в которой мышь не работает, а клавиши работают.
+
+async function setBackend(name) {
+  if (name !== '2d' && name !== '3d') return app.backend;
+  if (name === app.backend || app.backendBusy) return app.backend;
+  app.backendBusy = true;
+  try {
+    let make;
+    if (name === '3d') {
+      const mod = await import('./render3d.js');
+      make = mod.createRenderer;
+    } else {
+      make = createRenderer;
+    }
+    const opts = { quality: app.render.quality || 'high',
+                   tilePx: app.render.tilePx || 48 };
+    const oldCanvas = app.canvas;
+    const canvas = name === '3d' ? $('c3') : $('c');
+
+    app.render.dispose();
+    canvas.style.display = 'block';
+    if (oldCanvas !== canvas) oldCanvas.style.display = 'none';
+
+    app.render = make();
+    app.canvas = canvas;
+    app.backend = name;
+    app.render.init(canvas, opts);
+    app.render.resize(window.innerWidth, window.innerHeight);
+
+    app.input.detach();
+    app.input.canvas = canvas;
+    app.input.attach();
+    app.input.enabled = (app.screen === 'game');
+
+    $('backendBtn').textContent = name === '3d' ? '3D' : '2D';
+  } catch (e) {
+    setStatus('бэкенд ' + name + ' не поднялся: ' + e, true);
+    throw e;
+  } finally {
+    app.backendBusy = false;
+  }
+  return app.backend;
+}
+
 // ---------------------------------------------------------------- старт
 
 export function boot() {
   app.world = new WorldState();
   app.render = createRenderer();
   const canvas = $('c');
+  app.canvas = canvas;
   app.render.init(canvas, { quality: 'high', tilePx: 48 });
   app.input = new Input(canvas, (sx, sy) => app.render.screenToWorld(sx, sy)).attach();
   app.net = new Net(makeHandlers());
@@ -270,6 +348,14 @@ export function boot() {
   $('joinBtn').onclick = () => doJoin(($('code').value || '').trim().toUpperCase());
   $('refreshBtn').onclick = () => app.net.rooms();
   $('readyBtn').onclick = doReady;
+  $('backendBtn').onclick = () => setBackend(app.backend === '2d' ? '3d' : '2d');
+  // Клавиша B свободна: input.js разбирает WASD/стрелки, F, R, E, Q,
+  // Shift и пробел — B среди них нет.
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'KeyB' && app.screen === 'game' && !e.repeat) {
+      setBackend(app.backend === '2d' ? '3d' : '2d');
+    }
+  });
   $('code').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') $('joinBtn').click();
   });
@@ -312,6 +398,11 @@ export function boot() {
     rtt: () => app.net.rtt,
     fps: () => app.fps,
     stats: () => app.render.stats(),
+    // --- бэкенд рендера (tests/client_3d.py) --------------------------
+    setBackend: (v) => setBackend(v),
+    getBackend: () => app.backend,
+    backendName: () => app.render.name,
+
     setInterp: (v) => { app.world.interp = !!v; return app.world.interp; },
     getInterp: () => app.world.interp,
     record: (n) => { app.rec = { on: true, want: n, samples: [] }; },
@@ -356,7 +447,7 @@ export function boot() {
     // Именно так отвечают на вопрос «на каком тике кадр изменился»: питон
     // опросом из-за границы процесса такого разрешения не даёт вовсе.
     watch: (x, y, w, h, n) => {
-      const c = $('c');
+      const c = activeCanvas();
       x = Math.max(0, Math.min(c.width - 1, Math.round(x)));
       y = Math.max(0, Math.min(c.height - 1, Math.round(y)));
       w = Math.max(1, Math.min(c.width - x, Math.round(w)));
@@ -389,7 +480,7 @@ export function boot() {
       return { w: L.w, h: L.h, cells: Array.from(f), msgs: app.world.visMsgs };
     },
     worldToScreen: (x, y) => app.render.worldToScreen(x, y),
-    canvasSize: () => ({ w: $('c').width, h: $('c').height }),
+    canvasSize: () => ({ w: activeCanvas().width, h: activeCanvas().height }),
 
     // Пиксели НАСТОЯЩЕГО кадра: «видно» — это то, что попало на канву, а
     // не то, что лежит в модели мира. dark считает пиксели, у которых
@@ -397,13 +488,12 @@ export function boot() {
     // красный в коробке (по нему видно врага: #d16a6a это r=209, а самый
     // красный кусок подземелья — стена #666f88, r=102).
     pixels: (x, y, w, h, thresh) => {
-      const c = $('c');
-      const g = c.getContext('2d');
+      const c = activeCanvas();
       x = Math.max(0, Math.min(c.width - 1, Math.round(x || 0)));
       y = Math.max(0, Math.min(c.height - 1, Math.round(y || 0)));
       w = Math.max(1, Math.min(c.width - x, Math.round(w || c.width)));
       h = Math.max(1, Math.min(c.height - y, Math.round(h || c.height)));
-      const d = g.getImageData(x, y, w, h).data;
+      const d = readPix(x, y, w, h);
       const t = thresh === undefined ? 10 : thresh;
       let dark = 0, maxCh = 0, maxR = 0, sum = 0, lum = 0, bright = 0;
       for (let i = 0; i < d.length; i += 4) {
@@ -430,8 +520,7 @@ export function boot() {
     // сотен клеток; по одному вызову на клетку это сотни переходов границы
     // процесса и десятки секунд на ровном месте.
     boxesMean: (list, thresh) => {
-      const c = $('c');
-      const g = c.getContext('2d');
+      const c = activeCanvas();
       const t = thresh === undefined ? 10 : thresh;
       const out = [];
       for (let k = 0; k < list.length; k++) {
@@ -440,7 +529,7 @@ export function boot() {
         const y = Math.max(0, Math.min(c.height - 1, Math.round(q[1])));
         const w = Math.max(1, Math.min(c.width - x, Math.round(q[2])));
         const h = Math.max(1, Math.min(c.height - y, Math.round(q[3])));
-        const d = g.getImageData(x, y, w, h).data;
+        const d = readPix(x, y, w, h);
         let sum = 0, lum = 0, dark = 0, bright = 0, maxCh = 0;
         for (let i = 0; i < d.length; i += 4) {
           const r = d[i], gg = d[i + 1], b = d[i + 2];
@@ -488,13 +577,23 @@ export function boot() {
     // одинаково в обоих сравниваемых замерах и потому из отношения уходит.
     benchDrawFlush: (n) => {
       const view = app.world.buildView(performance.now());
-      const g = $('c').getContext('2d');
+      // Слив у каждого бэкенда свой, а смысл один: заставить браузер
+      // ДОРИСОВАТЬ накопленное. У канвы это чтение одного пикселя, у WebGL
+      // — readPixels одного пикселя (он тоже синхронный и тоже упирается в
+      // конец конвейера). Без слива меряется подача команд, а не закраска.
+      let flush;
+      if (app.render.flush) {
+        flush = () => app.render.flush();
+      } else {
+        const g = $('c').getContext('2d');
+        flush = () => g.getImageData(0, 0, 1, 1);
+      }
       app.render.draw(view, view.alpha);
-      g.getImageData(0, 0, 1, 1);
+      flush();
       const t0 = performance.now();
       for (let i = 0; i < n; i++) {
         app.render.draw(view, view.alpha);
-        g.getImageData(0, 0, 1, 1);
+        flush();
       }
       return (performance.now() - t0) / n;
     },

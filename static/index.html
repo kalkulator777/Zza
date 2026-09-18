@@ -8,7 +8,14 @@
 <style>
   html, body { margin:0; padding:0; height:100%; background:#05070c; color:#d8dde5;
                font:14px/1.5 system-ui, "Segoe UI", sans-serif; overflow:hidden; }
-  #c { display:block; position:fixed; inset:0; background:#05070c; cursor:crosshair; }
+  /* Две канвы: у канвы ровно один контекст на всю жизнь, и 2D-контекст с
+     WebGL на одном элементе не уживаются. Поэтому у каждого бэкенда своя,
+     а видна всегда только одна. Двумерная остаётся по умолчанию. */
+  #c, #c3 { display:block; position:fixed; inset:0; background:#05070c; cursor:crosshair; }
+  #c3 { display:none; }
+  #backendBtn { position:fixed; right:8px; top:6px; z-index:6; padding:4px 10px;
+                font:12px/1.4 ui-monospace, Consolas, monospace; opacity:.72; }
+  #backendBtn:hover { opacity:1; }
   .panel { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
            background:#05070c; z-index:10; }
   .card { width:min(560px, calc(100% - 32px)); background:#0d1117; border:1px solid #232a35;
@@ -46,8 +53,10 @@
 <!-- Игровой экран -->
 <div id="game" style="display:none">
   <canvas id="c"></canvas>
+  <canvas id="c3"></canvas>
+  <button id="backendBtn" title="Переключить бэкенд рендера (клавиша B)">2D</button>
   <div id="hud"></div>
-  <div id="help">WASD / стрелки — движение · мышь — прицел · ЛКМ или F — удар · ПКМ или R — выстрел · Shift или пробел — рывок · E — действие · Q — предмет</div>
+  <div id="help">WASD / стрелки — движение · мышь — прицел · ЛКМ или F — удар · ПКМ или R — выстрел · Shift или пробел — рывок · E — действие · Q — предмет · B — 2D/3D</div>
 </div>
 
 <!-- Меню -->
