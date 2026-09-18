@@ -578,8 +578,8 @@ export function createRenderer() {
       }
 
       // Замах — ПОД телом: тело сверху, сектор вокруг него.
-      if (false && this.combat && this.windup && !dead && (e.flags & F_WINDUP)) {
-        this._drawWindup(e, sx, sy, r);   // ПОДСАЖЕННАЯ ПОЛОМКА
+      if (this.combat && this.windup && !dead && (e.flags & F_WINDUP)) {
+        this._drawWindup(e, sx, sy, r);
       }
       if (this.combat && !dead && (e.flags & F_DASH)) {
         this._drawDash(e, sx, sy, r);

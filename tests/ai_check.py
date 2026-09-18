@@ -350,7 +350,7 @@ def t_noise():
         near.ai_alert = 0
         far.ai_alert = 0
         if action == "shot":
-            p.btn = 8                  # BTN_ITEM: снаряд (см. combat.begin)
+            p.btn = 8                  # BTN_SHOOT: снаряд (см. combat.begin)
         elif action == "melee":
             p.btn = 1                  # BTN_ATTACK
         elif action == "dash":

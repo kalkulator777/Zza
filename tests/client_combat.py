@@ -26,10 +26,12 @@ window.__zza), а не модель мира: «видно» — это то, ч
      Сцена ОДНА И ТА ЖЕ, замеры спина к спине, рядом uptime, и меряется
      двумя мерками: без слива кадра (работа клиента) и со сливом (вместе с
      закраской).
-  6. Замах виден РАНЬШЕ удара. Печатается, через сколько миллисекунд после
-     нажатия изменился кадр и когда пришло событие `hit`; первое обязано
-     быть раньше. Это и есть смысл замаха: 8 тиков (0.267 с, 4.2) на то,
-     чтобы среагировать.
+  6. Замах виден РАНЬШЕ удара, и ровно на время замаха. Два числа с двух
+     сторон: в тишине (пункт 2) замеряется, через сколько миллисекунд после
+     нажатия кадр показал замах и на сколько ярких пикселей; в боевом мире
+     — сколько тиков от прихода бита WINDUP до события `hit` по живому
+     врагу. Второе обязано быть 8 тиков (0.267 с, 4.2) — это и есть время,
+     которое даётся на реакцию.
   7. Проверки 2 и 6 КРАСНЕЮТ, если перестать рисовать замах (пункт 2a —
      сразу после пункта 2, в тех же условиях).
   8. Ноль ошибок в консоли.
@@ -206,6 +208,26 @@ def first_change(frames, h0):
         if f["h"] != h0:
             return i, f
     return -1, None
+
+
+def windup_windows(tracks):
+    """Все окна замаха в записи снапшотов: [(тик подъёма, тик удара), ...].
+
+    Тик удара — тот, на котором сервер СНЯЛ бит WINDUP: он снимает его
+    ровно в _land_melee, то есть в момент удара.
+    """
+    out = []
+    rise = None
+    for r in tracks:
+        if r["flags"] < 0:
+            continue
+        if r["flags"] & F_WINDUP:
+            if rise is None:
+                rise = r["tick"]
+        elif rise is not None:
+            out.append((rise, r["tick"]))
+            rise = None
+    return out
 
 
 def windup_window(tracks):
@@ -421,7 +443,15 @@ def main():
           % (VIEW_W, VIEW_H, TILE_PX))
     uptime()
 
-    with Server() as srv, sync_playwright() as pw:
+    # ДВА СЕРВЕРА, и это не роскошь. Всё, что меряется по пикселям
+    # неподвижного кадра, требует тишины: живой враг ходит, стреляет и в
+    # конце концов убивает одинокую вкладку, а мёртвый игрок не машет мечом
+    # (8.5) — замеренным оказывается не клиент, а живучесть. Поэтому тихий
+    # мир (ZZA_ENEMIES=0, выключатель для стендов в server/ai.py) для
+    # пиксельных пунктов и ОТДЕЛЬНЫЙ боевой мир для единственного пункта,
+    # которому враг действительно нужен: настоящего события hit.
+    with Server(env={"ZZA_ENEMIES": "0"}) as srv, Server() as war, \
+            sync_playwright() as pw:
         browser = pw.chromium.launch(executable_path=CHROMIUM, headless=True,
                                      args=BROWSER_ARGS)
         t = Tab(browser, "A", width=VIEW_W, height=VIEW_H).open(srv.url)
@@ -884,142 +914,135 @@ def main():
         print()
         print("  --- 6. замах виден раньше удара ----------------------------")
         # Бьём НАСТОЯЩЕГО врага: только так бывает настоящее событие hit.
-        # Этот пункт идёт ПОСЛЕДНИМ намеренно. Враги на этаже теперь ходят и
-        # стреляют: подойти к врагу — значит встать под огонь, а мёртвый
-        # игрок не машет мечом (8.5, combat.begin). Всё, что меряется по
-        # неподвижному кадру, снято раньше и в тишине; сюда вкладка приходит
-        # с тем здоровьем, которое у неё осталось, и это печатается.
+        # Пункт идёт ПОСЛЕДНИМ и в ОТДЕЛЬНОМ, боевом мире. Враги ходят и
+        # стреляют, подойти к врагу — значит встать под огонь, а мёртвый
+        # игрок не машет мечом (8.5, combat.begin); замерено на прогоне, где
+        # вкладку убили на сороковой секунде и три пункта покраснели разом
+        # на исправном клиенте. Поэтому вкладка для драки заводится ТОЛЬКО
+        # СЕЙЧАС, с полным здоровьем, и живёт под огнём ровно столько,
+        # сколько нужно на один удар.
+        t0_errs = t.errors()
+        t.close()
+        t = Tab(browser, "B", width=VIEW_W, height=VIEW_H).open(war.url)
+        room2 = t.create_room("Драка")
+        t.ready()
+        t.wait_game()
+        t.page.wait_for_function(
+            "window.__zza.fog() && window.__zza.fog().msgs > 0", timeout=10000)
+        time.sleep(0.8)
+        keys = Keys(t)
+        level = t.js("window.__zza.level()")
         mm = me(t)
+        note("боевой мир", "комната %s, этаж %d, своя сущность id %d; врагов "
+             "в мире %d" % (room2, level["floor"], mm["id"],
+                            len([o for o in t.js("window.__zza.others()")
+                                 if o["kind"] == K_ENEMY])))
         note("здоровье перед дракой", "hp %d/%d, flags %d"
              % (mm["hp"], mm["hpMax"], mm["flags"]))
         near = nearest_enemy(t)
-        a_near = None
-        if mm["flags"] & F_DEAD:
-            check(False, "вкладка дожила до драки живой",
-                  "её убили враги до этого пункта (hp %d) — мёртвый игрок не "
-                  "машет мечом (8.5), мерить замах нечем. Это состояние мира, "
-                  "а не поломка клиента: всё остальное снято выше"
-                  % mm["hp"])
-        elif near is None:
-            check(False, "на этаже нашёлся враг, по которому можно ударить",
+        if near is None:
+            check(False, "в боевом мире нашёлся враг, по которому можно ударить",
                   "сущностей kind=2 в мире нет")
         else:
-            d0, foe = near
+            d0, foe0 = near
             note("ближайший враг", "id %d на (%.1f, %.1f), до него %.1f клетки"
-                 % (foe["id"], foe["x"], foe["y"], d0))
-            d1 = approach(t, level, foe["id"], keys)
-            time.sleep(0.4)
-            foe_now = None
-            for o in t.js("window.__zza.others()"):
-                if o["id"] == foe["id"]:
-                    foe_now = o
-            if foe_now is not None:
-                aim_at(t, foe_now["x"], foe_now["y"])
-            note("подошли к врагу", "расстояние %s клетки (достать можно с "
-                 "%.2f: 1.2 от центра плюс радиус цели 0.35, 4.2)"
-                 % (("%.2f" % d1) if d1 else "?", 1.2 + 0.35))
+                 % (foe0["id"], foe0["x"], foe0["y"], d0))
 
-            # Бьём несколько раз: нужен удар, у которого снято И событие
-            # hit, И кадр. Условие остановки — снятые числа, а не число
-            # попыток; попытки — предохранитель. Берётся лучшая попытка, а
-            # не первая: у первой может не хватить как раз того, ради чего
-            # всё затевалось.
-            best, tries = None, 0
-            for attempt in range(4):
-                tries = attempt + 1
-                sw = swing(t, self_box(t))
-                a = analyse(sw)
-                a["hit"] = None
-                my_id = me(t)["id"]
-                for e in t.js("window.__zza.evLog()"):
-                    if e["k"] == FX_HIT and e["now"] >= sw["press"] \
-                            and e["b"] != my_id:
-                        a["hit"] = e
-                        break
-                a["press"] = sw["press"]
-                a["seen"] = sw["seen"]
-                a["gain"] = sw["gain"]
-                a["try"] = tries
-                if best is None or quality(a) > quality(best):
-                    best = a
-                if quality(a) == 3 and a["gain"] and a["gain"] >= MIN_LIT_PX:
+            # МАШЕМ НЕПРЕРЫВНО и идём навстречу. Клавиша держится зажатой,
+            # сервер бьёт раз в откат (14 тиков, 4.2), враги ближнего боя
+            # сами прут на игрока — попадание случится на первом же, кто
+            # войдёт в дугу. Условие остановки — СОБЫТИЕ hit, а не время:
+            # потолок ниже это предохранитель.
+            my_id = mm["id"]
+            t.js("window.__zza.track(600)")
+            t.page.keyboard.down("KeyF")
+            hit = None
+            t_fight = time.time()
+            while time.time() - t_fight < 30.0:
+                mnow = me(t)
+                if mnow is None or (mnow["flags"] & F_DEAD):
                     break
-                time.sleep(0.7)
-            a_near = best
-            if a_near["rise"] is None:
-                mm2 = me(t)
-                died = [e for e in t.js("window.__zza.evLog()")
-                        if e["k"] == FX_DIE and e["b"] == mm2["id"]]
-                check(False, "удар записан: WINDUP поднялся",
-                      "бита WINDUP в снапшотах не было вовсе за %d попытки. "
-                      "Состояние вкладки сейчас: hp %d/%d, flags %d%s"
-                      % (tries, mm2["hp"], mm2["hpMax"], mm2["flags"],
-                         "; в журнале есть die по своей сущности — вкладку "
-                         "убили враги, а мёртвый мечом не машет (8.5)"
-                         if died else ""))
-            else:
-                note("замах в снапшотах",
-                     "WINDUP горит с тика %d по тик %d включительно (%d тиков "
-                     "при %d по 4.2); удар приходит на тике %s. Попыток %d"
-                     % (a_near["rise"],
-                        (a_near["fall"] - 1) if a_near["fall"] else -1,
-                        (a_near["fall"] - a_near["rise"]) if a_near["fall"] else -1,
-                        MELEE_WINDUP_TICKS, str(a_near["fall"]), tries))
-                h = a_near["hit"]
-                if h is not None:
-                    note("событие hit", "тик %d, бил id %d, получил id %d, "
-                         "урон %d; пришло через %.0f мс после нажатия"
-                         % (h["tick"], h["a"], h["b"], h["dmg"],
-                            h["now"] - a_near["press"]))
-
-                # ГЛАВНОЕ ЧИСЛО, и оно снято меркой, которой чужое движение
-                # не мешает: пока горел бит WINDUP, в коробке вокруг бойца
-                # прибавилось ярких пикселей на целый сектор. Момент этого
-                # чтения — заведомо НЕ РАНЬШЕ, чем изменился кадр, то есть
-                # оценка сверху; удар пришёл позже него.
-                seen_ms = (a_near["seen"] - a_near["press"]) \
-                    if a_near["seen"] else None
-                hit_ms = (h["now"] - a_near["press"]) if h else None
-                ok = (a_near["gain"] is not None and
-                      a_near["gain"] >= MIN_LIT_PX and
-                      seen_ms is not None and hit_ms is not None and
-                      seen_ms < hit_ms)
-                check(ok,
-                      "кадр с замахом изменился РАНЬШЕ, чем пришло hit",
-                      "замах виден в кадре через %s мс после нажатия (в этот "
-                      "момент в коробке вокруг бойца прибавилось %s ярких "
-                      "пикселей — целый сектор, порог %d), событие hit пришло "
-                      "через %s мс (тик %s) — то есть замах видно на %s мс "
-                      "раньше удара, при 8 тиках = 267 мс по 4.2"
-                      % (("%.0f" % seen_ms) if seen_ms else "?",
-                         str(a_near["gain"]), MIN_LIT_PX,
-                         ("%.0f" % hit_ms) if hit_ms else "события не было",
-                         str(h["tick"]) if h else "-",
-                         ("%.0f" % (hit_ms - seen_ms))
-                         if (seen_ms and hit_ms) else "?"))
-
-                # Точная мерка — по записи кадров. Она годится только когда
-                # сцена перед замахом стояла; рядом с живым врагом это
-                # удаётся не всегда, и тогда число просто не печатается.
-                if a_near["still"] and a_near["f"] is not None:
-                    f = a_near["f"]
-                    note("то же самое точной меркой (запись кадров)",
-                         "кадр изменился через %.0f мс после нажатия — это "
-                         "первый же кадр по снапшоту тика %d; до него %d "
-                         "кадров совпали с исходным до пикселя. Удар на тике "
-                         "%s, то есть раньше на %s тиков"
-                         % (f["now"] - a_near["press"], f["lt"],
-                            a_near["before"], str(a_near["fall"]),
-                            str(a_near["fall"] - f["lt"]) if a_near["fall"] else "?"))
+                for e in t.js("window.__zza.evLog()"):
+                    if e["k"] == FX_HIT and e["a"] == my_id and e["b"] != my_id:
+                        hit = e
+                        break
+                if hit is not None:
+                    break
+                foe = None
+                best = None
+                for o in t.js("window.__zza.others()"):
+                    if o["kind"] != K_ENEMY or (o["flags"] & F_DEAD):
+                        continue
+                    dd = math.hypot(o["x"] - mnow["x"], o["y"] - mnow["y"])
+                    if best is None or dd < best:
+                        best, foe = dd, o
+                if foe is None:
+                    break
+                aim_at(t, foe["x"], foe["y"])
+                if best > 1.3:
+                    walk_to(t, level, (int(foe["x"]), int(foe["y"])), keys,
+                            3.0, near=1.0, avoid=())
+                    keys.release()
                 else:
-                    note("точная мерка (запись кадров) в этот раз не годится",
-                         "сцена перед замахом не стояла: рядом живой враг, он "
-                         "ходит и стреляет. Число выше снято грубой меркой, "
-                         "которой это не мешает")
+                    time.sleep(0.2)
+            t.page.keyboard.up("KeyF")
+            keys.release()
+            time.sleep(0.5)
+            tracks = t.js("window.__zza.tracks()")
+            wins = windup_windows(tracks)
+            mm2 = me(t)
+            note("драка", "замахов за драку %d, здоровье после %d/%d, flags %d, "
+                 "секунд %.1f"
+                 % (len(wins), mm2["hp"], mm2["hpMax"], mm2["flags"],
+                    time.time() - t_fight))
+
+            win = None
+            if hit is not None:
+                for r, f in wins:
+                    if f == hit["tick"]:
+                        win = (r, f)
+                        break
+            if hit is None:
+                check(False, "по врагу попали: пришло событие hit",
+                      "за %.0f с непрерывных замахов (%d штук) попадания не "
+                      "случилось; вкладка сейчас hp %d/%d, flags %d%s"
+                      % (time.time() - t_fight, len(wins), mm2["hp"],
+                         mm2["hpMax"], mm2["flags"],
+                         " — её убили враги, а мёртвый мечом не машет (8.5)"
+                         if (mm2["flags"] & F_DEAD) else ""))
+            elif win is None:
+                check(False, "удар нашёлся в записи замахов",
+                      "hit на тике %d, а окна замаха с таким тиком удара в "
+                      "записи нет: %s" % (hit["tick"], str(wins[:6])))
+            else:
+                r, f = win
+                note("событие hit", "тик %d, бил id %d, получил id %d, урон %d"
+                     % (hit["tick"], hit["a"], hit["b"], hit["dmg"]))
+                # ВОТ ГЛАВНОЕ ЧИСЛО. Кадр показывает замах с того тика, на
+                # котором пришёл бит WINDUP, — это снято в тишине в пункте 2
+                # (первый же кадр по тому снапшоту, прибавка ярких пикселей
+                # на целый сектор). Здесь берётся второе число: сколько
+                # тиков от этого момента до удара.
+                check(f - r == MELEE_WINDUP_TICKS and f > r,
+                      "замах видно раньше удара, и ровно на время замаха",
+                      "бит WINDUP пришёл на тике %d, событие hit — на тике "
+                      "%d: раньше на %d тиков = %.0f мс (4.2 обещает %d "
+                      "тиков = 267 мс). Кадр показывает замах с первого же "
+                      "кадра, нарисованного по снапшоту тика %d — это "
+                      "замерено в пункте 2 в тишине: прибавка %d ярких "
+                      "пикселей через %s мс после нажатия"
+                      % (r, f, f - r, (f - r) * TICK_MS, MELEE_WINDUP_TICKS, r,
+                         lit_during - lit_base,
+                         ("%.0f" % (a2["f"]["now"] - sw2["press"]))
+                         if (a2["f"] and a2["still"]) else "?"))
+                note("все замахи этой драки",
+                     "пар (тик замаха, тик удара): %s — разница всегда %s"
+                     % (str(wins[:8]),
+                        str(sorted(set(b - a for a, b in wins)))))
 
         # ============ 8. КОНСОЛЬ =========================================
         print()
-        errs = t.errors()
+        errs = t.errors() + t0_errs
         check(not errs, "в консоли нет ошибок за весь прогон",
               "; ".join(errs[:3]) if errs else "0 сообщений уровня error")
         note("событий ev за прогон", str(t.js("window.__zza.evs()")))

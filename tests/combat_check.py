@@ -236,7 +236,7 @@ def _fly(w, shooter, limit=80):
     когда проверка меряет не то число, которое ей нужно (раздел 10).
     """
     w.events[:] = []
-    press(w, shooter, proto.BTN_ITEM)
+    press(w, shooter, proto.BTN_SHOOT)
     sid = None
     for e in w.entities.values():
         if e.kind == W.K_SHOT:
@@ -475,7 +475,7 @@ def test_events():
     ok_hit = "hit" in kinds
     ok_die = "die" in kinds
     w.events[:] = []
-    press(w, p, proto.BTN_ITEM)
+    press(w, p, proto.BTN_SHOOT)
     kinds2 = [k for _t, k, _kw in w.events]
     note("после выстрела", "%s" % kinds2)
     check(ok_hit and ok_die and "shot" in kinds2,

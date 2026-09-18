@@ -33,8 +33,9 @@ VEL_DIGITS = 2   # 5.2: скорости до 2 знаков
 BTN_ATTACK = 1
 BTN_DASH = 2
 BTN_USE = 4
-BTN_ITEM = 8
-BTN_MASK = BTN_ATTACK | BTN_DASH | BTN_USE | BTN_ITEM
+BTN_SHOOT = 8            # дальняя атака
+BTN_ITEM = 16            # предмет; бит 16 прежняя маска срезала целиком
+BTN_MASK = BTN_ATTACK | BTN_DASH | BTN_USE | BTN_SHOOT | BTN_ITEM
 
 MAX_NAME = 24
 MAX_AIM = 4096.0  # прицел за пределами любой разумной карты — мусор

@@ -193,7 +193,7 @@ def begin(w, e):
         start_melee(w, e)
     # Отдельного бита под дальний бой в 5.1 нет: 1 атака, 2 рывок, 4 действие,
     # 8 предмет. Снаряд повешен на 8 — см. правку контракта в отчёте 2a.
-    if (btn & proto.BTN_ITEM) and tick >= e.shot_ready:
+    if (btn & proto.BTN_SHOOT) and tick >= e.shot_ready:
         # Сам снаряд рождается в resolve: spawn идёт из world.step, то есть
         # ИЗНУТРИ цикла по словарю сущностей, а это RuntimeError. Откат
         # ставится здесь, а не при рождении: ствол, упёртый в стену, всё
