@@ -318,6 +318,36 @@ export function boot() {
     // опросом из питона.
     msRecord: (on) => { app.msRec = !!on; app.msRing = []; return app.msRec; },
     msSamples: () => app.msRing.slice(),
+
+    // Стоимость кадра с разрешением лучше кванта таймера. performance.now()
+    // в браузере огрублён до 0.1 мс, а весь кадр стоит меньше этого кванта:
+    // на одиночных кадрах любое отношение вырождается в 0.1/0.0. Поэтому
+    // draw() гоняется n раз подряд по ОДНОМУ И ТОМУ ЖЕ виду, и квант
+    // размазывается по n. Повторять draw() безопасно: 7.1 запрещает ему
+    // менять мир, он только рисует то, что дали.
+    benchDraw: (n) => {
+      const view = app.world.buildView(performance.now());
+      app.render.draw(view, view.alpha);     // прогрев: кэш карты и маска тумана
+      const t0 = performance.now();
+      for (let i = 0; i < n; i++) app.render.draw(view, view.alpha);
+      return (performance.now() - t0) / n;
+    },
+
+    // Во что обходится ПЕРЕСЧЁТ маски тумана — то, что случается не каждый
+    // кадр, а только когда пришла дельта vis. Разница двух пачек: в первой
+    // маска перерисовывается перед каждым draw, во второй нет.
+    benchFog: (n) => {
+      const view = app.world.buildView(performance.now());
+      const r = app.render;
+      r.draw(view, view.alpha);
+      const t0 = performance.now();
+      for (let i = 0; i < n; i++) { r.fogKey = ''; r.draw(view, view.alpha); }
+      const a = performance.now() - t0;
+      const t1 = performance.now();
+      for (let i = 0; i < n; i++) r.draw(view, view.alpha);
+      const b = performance.now() - t1;
+      return { repaint: (a - b) / n, frame: b / n, n: n };
+    },
   };
 }
 
