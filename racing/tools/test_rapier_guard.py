@@ -49,7 +49,7 @@ if BASE_DIR not in sys.path:
 from game import physics                        # noqa: E402
 from game import rapier_host as rh              # noqa: E402
 from game.cars import load_cars                 # noqa: E402
-from game.track import Track                    # noqa: E402
+from game.track import Track, RAMP_BOX_FLOATS   # noqa: E402
 
 abi = rh.abi
 OUT = abi.CarOut
@@ -743,7 +743,7 @@ def report_restrictions(report):
             report.check(settings.get(name) == value, 'настройка %s' % label,
                          'просили %r, стало %r'
                          % (wanted[name], settings.get(name)))
-        report.check(len(sim.disabled_features) == 2,
+        report.check(len(sim.disabled_features) == len(rh.RESTRICTED),
                      'комната сообщает игрокам, что опущено',
                      '%d фраз: %s'
                      % (len(sim.disabled_features),
@@ -797,18 +797,55 @@ def report_restrictions(report):
                      and sim.rapier.__class__.__name__ == 'RapierRace',
                      'мир гонки — RapierRace',
                      sim.rapier.__class__.__name__ if sim.rapier else 'нет')
-        # Гандикап: он не в симуляции, а в комнате, и читает НАСТРОЙКИ
-        # СИМУЛЯЦИИ. Убедиться, что после снятия настройки он ничего не
-        # подменяет, можно прямо по ней: ветка выходит на первом же if.
-        report.check(sim.settings.get('handicap') is False,
-                     'гандикап опущен до того, как комната его наложит',
-                     '_apply_handicap читает settings симуляции (room.py)')
-        # Трамплины сюда не берём СОЗНАТЕЛЬНО: вычищает их room.py из
-        # race_init, а не симуляция, и проверить это, не подняв комнату,
-        # можно было бы только копией тех же двух строк — то есть проверкой
-        # собственной копии. Проверка, не способная покраснеть, хуже
-        # отсутствующей.
-        # Трамплины: при rapier их в сетке нет, и рисовать их нельзя.
+        # ГАНДИКАП (§12.30). Его попросили включённым, и он обязан
+        # РАБОТАТЬ, а не быть тихо опущенным — то есть проверяется он с той
+        # же стороны, что бонусы и поток. Мало флага: ровно на гандикапе
+        # проект и горел, «включено и молчит». Поэтому дверь дёргается
+        # по-настоящему и смотрится результат В МОДУЛЕ.
+        report.check(sim.settings.get('handicap') is True,
+                     'гандикап больше не опускается',
+                     'handicap=%r, опущено: %s'
+                     % (sim.settings.get('handicap'),
+                        ', '.join(row[0] for row in rh.RESTRICTED) or 'ничего'))
+        report.check('handicap' not in [row[0] for row in rh.RESTRICTED],
+                     'гандикап больше не в списке опущенного')
+        names = ('engine_force', 'max_speed', 'boost_speed')
+        car = sim.cars[0]
+        base_tuning = dict(rh.car_tuning(car.stats_base, sim.rapier.mode))
+        sim.apply_handicap(car.slot, 0.97, names)
+        live = sim.rapier.host.tuning_values()
+        # 1. Тело пересоздано с замедленными настройками. Читаем ШАБЛОН,
+        #    в который их положили перед spawn_car: живое тело модуль
+        #    наружу не показывает, а шаблон — ровно то, что оно прочитало.
+        slowed = all(abs(live[n] - base_tuning[n] * 0.97) < 1e-3 for n in names
+                     if n in base_tuning)
+        report.check(slowed, 'тело Rapier создано с замедленными настройками',
+                     'engine_force %.0f -> %.0f (ждали %.0f)'
+                     % (base_tuning['engine_force'], live['engine_force'],
+                        base_tuning['engine_force'] * 0.97))
+        # 2. Блок tuning каталожной записи ЦЕЛ. Прежняя сборка гандикапа
+        #    отдавала голый CarStats без tuning, и машина уехала бы на
+        #    чистом пресете режима: другой габарит, другая масса.
+        report.check(abs(live['half_length'] - base_tuning['half_length']) < 1e-6
+                     and abs(live['mass'] - base_tuning['mass']) < 1e-6,
+                     'гандикап не съел блок tuning (габарит и масса целы)',
+                     'half_length %.3f, масса %.0f'
+                     % (live['half_length'], live['mass']))
+        report.check(abs(car.handicap - 0.97) < 1e-9
+                     and car.stats is not car.stats_base
+                     and getattr(car.stats, 'tuning', None),
+                     'классика читает те же замедленные характеристики',
+                     'множитель %.4f, engine_force %.3f -> %.3f'
+                     % (car.handicap, car.stats_base.engine_force,
+                        car.stats.engine_force))
+        # 3. Трамплины при rapier ЕДУТ клиенту (§12.30): их больше не
+        #    вычищают из race_init, потому что в мире они теперь есть.
+        ramps = sim.track.to_client().get('ramps') or []
+        report.check(sim.rapier.ramp_boxes == 0 if not ramps else
+                     sim.rapier.ramp_boxes > 0,
+                     'трамплины трассы стоят в мире гонки',
+                     'трамплинов %d, коробок %d'
+                     % (len(ramps), sim.rapier.ramp_boxes))
     finally:
         if saved is None:
             os.environ.pop(rh.ENV_VAR, None)
@@ -1419,6 +1456,456 @@ def report_module(report, wasm_parity=True):
 
 
 # ---------------------------------------------------------------------------
+# Трамплины (§12.30)
+# ---------------------------------------------------------------------------
+#
+# У классики трамплин — поле высоты, у Rapier — настоящая геометрия из
+# неподвижных коробок. Проверок здесь четыре рода, и каждая ловит свой
+# способ сломаться:
+#
+# * КОРОБКИ ПОВТОРЯЮТ ПРОФИЛЬ. Считается по-честному: верх коробки против
+#   Track.ramp_height в девятнадцати тысячах точек следа. Порог выведен из
+#   раскладки (половина боковой ступеньки), а не подобран под прогон;
+# * ЛЕСЕНКА СКОСА НЕ ВЫШЕ, ЧЕМ МОЖЕТ ПРОГЛОТИТЬ ПОДВЕСКА. Оба предела
+#   читаются из ЖИВЫХ настроек машины, а не повторяются числом;
+# * MAX_PROPS НЕ ТРАТИТСЯ. Неподвижная коробка тела не заводит, и это
+#   меряется, а не заявляется: rp_prop_count() после постройки;
+# * ПОЛЁТ НЕ ПЛАТИТ ЗА ЗАНОС. Четвёртый барьер §12.15 на настоящем
+#   трамплине, а не на догадке.
+
+RAMP_TRACK = 'industrial'      # самый высокий трамплин каталога: rise 1,25 м
+RAMP_CAR = 'hatch'             # самая низкая машина: у неё просвет 0,284 м
+
+# Потолок расхождения профиля. ВЫВЕДЕН: лесенка скоса даёт ступеньку
+# rise/steps, и точка следа отстоит от истинного профиля не дальше её
+# половины. Плюс допуск на то, что полотно под трамплином — ломаная по
+# точкам оцифровки (шаг 2 м), а профиль классики считает surface() своей
+# доводкой: замерено 0,015 м. Итого половина ступеньки плюс 0,02 м.
+RAMP_PROFILE_SLACK = 0.02
+
+_RAMP_TRACKS = {}
+
+
+def ramp_track(track_id=RAMP_TRACK):
+    tr = _RAMP_TRACKS.get(track_id)
+    if tr is None:
+        tr = Track.load(os.path.join(BASE_DIR, 'content', 'tracks',
+                                     track_id + '.json'))
+        _RAMP_TRACKS[track_id] = tr
+    return tr
+
+
+def _box_top(box, x, z):
+    """Высота верхней грани коробки в точке (x, z) или None вне её следа."""
+    hx, hy, hz, cx, cy, cz, yaw, pitch = box
+    sy, cy_ = math.sin(yaw), math.cos(yaw)
+    sp, cp = math.sin(pitch), math.cos(pitch)
+    if cp <= 0.0:
+        return None
+    # Центр ВЕРХНЕЙ ГРАНИ: центр коробки плюс полутолщина по её нормали.
+    tx = cx + hy * sp * sy
+    tz = cz + hy * sp * cy_
+    ty = cy + hy * cp
+    dx, dz = x - tx, z - tz
+    lx = dx * cy_ - dz * sy
+    lz = (dx * sy + dz * cy_) / cp
+    if abs(lx) > hx + 1e-9 or abs(lz) > hz + 1e-9:
+        return None
+    return ty + lz * (-sp)
+
+
+RAMP_SCAN_POINTS = 2500     # точек следа на трамплин
+RAMP_SCAN_SEED = 30012
+# Отступ от края следа при сверке профиля, м. Профиль классики на кромке
+# вылета РАЗРЫВЕН по построению: на ds = span высота равна rise, на
+# ds = span + eps — нулю. Коробка кончается ровно на кромке, но `ds`
+# классика считает от своей точки оцифровки, и на последних миллиметрах
+# два счёта дают разные стороны разрыва. Сравнивать высоты в точке разрыва
+# бессмысленно, поэтому пять сантиметров с каждого края не берём — и то же
+# самое поперёк, у внешней кромки скоса.
+RAMP_SCAN_INSET = 0.05
+
+
+def ramp_profile_error(tr, ramp, points=RAMP_SCAN_POINTS):
+    """(макс. расхождение с профилем классики, дыр в следе, коробок).
+
+    Точки следа берутся СЛУЧАЙНО с фиксированным зерном, а не решёткой:
+    решётка с шагом, кратным ширине полосы, ложится ровно в середины полос,
+    где расхождение равно нулю по построению, — и проверка меряет ноль.
+    Это ловушка §12.20 «стенд создаёт то, что меряет», и здесь она реальна:
+    первая версия на решётке 80 столбцов давала 0,009 м там, где честный
+    максимум 0,062 м.
+    """
+    flat = ramp['boxes']
+    stride = RAMP_BOX_FLOATS
+    boxes = [flat[i:i + stride] for i in range(0, len(flat), stride)]
+    s0, span = ramp['s0'], ramp['length']
+    off, hw = ramp['offset'], ramp['half_width']
+    rng = random.Random(RAMP_SCAN_SEED)
+    worst, holes = 0.0, 0
+    inset = RAMP_SCAN_INSET
+    for _ in range(points):
+        s = s0 + inset + (span - 2.0 * inset) * rng.random()
+        u = off + (2.0 * rng.random() - 1.0) * (hw - inset)
+        px, _py, pz, nx, nz = tr._sample_at(s)
+        x, z = px + nx * u, pz + nz * u
+        i, lateral, _hw, ground, _p = tr.surface(x, z, 0)
+        along = ((x - tr._cx[i]) * tr._ctx[i]
+                 + (z - tr._cz[i]) * tr._ctz[i])
+        classic = tr.ramp_height(i, lateral, along)
+        best = None
+        for box in boxes:
+            top = _box_top(box, x, z)
+            if top is not None and (best is None or top > best):
+                best = top
+        if best is None:
+            holes += 1
+            continue
+        worst = max(worst, abs((best - ground) - classic))
+    return worst, holes, len(boxes)
+
+
+class RampCar(object):
+    """Машина на трассе с трамплинами, пилот держит линию и скорость.
+
+    Руль КНОПОЧНЫЙ (+1/-1/0), как в игре: сравнивать классику и Rapier
+    имеет смысл только на одинаковом вводе.
+    """
+
+    def __init__(self, track_id=RAMP_TRACK, ramp=0, run_up=140.0,
+                 lateral=None):
+        self.tr = tr = ramp_track(track_id)
+        self.ramp = r = tr.ramps[ramp]
+        self.target = r['offset'] if lateral is None else lateral
+        x, z, yaw, i = self._place(r['s0'] + r['length'] - run_up, self.target)
+        self.h = h = host()
+        h.reset(0)
+        margin, height, friction = rh.mesh_params(tr)
+        h.build_track(tr, margin, height, friction)
+        h.free_track_mesh()
+        self.boxes = h.add_ramps(tr, friction)
+        h.tuning_preset(0)
+        h.set_tuning(rh.car_tuning(car_spec(), 'arcade'))
+        tune = h.tuning_values()
+        self.rest = (tune['wheel_radius'] + tune['suspension_rest']
+                     + tune['half_height'] * 0.2)
+        self.travel = tune['max_suspension_travel']
+        self.clearance = tune['wheel_radius'] + tune['suspension_rest'] \
+            - 0.8 * tune['half_height']
+        ground = tr.surface(x, z, i)[3]
+        self.idx = h.spawn_car(x, ground + self.rest, z, yaw)
+        self.base = self.idx * OUT.FLOATS
+        self.hint = i
+        for _ in range(rh.SETTLE_TICKS):
+            h.set_input(self.idx, 0.0, 0.0, 0.0, 0.0)
+            h.step(1)
+
+    def _place(self, s, lateral):
+        tr = self.tr
+        n = tr._n
+        f = (s % tr.length) * tr._inv_step
+        i = int(f) % n
+        t = f - int(f)
+        j = (i + 1) % n
+        x = (tr._cx[i] + (tr._cx[j] - tr._cx[i]) * t + tr._cnx[i] * lateral)
+        z = (tr._cz[i] + (tr._cz[j] - tr._cz[i]) * t + tr._cnz[i] * lateral)
+        return x, z, math.atan2(tr._ctx[i], tr._ctz[i]), i
+
+    def g(self, field):
+        return self.h.outputs[self.base + field]
+
+    def inject_charge(self, value):
+        """Положить машине копилку заноса через слот сохранения."""
+        h = self.h
+        h.car_save(self.idx)
+        h._sync()
+        h.saves[self.idx * SAVE.FLOATS + SAVE.DRIFT_CHARGE] = float(value)
+        h.car_restore(self.idx)
+
+    def run(self, v_target, seconds=14.0, abuse_in_air=False):
+        """Прогон пилота. Возвращает кадры: (t, height, speed, x, z,
+        airborne, v_vert, drift_charge, drift_level).
+
+        ``abuse_in_air`` — как только машина оторвалась, пилот жмёт ручник
+        и выкручивает руль до упора. На земле он этого не делает: задача —
+        доехать до трамплина, а не разбиться до него.
+        """
+        tr = self.tr
+        rec = []
+        ticks = int(seconds / DT)
+        for k in range(ticks):
+            x, z = self.g(OUT.PX), self.g(OUT.PZ)
+            i, lateral, hw, ground, _p = tr.surface(x, z, self.hint)
+            self.hint = i
+            head = math.atan2(tr._ctx[i], tr._ctz[i]) - self.g(OUT.YAW)
+            while head > math.pi:
+                head -= 2.0 * math.pi
+            while head < -math.pi:
+                head += 2.0 * math.pi
+            v = self.g(OUT.SPEED)
+            cmd = (self.target - lateral) * 0.18 + head * 2.2
+            steer = 1.0 if cmd > 0.04 else (-1.0 if cmd < -0.04 else 0.0)
+            hb = 0.0
+            if abuse_in_air and self.g(OUT.WHEELS_ON_GROUND) == 0.0:
+                hb, steer = 1.0, 1.0
+            self.h.set_input(self.idx, 1.0 if v < v_target else 0.0,
+                             1.0 if v > v_target + 1.5 else 0.0, steer, hb)
+            self.h.step(1)
+            x, z = self.g(OUT.PX), self.g(OUT.PZ)
+            i, lateral, hw, ground, _p = tr.surface(x, z, self.hint)
+            rec.append((k * DT, self.g(OUT.PY) - ground - self.rest,
+                        self.g(OUT.SPEED), x, z,
+                        self.g(OUT.WHEELS_ON_GROUND) == 0.0, self.g(OUT.VY),
+                        self.g(OUT.DRIFT_CHARGE), self.g(OUT.DRIFT_LEVEL)))
+        return rec
+
+
+def longest_flight(rec):
+    """(начало, конец) самого длинного отрезка полёта или None."""
+    best, k = None, 0
+    while k < len(rec):
+        if rec[k][5]:
+            j = k
+            while j < len(rec) and rec[j][5]:
+                j += 1
+            if best is None or (j - k) > (best[1] - best[0]):
+                best = (k, j)
+            k = j
+        else:
+            k += 1
+    if best is None or best[1] - best[0] < 6:
+        return None
+    return best
+
+
+def flight_stats(rec):
+    span = longest_flight(rec)
+    if span is None:
+        return None
+    a, b = span
+    return {
+        'apex': max(r[1] for r in rec[a:b]),
+        'air': (b - a) * DT,
+        'dist': math.hypot(rec[b - 1][3] - rec[a][3], rec[b - 1][4] - rec[a][4]),
+        'v_in': rec[a][2],
+        'v_out': rec[b - 1][2],
+        'v_vert': rec[a][6],
+        'charge_peak': max(r[7] for r in rec[a:b]),
+        'level_sum': sum(r[8] for r in rec[a:b]),
+        'span': span,
+    }
+
+
+def classic_flight(track_id=RAMP_TRACK, ramp=0, run_up=140.0, v_target=40.0,
+                   seconds=14.0):
+    """Тот же прыжок у классики: пилот и трасса те же, физика другая."""
+    from game.protocol import BTN_THROTTLE, BTN_BRAKE, BTN_LEFT, BTN_RIGHT
+    tr = ramp_track(track_id)
+    r = tr.ramps[ramp]
+    stats = car_spec()
+    n = tr._n
+    s = (r['s0'] + r['length'] - run_up) % tr.length
+    f = s * tr._inv_step
+    i = int(f) % n
+    t = f - int(f)
+    j = (i + 1) % n
+    x = tr._cx[i] + (tr._cx[j] - tr._cx[i]) * t + tr._cnx[i] * r['offset']
+    z = tr._cz[i] + (tr._cz[j] - tr._cz[i]) * t + tr._cnz[i] * r['offset']
+    yaw = math.atan2(tr._ctx[i], tr._ctz[i])
+    st = physics.CarState(x, z, yaw)
+    tr.init_state(st)
+    st.x, st.z, st.yaw, st.sample_idx = x, z, yaw, i
+    rec = []
+    for k in range(int(seconds / DT)):
+        v = math.hypot(st.vx, st.vz)
+        idx, lateral, hw, ground, _p = tr.surface(st.x, st.z, st.sample_idx)
+        head = math.atan2(tr._ctx[idx], tr._ctz[idx]) - st.yaw
+        while head > math.pi:
+            head -= 2.0 * math.pi
+        while head < -math.pi:
+            head += 2.0 * math.pi
+        cmd = (r['offset'] - lateral) * 0.18 + head * 2.2
+        buttons = BTN_THROTTLE if v < v_target else 0
+        if v > v_target + 1.5:
+            buttons |= BTN_BRAKE
+        if cmd > 0.04:
+            buttons |= BTN_LEFT
+        elif cmd < -0.04:
+            buttons |= BTN_RIGHT
+        physics.step(st, stats, buttons, DT, tr, st.sample_idx)
+        rec.append((k * DT, st.height, math.hypot(st.vx, st.vz), st.x, st.z,
+                    bool(st.airborne), st.v_vert, st.drift_charge, 0.0))
+    return rec
+
+
+def report_ramps(report):
+    print('  трамплины (§12.30):')
+    from game import track as track_mod
+
+    # 1. Клиенту трамплины едут при любой физике, и вместе с коробками.
+    tr = ramp_track()
+    payload = tr.to_client()
+    rows = payload.get('ramps') or []
+    with_boxes = [r for r in rows if r.get('boxes')]
+    report.check(len(rows) == len(tr.ramps) and len(with_boxes) == len(rows),
+                 'запись трассы везёт трамплины вместе с коробками',
+                 '%d трамплинов, у %d есть boxes' % (len(rows), len(with_boxes)))
+
+    # 2. Коробки повторяют профиль классики, дыр в следе нет.
+    worst_all, holes_all, boxes_all = 0.0, 0, 0
+    worst_bound = 0.0
+    for track_id in ('serpentine', 'industrial', 'ridge'):
+        t = ramp_track(track_id)
+        for ramp in t.ramps:
+            worst, holes, count = ramp_profile_error(t, ramp)
+            steps = (count - 1) // 2
+            bound = ramp['rise'] / (2.0 * steps) + RAMP_PROFILE_SLACK
+            worst_all = max(worst_all, worst)
+            worst_bound = max(worst_bound, bound)
+            holes_all += holes
+            boxes_all += count
+    report.check(worst_all <= worst_bound,
+                 'коробки повторяют профиль ramp_height',
+                 'максимум %.4f м при пороге %.4f (половина ступеньки + %.2f)'
+                 % (worst_all, worst_bound, RAMP_PROFILE_SLACK))
+    report.check(holes_all == 0,
+                 'в следе трамплина нет дыр',
+                 'непокрытых точек %d из %d'
+                 % (holes_all, 4 * RAMP_SCAN_POINTS))
+
+    # 3. Ступенька лесенки — ниже того, что глотает подвеска, и ниже
+    #    половины просвета кузова. Оба числа из ЖИВЫХ настроек машины.
+    car = RampCar()
+    worst_step = 0.0
+    for track_id in ('serpentine', 'industrial', 'ridge'):
+        for ramp in ramp_track(track_id).ramps:
+            steps = (len(ramp['boxes']) // RAMP_BOX_FLOATS - 1) // 2
+            worst_step = max(worst_step, ramp['rise'] / steps)
+    report.check(worst_step <= car.travel,
+                 'боковая ступенька ниже хода подвески',
+                 '%.3f м при ходе %.3f м' % (worst_step, car.travel))
+    report.check(worst_step <= car.clearance * 0.5,
+                 'боковая ступенька ниже половины просвета кузова',
+                 '%.3f м при просвете %.3f м' % (worst_step, car.clearance))
+    # Ход подвески приезжает из модуля в f32, поэтому 0,13 читается как
+    # 0,129999995: сравнение с допуском в микрометр, а не «меньше».
+    report.check(track_mod.RAMP_STEP_MAX <= car.travel + 1e-6,
+                 'потолок ступеньки выведен из хода подвески, а не подобран',
+                 'RAMP_STEP_MAX %.3f, ход %.3f' % (track_mod.RAMP_STEP_MAX,
+                                                   car.travel))
+
+    # 4. MAX_PROPS неподвижные коробки не расходуют — замер, не заявление.
+    report.check(car.h.prop_count() == 0,
+                 'коробки трамплина не тратят MAX_PROPS',
+                 '%d коробок в мире, подвижных предметов %d из %d'
+                 % (car.boxes, car.h.prop_count(), abi.MAX_PROPS))
+
+    # 5. Прыжок. Числа рядом с классикой: совпадать они не обязаны (у
+    #    Rapier рельеф настоящий, тяготение 9,81 против 12,0 у классики, а
+    #    скорость отрыва не зажата RAMP_LIFT_MAX), но прыжок обязан
+    #    остаться прыжком, а не улётом.
+    rec = car.run(40.0)
+    fly = flight_stats(rec)
+    ok = fly is not None
+    report.check(ok, 'машина улетает с трамплина',
+                 'полёта нет' if not ok else
+                 'высота %.2f м, время %.3f с, дальность %.1f м'
+                 % (fly['apex'], fly['air'], fly['dist']))
+    if ok:
+        cls = flight_stats(classic_flight())
+        report.check(cls is not None and fly['air'] <= cls['air'] * 1.5
+                     and fly['apex'] <= cls['apex'] * 1.5,
+                     'прыжок не длиннее классического в полтора раза',
+                     'rapier %.2f м / %.3f с против классики %.2f м / %.3f с'
+                     % (fly['apex'], fly['air'], cls['apex'], cls['air']))
+        # Отсечку прыжком не перепрыгнуть — то же требование, что в §12.18.
+        gap = min(ramp_track(t).length / 12.0
+                  for t in ('serpentine', 'industrial', 'ridge'))
+        report.check(fly['dist'] < gap,
+                     'прыжком не перепрыгнуть отсечку',
+                     'дальность %.1f м при самой короткой отсечке %.1f м'
+                     % (fly['dist'], gap))
+
+        # 6. Четвёртый барьер §12.15 на НАСТОЯЩЕМ трамплине, а не на
+        #    догадке: в воздухе ручник и полный руль не копят заряд.
+        air = RampCar()
+        rec_air = air.run(40.0, abuse_in_air=True)
+        fa = flight_stats(rec_air)
+        report.check(fa is not None and fa['charge_peak'] == 0.0,
+                     'ручник и полный руль весь полёт не копят заряд',
+                     'полёт %.2f с, пик заряда %.5f с'
+                     % (fa['air'] if fa else 0.0,
+                        fa['charge_peak'] if fa else -1.0))
+        report.check(fa is not None and fa['level_sum'] == 0.0,
+                     'полёт не платит за занос ни одного уровня',
+                     'сумма уровней %.1f' % (fa['level_sum'] if fa else -1.0))
+
+        # Та же дыра с другой стороны: копилка, ПРИНЕСЁННАЯ на кромку,
+        # сгорает без выплаты. Одной первой проверки мало — она зеленела бы
+        # и на сломанном барьере, если бы заряд просто не набирался
+        # (§12.29, урок про масло). Поэтому рядом тот же заряд, отпущенный
+        # на земле: он обязан заплатить.
+        paid_air, left_air = charge_release(True)
+        paid_ground, left_ground = charge_release(False)
+        report.check(paid_air == 0.0 and left_air == 0.0,
+                     'копилка 3,00 с, принесённая на кромку, сгорает без награды',
+                     'выплат %.0f, остаток %.3f с' % (paid_air, left_air))
+        report.check(paid_ground > 0.0,
+                     'та же копилка на земле платит — проверка умеет краснеть',
+                     'уровень %.0f, остаток %.3f с' % (paid_ground, left_ground))
+
+    # 7. Машина, задевшая скос трамплина сбоку, не встаёт: лесенка — это
+    #    поребрик, а не стена. Замер по потере скорости на проезде мимо.
+    ramp0 = ramp_track().ramps[0]
+    edge = RampCar(lateral=ramp0['offset'] - ramp0['half_width'] + 0.4)
+    rec_edge = edge.run(35.0)
+    v_min = min(r[2] for r in rec_edge[120:])
+    report.check(v_min > 10.0,
+                 'проезд по самому скосу не останавливает машину',
+                 'минимум скорости %.1f м/с на линии скоса' % v_min)
+
+
+CHARGE_INJECT = 3.00        # с, копилка из §12.18: «3,00 с на кромке»
+
+
+def charge_release(in_air):
+    """Вложить копилку и отпустить ручник в воздухе либо на земле.
+
+    Возвращает (сумма уровней выплаты, остаток копилки). Копилка кладётся
+    через слот сохранения — это единственное место, где её можно задать
+    снаружи, и ровно то же место, которым пользуется откат клиента.
+    """
+    car = RampCar()
+    tr = car.tr
+    lip = car.ramp['s0'] + car.ramp['length']
+    paid, left, armed = 0.0, 0.0, False
+    for _ in range(int(14.0 / DT)):
+        rec = car.run(40.0, seconds=DT)
+        if not rec:
+            break
+        airborne = rec[-1][5]
+        x, z = rec[-1][3], rec[-1][4]
+        i = tr.surface(x, z, car.hint)[0]
+        if not armed:
+            # В воздухе — сразу после отрыва; на земле — на подъезде, за
+            # тридцать метров до въезда, чтобы выплата успела случиться.
+            ready = airborne if in_air else (tr._cs[i] > car.ramp['s0'] - 40.0
+                                             and not airborne)
+            if ready:
+                car.inject_charge(CHARGE_INJECT)
+                armed = True
+                continue
+        if armed:
+            paid += rec[-1][8]
+            left = rec[-1][7]
+            if not in_air and paid > 0.0:
+                break
+            if in_air and not airborne:
+                break
+    return paid, left
+
+
+# ---------------------------------------------------------------------------
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
@@ -1441,6 +1928,7 @@ def main(argv=None):
         report_restrictions(report)
         report_effects(report)
         report_road(report)
+        report_ramps(report)
         report_module(report, wasm_parity=not args.no_wasm_parity)
     except rh.HostError as exc:
         print('  ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)

@@ -18,6 +18,10 @@
 export const WASM_URL = '/native/testbed/racing_physics.wasm';
 export const ABI_URL = '/native/abi/abi_layout.js';
 
+// Шаг записи коробки трамплина (§12.30). Импортируется, а не повторяется:
+// формат объявлен один раз, в game/track.py, и track.js его зеркалит.
+import { RAMP_BOX_FLOATS } from './track.js';
+
 // Геометрии полотна ЗДЕСЬ НЕТ. Модуль физики игровых констант не знает, и обе
 // стороны обязаны передать ему одно и то же; на 4b ради этого в каждом хозяине
 // лежало по копии WALL_HEIGHT и TRACK_FRICTION. Теперь все три числа объявлены
@@ -188,6 +192,53 @@ export class RapierHost {
         this._sync(true);
     }
 
+    /**
+     * Коробка в мире. mass <= 0 — неподвижный коллайдер, тела не заводит
+     * и MAX_PROPS не расходует (§12.30).
+     */
+    addBox(hx, hy, hz, x, y, z, yaw, pitch, friction, mass) {
+        this.x.rp_add_box(hx, hy, hz, x, y, z, yaw, pitch, friction, mass || 0);
+    }
+
+    /**
+     * Трамплины трассы неподвижными коробками (§12.30).
+     *
+     * Числа здесь НЕ считаются: они выведены один раз на сервере
+     * (game/track.py, Track._ramp_boxes) и приехали в race_init готовыми,
+     * вместе с остальной геометрией трамплина. Считать их у себя значило бы
+     * завести вторую геометрию, обязанную совпасть с первой до бита, — то
+     * есть ровно ту болезнь, от которой полотно лечится постройкой сетки
+     * ВНУТРИ модуля (native/src/trackmesh.rs). Угол коробки берётся через
+     * atan2, а он у CPython и у V8 имеет право разойтись в последнем разряде.
+     *
+     * friction — трение полотна, уже домноженное на погоду.
+     */
+    addRamps(track, friction) {
+        const rows = (track && track.ramps) || [];
+        const stride = RAMP_BOX_FLOATS;
+        let count = 0;
+        for (let k = 0; k < rows.length; k++) {
+            const box = rows[k].boxes;
+            if (!box || !box.length) continue;
+            if (box.length % stride) {
+                throw new HostError('коробки трамплина: ' + box.length +
+                    ' чисел, не кратно ' + stride);
+            }
+            for (let i = 0; i < box.length; i += stride) {
+                this.x.rp_add_box(box[i], box[i + 1], box[i + 2], box[i + 3],
+                                  box[i + 4], box[i + 5], box[i + 6],
+                                  box[i + 7], friction, 0);
+                count++;
+            }
+        }
+        // Вставка коллайдеров могла подвинуть память: виды после неё
+        // недействительны. Один раз на все коробки, а не на каждую.
+        if (count) this._sync(true);
+        return count;
+    }
+
+    propCount() { return this.x.rp_prop_count(); }
+
     spawnCar(x, y, z, yaw) {
         const idx = this.x.rp_car_spawn(x, y, z, yaw);
         this._sync(true);
@@ -337,6 +388,11 @@ export const DRIFT_MIN_SLIP = 0.12;
 // Зеркало game/rapier_host.PRESET_NAMES и server/config.PHYSICS_MODES.
 export const PRESET_NAMES = ['arcade', 'sim'];
 
+// Поля CarTuning, которые режет гандикап. Тот же список, что
+// server/config.HANDICAP_STATS и что перечисляет applyHandicap() в main.js
+// для предсказания классики; tools/test_sim.py сверяет копии одной проверкой.
+export const HANDICAP_STATS = ['engine_force', 'max_speed', 'boost_speed'];
+
 export function presetIndex(name) {
     const at = PRESET_NAMES.indexOf(String(name || '').toLowerCase());
     return at < 0 ? 0 : at;
@@ -346,7 +402,7 @@ export function presetIndex(name) {
  * Правки CarTuning для машины каталога в выбранном режиме (§12.23).
  * Блок body общий для обоих режимов: кузов у машины один.
  */
-export function carTuning(spec, mode) {
+export function carTuning(spec, mode, handicap, handicapFields) {
     // Награда за занос идёт ПЕРВОЙ и одинакова у всех машин: это правила
     // 6.3, а не свойство кузова. Зеркало car_tuning() из game/rapier_host.py.
     const stats = (spec && spec.stats) || null;
@@ -363,7 +419,29 @@ export function carTuning(spec, mode) {
     const tuning = spec && spec.tuning;
     if (!tuning) return out;
     Object.assign(out, tuning.body || null);
-    return Object.assign(out, tuning[mode] || null);
+    Object.assign(out, tuning[mode] || null);
+    handicapTuning(out, handicap, handicapFields || HANDICAP_STATS);
+    return out;
+}
+
+/**
+ * Домножить поля гандикапа в ГОТОВОМ наборе настроек (§12.30).
+ * Зеркало _handicap_tuning() из game/rapier_host.py, правило то же:
+ * carTuning получает КАТАЛОЖНЫЕ числа и множитель и режет названные поля
+ * сама. Заранее замедленные характеристики сюда не подают — boost_speed
+ * (единственное поле не из блока tuning) порезался бы дважды.
+ *
+ * Резать надо именно тут: тяга и потолок скорости у модуля СВОИ, из блока
+ * tuning, а stats.engine_force он не читает вовсе.
+ */
+export function handicapTuning(values, handicap, fields) {
+    const k = +handicap;
+    if (!(k > 0) || k === 1) return values;
+    for (let i = 0; i < fields.length; i++) {
+        const name = fields[i];
+        if (name in values) values[name] = values[name] * k;
+    }
+    return values;
 }
 
 function shortAngle(from, to) {
@@ -398,6 +476,32 @@ export class RapierLocal {
         this.ringLen = 0;
         this.grid = null;         // куда поставлена машина на решётке
         this.level = 0;           // уровень заноса, выплаченный на прошлом шаге
+        this.rampBoxes = 0;       // сколько коробок трамплинов стоит в мире
+        // Гандикап своей машины (§12.30). Приезжает в race_init
+        // players[].handicap и ложится ДО создания тела: перенастроить живое
+        // тело модуль не умеет, CarTuning читается один раз, в spawn_car.
+        this.handicap = 1;
+        this.handicapStats = HANDICAP_STATS;
+        this._begin = null;       // аргументы beginRace для пересборки
+    }
+
+    /**
+     * Наложить гандикап и пересобрать мир (§12.30).
+     *
+     * Зовётся из main.js сразу после applyHandicap(): net.js строит мир по
+     * race_init раньше, чем главный экран разберёт множитель, а ставить тело
+     * дважды дешевле, чем городить порядок между двумя модулями. Пересборка
+     * стоит одну сборку сетки полотна и случается только у победителя
+     * прошлой гонки.
+     */
+    applyHandicap(factor) {
+        const value = +factor;
+        if (!(value > 0) || value === 1 || value === this.handicap) return false;
+        this.handicap = value;
+        const a = this._begin;
+        if (!a) return false;
+        this.beginRace(a[0], a[1], a[2], a[3], a[4], a[5]);
+        return true;
     }
 
     /**
@@ -411,6 +515,7 @@ export class RapierLocal {
      * @param grid      {x, z, yaw} — место на решётке
      */
     beginRace(track, spec, mode, gripMul, ringLen, grid) {
+        this._begin = [track, spec, mode, gripMul, ringLen, grid];
         const preset = presetIndex(mode);
         const host = this.host;
         this.ready = false;
@@ -419,10 +524,15 @@ export class RapierLocal {
         // Погода — единственное, чем правится покрытие: её множитель уезжает
         // в ТРЕНИЕ СЕТКИ. Сервер делает ровно то же в RapierRace.__init__,
         // и оба числа обязаны совпасть до бита, иначе предсказание поедет.
-        host.buildTrack(track, p[0], p[1], p[2] * (gripMul || 1));
+        const friction = p[2] * (gripMul || 1);
+        host.buildTrack(track, p[0], p[1], friction);
         host.freeTrackMesh();
+        // Трамплины — настоящая геометрия, неподвижные коробки (§12.30).
+        // Числа приехали с сервера в race_init.track.ramps[].boxes, поэтому
+        // у браузера и у сервера они одни и те же по построению.
+        this.rampBoxes = host.addRamps(track, friction);
         host.tuningPreset(preset);
-        host.setTuning(carTuning(spec, mode));
+        host.setTuning(carTuning(spec, mode, this.handicap, this.handicapStats));
         const t = host.tuningValues();
         this.restY = t.wheel_radius + t.suspension_rest + t.half_height * 0.2;
         this.invSteerMax = 1 / (t.steer_max || 1);

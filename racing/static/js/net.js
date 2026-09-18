@@ -1360,6 +1360,7 @@ export class NetClient {
             if (road) this.roadAfterStep(state);
             this._recordState(i);
         }
+        if (rapier !== null) this._readLocalTilt(state);
         if (replayed > 0) {
             const us = (performance.now() - replayT0) * 1000 / replayed;
             this.replayUs = this.replayUs > 0
@@ -1591,6 +1592,30 @@ export class NetClient {
     // =======================================================================
 
     /**
+     * Крен и тангаж своей машины из физики — бесплатно, без байта по сети
+     * (§12.24/§12.31: снапшот везёт только курс, а своя машина и так вся
+     * тут, в предсказании). Кватернион кузова модуль уже посчитал и держит
+     * в CarOut рядом с YAW (native/abi/abi_layout.py), `readInto()` его
+     * просто не читал — здесь тот же буфер, тот же уже сделанный `_sync()`,
+     * ни одного лишнего вызова в модуль.
+     *
+     * Раскладывать в углы (Euler YXZ, порядок root.rotation в renderer.js)
+     * тут не нужно: rr.setCarState передаст кватернион как есть, а
+     * разложением займётся сам three.js — тем же кодом и тем же порядком,
+     * что и rotation.order='YXZ' у машины, без риска разъехаться в знаке.
+     */
+    _readLocalTilt(state) {
+        const rapier = this.rapier;
+        const o = rapier.abi.CarOut;
+        const out = rapier.host.outputs;
+        const base = rapier.idx * o.FLOATS;
+        state.qx = out[base + o.QX];
+        state.qy = out[base + o.QY];
+        state.qz = out[base + o.QZ];
+        state.qw = out[base + o.QW];
+    }
+
+    /**
      * Один фиксированный шаг: предсказать свою машину, сохранить (seq,
      * buttons, state) и отправить бинарный ввод. Аллокаций нет — encodeInput
      * отдаёт переиспользуемый буфер, ws.send копирует его синхронно.
@@ -1627,6 +1652,7 @@ export class NetClient {
             // характеристик: характеристик у модуля снаружи нет (§12.28).
             rapier.step(buttons, BTN_MASK, state, this.roadDose(state));
             rapier.readInto(state, this.track);
+            this._readLocalTilt(state);
         } else {
             let stats = this.localStats;
             if (this.roadCount > 0) {

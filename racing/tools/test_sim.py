@@ -1005,6 +1005,109 @@ def check_ghosts(report):
     report.check(rows and rows[0]['dnf'] is True, 'в итогах сошедший помечен dnf')
 
 
+def check_records(report):
+    """server/records.py и server/room._physics_group: рекорды по физике (12.31).
+
+    Проверяется то, ради чего затевалось разделение: старый файл (версия 1,
+    ключи без суффикса — так писал только classic, Rapier рекорды раньше
+    не писал вовсе, §12.24) не теряет ни записи и не переименовывается, а
+    более быстрый круг на ДРУГОЙ физике не перебивает classic-рекорд —
+    иначе разделение было бы фикцией.
+    """
+    report.section('Рекорды: разделение по физике (12.31)')
+    import json as _json
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from server.records import RecordStore
+    from server.room import _physics_group
+
+    tmp_dir = _tempfile.mkdtemp(prefix='racing_records_test_')
+    try:
+        path = os.path.join(tmp_dir, 'records.json')
+        old_file = {
+            'version': 1,
+            'tracks': {
+                'serpentine': {
+                    'best': {'time': 39.58, 'name': 'Вася', 'car': 'rocket',
+                             'date': '2026-09-15 14:02'},
+                    'cars': {'rocket': {'time': 39.58, 'name': 'Вася',
+                                        'date': '2026-09-15 14:02'}},
+                },
+            },
+        }
+        with open(path, 'w', encoding='utf-8') as fh:
+            _json.dump(old_file, fh)
+
+        store = RecordStore(path, enabled=True).load()
+        best = store.best('serpentine')
+        report.check(best is not None and best['time'] == 39.58,
+                     'файл версии 1 (ключ без суффикса) читается как classic')
+        report.check(store.best('serpentine', physics='rapier_arcade') is None,
+                     'в старом файле рекордов Rapier нет — и не появляются из воздуха')
+
+        rec = store.submit('serpentine', False, 'wedge', 'Петя', 41.02, 'rapier_arcade')
+        report.check(rec is not None and rec['physics'] == 'rapier_arcade',
+                     'круг на rapier_arcade учтён отдельным разделом')
+        report.check(store.best('serpentine')['time'] == 39.58,
+                     'classic-рекорд не тронут заездом на другой физике')
+
+        # Круг куда быстрее classic-рекорда, но на ТРЕТЬЕЙ физике — не должен
+        # его побить. Это и есть проверка «времена не смешиваются», а не
+        # просто «числа не совпадают».
+        store.submit('serpentine', False, 'buggy', 'Валера', 20.0, 'rapier_sim')
+        report.check(store.best('serpentine')['time'] == 39.58,
+                     '20,0 с на rapier_sim не побили classic-рекорд 39,58 с')
+        report.check(store.best('serpentine', physics='rapier_sim')['time'] == 20.0,
+                     'rapier_sim учёл свой рекорд отдельно от classic и rapier_arcade')
+
+        table = {(row['track'], row['mirror'], row['physics']) for row in store.table()}
+        report.check(
+            {('serpentine', False, 'classic'), ('serpentine', False, 'rapier_arcade'),
+             ('serpentine', False, 'rapier_sim')} <= table,
+            'таблица для клиента несёт три раздела одной трассы с меткой физики')
+
+        store._dirty = True
+        store._write_now(store._serialize())
+        with open(path, encoding='utf-8') as fh:
+            on_disk = _json.load(fh)
+        report.check(on_disk['version'] == 2,
+                     'версия файла поднялась до 2 при первой новой записи')
+        report.check('serpentine' in on_disk['tracks']
+                     and 'serpentine#rapier_arcade' in on_disk['tracks']
+                     and 'serpentine#rapier_sim' in on_disk['tracks'],
+                     'на диске все три раздела, classic — тем же ключом, что в версии 1')
+
+        reread = RecordStore(path, enabled=True).load()
+        report.check(
+            reread.best('serpentine')['time'] == 39.58
+            and reread.best('serpentine', physics='rapier_arcade')['time'] == 41.02
+            and reread.best('serpentine', physics='rapier_sim')['time'] == 20.0,
+            'после записи и перечитывания с диска все три физики целы')
+    finally:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # server/room._physics_group: метка идёт от backend()/настройки комнаты
+    # напрямую (rapier_host.backend() читает переменную окружения на каждый
+    # вызов, без кеша — переключать можно без перезагрузки модулей).
+    saved = os.environ.get('RACING_PHYSICS')
+    try:
+        os.environ.pop('RACING_PHYSICS', None)
+        report.check(_physics_group({'physics': 'sim'}) == 'classic',
+                     'classic backend -> метка classic независимо от настройки комнаты')
+        os.environ['RACING_PHYSICS'] = 'rapier'
+        report.check(_physics_group({'physics': 'arcade'}) == 'rapier_arcade',
+                     'rapier + комната physics=arcade -> rapier_arcade')
+        report.check(_physics_group({'physics': 'sim'}) == 'rapier_sim',
+                     'rapier + комната physics=sim -> rapier_sim')
+        report.check(_physics_group({'physics': 'garbage'}) == 'rapier_arcade',
+                     'rapier + мусор в настройке -> умолчание rapier_arcade, не падение')
+    finally:
+        if saved is None:
+            os.environ.pop('RACING_PHYSICS', None)
+        else:
+            os.environ['RACING_PHYSICS'] = saved
+
+
 def check_snapshot(report):
     """Формат снапшота: кортежи раздела 12.3, ack на игрока."""
     report.section('Снапшот: формат 12.3')
@@ -2022,6 +2125,7 @@ def main(argv=None):
     check_drift(report)
     check_shortcut(report)
     check_ghosts(report)
+    check_records(report)
     check_snapshot(report)
     check_traffic(report)
     check_traffic_free_lane(report)

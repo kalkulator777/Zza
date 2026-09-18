@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import subprocess
@@ -88,30 +89,102 @@ def build_program(cars: int, ticks: int, seed: int = 20260915) -> str:
     return ''.join(out)
 
 
-def build_scenario() -> dict:
-    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', TRACK_ID + '.json'))
+# Прогон по трамплину (§12.30). Отдельный сценарий, а не правка старого:
+# хэши §12.27 сняты СО СТАРОГО, и менять его значило бы обесценить
+# записанные числа. Машины ставятся перед въездом и разложены поперёк
+# трамплина — по скосам, по сердцевине и мимо, — поэтому любое расхождение
+# коробок между хозяевами видно в первом же прыжке.
+RAMP_TICKS = 900
+RAMP_MARKS = (1, 60, 120, 200, 300, 450, 600, 900)
+RAMP_RUN_UP = 90.0          # м от въезда назад, где ставятся машины
+
+
+def _straightest_ramp(track):
+    """Трамплин с самым прямым разгоном перед ним.
+
+    Руля в программе нет: машины едут газом в пол по прямой, и въезд надо
+    выбрать такой, до которого они доедут. На кривом разгоне они упираются
+    в стену за 60 м до трамплина, и сверка движков становится сверкой двух
+    одинаково разбившихся машин — то есть проверкой, которая не может
+    покраснеть (§12.30: ровно это и случилось при первой попытке).
+    """
+    best, best_turn = 0, None
+    n = track._n
+    for k, ramp in enumerate(track.ramps):
+        i = int(((ramp['s0'] - RAMP_RUN_UP) % track.length) * track._inv_step) % n
+        stop = int((ramp['s0'] % track.length) * track._inv_step) % n
+        turn = 0.0
+        while i != stop:
+            j = (i + 1) % n
+            d = (math.atan2(track._ctx[j], track._ctz[j])
+                 - math.atan2(track._ctx[i], track._ctz[i]))
+            while d > math.pi:
+                d -= 2.0 * math.pi
+            while d < -math.pi:
+                d += 2.0 * math.pi
+            turn += abs(d)
+            i = j
+        if best_turn is None or turn < best_turn:
+            best, best_turn = k, turn
+    return track.ramps[best]
+
+
+def _ramp_spawn(track, index, count):
+    """(x, z, yaw) i-й машины перед трамплином с прямым разгоном."""
+    ramp = _straightest_ramp(track)
+    s = ramp['s0'] - RAMP_RUN_UP
+    n = track._n
+    f = (s % track.length) * track._inv_step
+    i = int(f) % n
+    t = f - int(f)
+    j = (i + 1) % n
+    hw = ramp['half_width']
+    # Поперёк: от внешнего скоса до внешнего скоса, с запасом в полметра.
+    lateral = ramp['offset'] + (2.0 * index / (count - 1.0) - 1.0) * (hw + 0.5)
+    x = (track._cx[i] + (track._cx[j] - track._cx[i]) * t
+         + track._cnx[i] * lateral)
+    z = (track._cz[i] + (track._cz[j] - track._cz[i]) * t
+         + track._cnz[i] * lateral)
+    return x, z, math.atan2(track._ctx[i], track._ctz[i]), i
+
+
+def build_scenario(track_id: str = TRACK_ID) -> dict:
+    track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', track_id + '.json'))
     catalog = load_cars(os.path.join(BASE_DIR, 'content', 'cars.json'))
     margin, height, friction = rh.mesh_params(track)
+    ramps = bool(getattr(track, 'ramps', ()))
+    ticks = RAMP_TICKS if ramps else TICKS
+    marks = RAMP_MARKS if ramps else MARKS
     cars = []
     for i, car_id in enumerate(CAR_IDS):
         spec = catalog.get(car_id)
-        grid = track.start_grid[i]
         tuning = rh.car_tuning(spec, 'arcade')
         rest = (tuning.get('wheel_radius', 0.34)
                 + tuning.get('suspension_rest', 0.30)
                 + tuning.get('half_height', 0.42) * 0.2)
-        ground = track.surface(grid['x'], grid['z'], 0)[3]
-        cars.append({'x': grid['x'], 'y': ground + rest, 'z': grid['z'],
-                     'yaw': grid['yaw'], 'tuning': tuning})
+        if ramps:
+            x, z, yaw, hint = _ramp_spawn(track, i, len(CAR_IDS))
+        else:
+            grid = track.start_grid[i]
+            x, z, yaw, hint = grid['x'], grid['z'], grid['yaw'], 0
+        ground = track.surface(x, z, hint)[3]
+        cars.append({'x': x, 'y': ground + rest, 'z': z,
+                     'yaw': yaw, 'tuning': tuning})
+    if ramps:
+        # Газ в пол и без руля: задача — доехать до кромки и улететь, а не
+        # накатать разнообразие. Разнообразие даёт поперечная раскладка.
+        program = ('1' * len(CAR_IDS)) * ticks
+    else:
+        program = build_program(len(CAR_IDS), ticks)
     return {
         'track': track.to_client(),
         'mesh': [margin, height, friction],
         'preset': 0,
         'settle': rh.SETTLE_TICKS,
-        'ticks': TICKS,
-        'marks': list(MARKS),
+        'ticks': ticks,
+        'marks': list(marks),
         'cars': cars,
-        'program': build_program(len(cars), TICKS),
+        'program': program,
     }
 
 
@@ -123,6 +196,9 @@ def run_wasmtime(scenario: dict) -> dict:
     verts, tris = host.track_hashes()
     mesh = {'verts': verts, 'tris': tris, 'size': list(host.mesh_size())}
     host.free_track_mesh()
+    # Трамплины: коробки из той же записи трассы (§12.30). На трассе без
+    # трамплинов вызов не делает ничего и старый сценарий не трогает.
+    mesh['ramps'] = host.add_ramps(scenario['track'], scenario['mesh'][2])
     for car in scenario['cars']:
         host.tuning_preset(scenario['preset'])
         host.set_tuning(car['tuning'])
@@ -241,8 +317,10 @@ def compare(results: dict) -> int:
     base = names[0]
     ref = results[base]
     print('')
-    print('сетка полотна: вершины %s, треугольники %s, размер %s'
-          % (ref['mesh']['verts'], ref['mesh']['tris'], tuple(ref['mesh']['size'])))
+    print('сетка полотна: вершины %s, треугольники %s, размер %s, '
+          'коробок трамплинов %s'
+          % (ref['mesh']['verts'], ref['mesh']['tris'], tuple(ref['mesh']['size']),
+             ref['mesh'].get('ramps', 0)))
     bad = 0
     for name in names[1:]:
         other = results[name]
@@ -250,6 +328,10 @@ def compare(results: dict) -> int:
                 or other['mesh']['tris'] != ref['mesh']['tris']):
             print('  РАСХОЖДЕНИЕ сетки у %s: %s / %s'
                   % (name, other['mesh']['verts'], other['mesh']['tris']))
+            bad += 1
+        if other['mesh'].get('ramps', 0) != ref['mesh'].get('ramps', 0):
+            print('  РАСХОЖДЕНИЕ числа коробок трамплинов у %s: %s против %s'
+                  % (name, other['mesh'].get('ramps'), ref['mesh'].get('ramps')))
             bad += 1
     print('')
     print('%-8s %-18s %-18s %s' % ('тик', 'хэш мира', 'хэш состояний', 'движки'))
@@ -281,12 +363,18 @@ def main(argv=None):
                         help='какие движки гонять через запятую')
     parser.add_argument('--keep', metavar='FILE', default=None,
                         help='сохранить сценарий в файл (для ручного прогона)')
+    parser.add_argument('--track', default=TRACK_ID,
+                        help='трасса сценария; с трамплинами (industrial, '
+                             'serpentine, ridge) машины ставятся перед '
+                             'въездом и летят (§12.30)')
     args = parser.parse_args(argv)
     wanted = [name.strip() for name in args.engines.split(',') if name.strip()]
 
-    print('стенд сверки движков: трасса %s, %d машин, %d тиков, %d контрольных точек'
-          % (TRACK_ID, len(CAR_IDS), TICKS, len(MARKS)))
-    scenario = build_scenario()
+    scenario = build_scenario(args.track)
+    print('стенд сверки движков: трасса %s, %d машин, %d тиков, '
+          '%d контрольных точек'
+          % (args.track, len(scenario['cars']), scenario['ticks'],
+             len(scenario['marks'])))
     tmp = args.keep or os.path.join(tempfile.mkdtemp(prefix='wasm-parity-'),
                                     'scenario.json')
     with open(tmp, 'w', encoding='utf-8') as fh:

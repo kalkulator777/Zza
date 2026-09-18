@@ -25,6 +25,9 @@ export function runScenario(host, RapierHostClass, scenario) {
     const mesh = { verts: host.trackHashes()[0], tris: host.trackHashes()[1],
                    size: host.meshSize() };
     host.freeTrackMesh();
+    // Трамплины: коробки из той же записи трассы (§12.30). На трассе без
+    // трамплинов вызов не делает ничего.
+    mesh.ramps = host.addRamps(scenario.track, scenario.mesh[2]);
     for (const car of scenario.cars) {
         host.tuningPreset(scenario.preset | 0);
         host.setTuning(car.tuning);

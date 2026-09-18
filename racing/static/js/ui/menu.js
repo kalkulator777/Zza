@@ -1469,7 +1469,8 @@ export class MenuScreen {
             const head = el('div', 'rec-head');
             head.appendChild(el('span', 'theme-chip theme-' + (track.theme || 'city')));
             const title = el('span', 'rec-track',
-                (track.name || entry.track) + (entry.mirror ? ' (зеркало)' : ''));
+                (track.name || entry.track) + (entry.mirror ? ' (зеркало)' : '')
+                + _physicsSuffix(entry.physics));
             head.appendChild(title);
             if (entry.best) {
                 head.appendChild(el('span', 'rec-best num', formatLap(entry.best.time)));
@@ -1611,6 +1612,18 @@ function formatLap(seconds) {
     const csText = cs < 10 ? '0' + cs : String(cs);
     if (m > 0) return m + ':' + (s < 10 ? '0' + s : s) + '.' + csText;
     return s + '.' + csText;
+}
+
+// Метка физики у строки таблицы рекордов (server/records.py, §12.31):
+// classic не подписывается вовсе — рекорды до разделения выглядели так же,
+// и большинство разделов надолго останутся classic.
+const PHYSICS_LABELS = {
+    rapier_arcade: ' · Rapier: аркада',
+    rapier_sim: ' · Rapier: симулятор',
+};
+
+function _physicsSuffix(physics) {
+    return PHYSICS_LABELS[physics] || '';
 }
 
 /** «1 трасса», «3 трассы», «5 трасс» — окончание по числу. */

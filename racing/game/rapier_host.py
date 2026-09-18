@@ -85,6 +85,15 @@ def race_enabled() -> bool:
 # машин в модуле стоят 122 мкс на тик, шестнадцать — 258, а болванок надо
 # двенадцать, то есть двадцать тел, которые в MAX_CARS не влезают вовсе.
 #
+# ГАНДИКАП ИЗ ЭТОГО СПИСКА УШЁЛ (§12.30). Он лежал здесь потому, что
+# комната подменяла характеристики машины ПОСЛЕ конструктора симуляции, то
+# есть после того, как тела уже расставлены, а перенастроить живое тело
+# модуль не умеет: CarTuning читается один раз, в spawn_car. Разобрано это
+# двумя правками: ``Simulation.apply_handicap`` — единственная дверь, и она
+# пересобирает мир Rapier с уже замедленной машиной; ``car_tuning``
+# домножает те же поля в CarTuning, потому что тяга и потолок скорости у
+# модуля СВОИ, из блока tuning, и stats он для них не читает.
+#
 # Столкновения в этом списке с другой стороны: их Rapier считает ВНУТРИ
 # шага, и выключить их нечем — групп столкновений в ABI нет. Галочка
 # «Столкновения» при этом режиме не врёт только принудительно включённой.
@@ -92,11 +101,6 @@ def race_enabled() -> bool:
 # (имя поля настроек, во что оно ставится, что сказать игроку)
 RESTRICTED = (
     ('collisions', True, 'столкновения включены всегда'),
-    # Гандикап подменяет ХАРАКТЕРИСТИКИ машины уже после того, как мир
-    # создан и тела расставлены, а перенастроить живую машину модуль не
-    # умеет: настройки читаются один раз, в spawn_car. Оставить галочку
-    # включённой значило бы обещать замедление победителя и не делать его.
-    ('handicap', False, 'гандикап выключен'),
 )
 
 
@@ -166,7 +170,7 @@ except OSError as _exc:          # native/abi/ не на месте — repo б�
 # берёт те же числа из присланной записи трассы. На 4b два из них лежали
 # по копии в каждом хозяине — эта копия убрана.
 from .track import (WALL_MARGIN, WALL_HEIGHT,         # noqa: E402  (после _load_abi)
-                    TRACK_FRICTION)
+                    TRACK_FRICTION, RAMP_BOX_FLOATS)
 
 
 class HostError(RuntimeError):
@@ -373,6 +377,54 @@ class RapierHost(object):
                             '(1 — осевая не залита, 2 — Rapier не принял сетку)' % code)
         self._sync(force=True)
 
+    def add_box(self, hx: float, hy: float, hz: float, x: float, y: float,
+                z: float, yaw: float, pitch: float, friction: float,
+                mass: float = 0.0) -> None:
+        """Коробка в мире. ``mass <= 0`` — неподвижный коллайдер (§12.30).
+
+        Неподвижная коробка ТЕЛА не заводит: в ``world.rs`` ветка ``mass <= 0``
+        кладёт только коллайдер и в ``PROPS`` ничего не пишет. Значит
+        ``MAX_PROPS`` (64 подвижных предмета) на трамплины не расходуется —
+        замерено проверкой ``rp_prop_count() == 0`` в барьерах.
+        """
+        self._ex['rp_add_box'](self._store, float(hx), float(hy), float(hz),
+                               float(x), float(y), float(z), float(yaw),
+                               float(pitch), float(friction), float(mass))
+
+    def add_ramps(self, track, friction: float) -> int:
+        """Поставить трамплины трассы неподвижными коробками. Вернуть счёт.
+
+        Числа НЕ считаются здесь: они выведены один раз в ``game/track.py``
+        (``Track._ramp_boxes``) и уехали клиенту в ``to_client()`` вместе с
+        остальной геометрией трамплина. Оба хозяина берут их отсюда, поэтому
+        коробки у сервера и у браузера одинаковы по построению, а не по
+        договорённости — то же решение, что с сеткой полотна (§12.30).
+
+        ``friction`` — трение полотна, УЖЕ домноженное на погоду: трамплин
+        сделан из того же асфальта, что дорога под ним.
+        """
+        rows = track.get('ramps') if isinstance(track, dict) else getattr(track, 'ramps', ())
+        count = 0
+        stride = RAMP_BOX_FLOATS
+        for row in rows or ():
+            box = row.get('boxes') or ()
+            if len(box) % stride:
+                raise HostError('коробки трамплина: %d чисел, не кратно %d'
+                                % (len(box), stride))
+            for k in range(0, len(box), stride):
+                self.add_box(box[k], box[k + 1], box[k + 2], box[k + 3],
+                             box[k + 4], box[k + 5], box[k + 6], box[k + 7],
+                             friction, 0.0)
+                count += 1
+        if count:
+            # Вставка коллайдеров могла подвинуть память модуля: виды после
+            # неё недействительны. Один раз на все коробки, а не на каждую.
+            self._sync(force=True)
+        return count
+
+    def prop_count(self) -> int:
+        return self._ex['rp_prop_count'](self._store)
+
     def add_ground(self, half_size: float = 300.0, friction: float = TRACK_FRICTION) -> None:
         self._ex['rp_add_ground'](self._store, float(half_size), float(friction))
         self._sync(force=True)
@@ -522,7 +574,8 @@ from .physics import (DRIFT_CHARGE_L1, DRIFT_CHARGE_L2,   # noqa: E402
 SPEED_DROP_SLOW = 1.0 - SLOW_FACTOR   # доля продольной скорости за шаг «Грозы»
 
 
-def car_tuning(stats, mode: str) -> dict:
+def car_tuning(stats, mode: str, handicap: float = 1.0,
+               handicap_fields=()) -> dict:
     """Правки CarTuning для машины каталога в выбранном режиме (§12.23).
 
     ``stats`` — ``game.cars.CarSpec`` из ``content/cars.json`` либо
@@ -552,7 +605,30 @@ def car_tuning(stats, mode: str) -> dict:
         return values
     values.update(tuning.get('body') or {})
     values.update(tuning.get(mode) or {})
+    _handicap_tuning(values, handicap, handicap_fields)
     return values
+
+
+def _handicap_tuning(values: dict, handicap: float, fields) -> None:
+    """Домножить поля гандикапа в ГОТОВОМ наборе настроек (§12.30).
+
+    Правило одно на оба хозяина: ``car_tuning`` получает КАТАЛОЖНЫЕ числа и
+    множитель, и режет названные поля сама. Ни сервер, ни браузер не подают
+    сюда заранее замедленные характеристики — иначе ``boost_speed``
+    (единственное поле, которое приезжает из ``stats``, а не из блока
+    ``tuning``) резался бы дважды на одной стороне и один раз на другой,
+    и предсказание разъехалось бы с сервером на ровном месте.
+
+    Почему вообще надо резать здесь. У модуля тяга и потолок скорости СВОИ,
+    из блока ``tuning``: ``stats.engine_force`` он не читает. Гандикап,
+    наложенный только на ``stats``, при Rapier не делал бы ничего — ровно та
+    молчащая галочка, из-за которой он и лежал в ``RESTRICTED``.
+    """
+    if handicap == 1.0 or not (handicap > 0.0):
+        return
+    for name in fields:
+        if name in values:
+            values[name] = values[name] * handicap
 
 
 class ShadowWorld(object):
@@ -572,6 +648,10 @@ class ShadowWorld(object):
         self.host = RapierHost(wasm_path, self.preset)
         self.host.build_track(sim.track)
         self.host.free_track_mesh()
+        # Трамплины ставятся и в тени: теневой мир меряет цену тика и хэш
+        # мира на ЖИВОЙ трассе, а трасса с трамплинами — это трасса с
+        # трамплинами. Без них замер тени врал бы в меньшую сторону.
+        self.host.add_ramps(sim.track, mesh_params(sim.track)[2])
         self.slots = []
         for car in sim.cars:
             state = car.state
@@ -664,10 +744,20 @@ FELL_THROUGH = 8.0
 # машина, которая не может сдвинуть себя ничем. Если она при этом ещё и
 # стоит, состояние терминальное.
 #
+# ВТОРОЙ СЛУЧАЙ, найденный на трамплинах (§12.30): машина стоит ВНЕ ПОЛОТНА,
+# всеми четырьмя колёсами на земле, упершись в стену, и не едет никуда.
+# Замерено на serpentine: lateral -6,40 м при полуширине 4,75, четыре колеса
+# в контакте, скорость 0,0 м/с, состояние держалось до конца потолка времени
+# гонки (26 500 тиков). Проверка по колёсам его не ловит и не может: колёса
+# на месте, это не переворот. У классики такого состояния не бывает
+# вовсе — шаг 14 выталкивает из стены каждый тик, — поэтому сеть Rapier
+# обязана покрывать и его. Мера та же: «стоит там, где стоять нельзя,
+# дольше трёх секунд».
+#
 # FLIPPED_SPEED = 1,0 м/с — уже остановилась, а не скользит. FLIPPED_TIME =
-# 3,0 с — вдвое больше самого долгого полёта в замерах паритета (2,84 м
-# высоты, 1,4 с), да и в полёте скорость много выше метра в секунду, так
-# что прыжок под сеть не попадает дважды.
+# 3,0 с — вдвое больше самого долгого полёта в замерах (1,62 с на самом
+# высоком трамплине industrial, §12.30), да и в полёте скорость много выше
+# метра в секунду, так что прыжок под сеть не попадает дважды.
 FLIPPED_WHEELS = 2.0
 FLIPPED_SPEED = 1.0
 FLIPPED_TIME = 3.0
@@ -689,10 +779,11 @@ class RapierRace(object):
     * шаг 14 (границы полотна) — стены стоят в сетке, солвер держит их сам;
       хозяину остаётся флаг ``offtrack`` (его читает HUD и снапшот) и сеть
       безопасности на случай вылета за мир;
-    * шаг 14б (трамплины) — трамплинов в сетке нет, зато есть настоящий
-      рельеф: подъёмы тормозят, спуски разгоняют. ``height`` считается от
-      полотна, как и раньше, но её теперь диктует не геометрия трамплина,
-      а сама машина;
+    * шаг 14б (трамплины) — отдельного шага нет: трамплин стоит в мире
+      настоящей геометрией, неподвижными коробками ``rp_add_box``, и машина
+      взлетает с него сама (§12.30). ``height`` по-прежнему считает хозяин
+      как разницу между позой тела и полотном, но диктует её теперь не
+      профиль ``ramp_h``, а физика: и на трамплине, и на кочке рельефа;
     * шаг 15 (заряд заноса и награда) — целиком в модуле, числа 6.3
       приезжают снаружи в ``CarTuning`` (§12.24);
     * шаг 16 (прогресс, круги, отсечки) — остаётся в ``game/track.py``
@@ -713,23 +804,59 @@ class RapierRace(object):
 
     def __init__(self, sim, wasm_path: str = WASM_PATH):
         self.sim = sim
-        track = sim.track
         self.preset = preset_index(sim.settings.get('physics'))
         self.mode = PRESET_NAMES[self.preset]
         self.host = RapierHost(wasm_path, self.preset)
+        self.ticks = 0
+        self.micros = []
+        # Выход RoadEvents.solid_resolve: x, z, vx, vz, затухание.
+        self._solid = [0.0, 0.0, 0.0, 0.0, 1.0]
+        self._coll_rows = []     # что было у гонщиков до прохода столкновений
+        self.ramp_boxes = 0
+        self._build()
+
+    def rebuild(self) -> None:
+        """Пересобрать мир с нуля. Зовётся, когда характеристики машины
+        поменялись ДО первого тика — то есть гандикапом (§12.30).
+
+        Перенастроить живое тело модуль не умеет: ``CarTuning`` читается один
+        раз, в ``spawn_car``. Значит машину с гандикапом надо СОЗДАТЬ уже
+        замедленной. Ни одного тика ещё не было, состояния машин — те же
+        стартовые, что при первой сборке, поэтому пересборка даёт ровно тот
+        мир, который получился бы, приди гандикап на шаг раньше.
+        """
+        if self.ticks:
+            raise HostError('пересборка мира после начала гонки: тиков уже %d'
+                            % self.ticks)
+        self._build()
+
+    def _build(self):
+        sim = self.sim
+        track = sim.track
         # Погода правится ТРЕНИЕМ СЕТКИ полотна: она одна на всю трассу и
         # на обе стороны, ей персональная доза не нужна. Покрытие ПОД
         # ОТДЕЛЬНОЙ МАШИНОЙ — масло и обломки — едет другой дорогой:
         # CarEffect.grip_drop и speed_drop, см. _write_effect (§12.28).
         margin, height, friction = mesh_params(track)
-        self.host.build_track(track, margin, height, friction * sim.grip_mul)
+        friction *= sim.grip_mul
+        self.host.reset(self.preset)
+        self.host.build_track(track, margin, height, friction)
         self.host.free_track_mesh()
+        # Трамплины: настоящая геометрия, неподвижные коробки (§12.30).
+        # Трение то же, что у полотна, вместе с погодой: трамплин сделан из
+        # того же асфальта, что дорога под ним.
+        self.ramp_boxes = self.host.add_ramps(track, friction)
 
         self.slots = []          # (car, idx, in_base, out_base, rest_y)
         for car in sim.cars:
             state = car.state
             self.host.tuning_preset(self.preset)
-            self.host.set_tuning(car_tuning(car.stats, self.mode))
+            # Каталожные характеристики, а не замедленные: множитель
+            # гандикапа car_tuning накладывает сама (§12.30).
+            self.host.set_tuning(car_tuning(getattr(car, 'stats_base', car.stats),
+                                            self.mode,
+                                            getattr(car, 'handicap', 1.0),
+                                            getattr(car, 'handicap_stats', ())))
             tuning = self.host.tuning_values()
             # Высота центра кузова, когда машина стоит колёсами на полотне:
             # колесо плюс ход подвески плюс вынос точки крепления вниз
@@ -743,12 +870,6 @@ class RapierRace(object):
                                idx * abi.CarOut.FLOATS, rest_y, 1.0 / steer_max,
                                idx * abi.CarEffect.FLOATS,
                                [0.0, 0.0, 0.0, 0.0], 0.0])
-
-        self.ticks = 0
-        self.micros = []
-        # Выход RoadEvents.solid_resolve: x, z, vx, vz, затухание.
-        self._solid = [0.0, 0.0, 0.0, 0.0, 1.0]
-        self._coll_rows = []     # что было у гонщиков до прохода столкновений
         self._settle()
 
     # --- расстановка ----------------------------------------------------
@@ -1034,9 +1155,11 @@ class RapierRace(object):
                 entry[8] = 0.0
                 advance(state, i)
                 continue
-            # Машина на крыше или на боку: колёса не достают до полотна,
-            # газ не делает ничего. Считаем секунды, а не тики.
-            if grounded < FLIPPED_WHEELS and speed < FLIPPED_SPEED:
+            # Машина на крыше, на боку — или упёршаяся в стену вне полотна:
+            # в первом случае газ не делает ничего (тяга идёт через колесо в
+            # контакте), во втором ехать некуда. Считаем секунды, а не тики.
+            if speed < FLIPPED_SPEED and (grounded < FLIPPED_WHEELS
+                                          or state.offtrack):
                 entry[8] += physics.DT
                 if entry[8] >= FLIPPED_TIME:
                     entry[8] = 0.0

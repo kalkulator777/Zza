@@ -32,6 +32,7 @@ from game import protocol
 from game import rapier_host
 
 from . import config
+from . import records as records_mod
 from .player import sanitize_text
 
 
@@ -69,6 +70,23 @@ def resolve_simulation(log=None):
 def simulation_is_stub():
     """Работает ли сейчас заглушка вместо настоящей симуляции."""
     return _SIM_IS_STUB
+
+
+def _physics_group(settings):
+    """Метка режима физики для ключа рекордов (server/records.py, §12.31).
+
+    ``classic`` — включая ``shadow``: гонку в обоих случаях считает
+    ``game/physics.py``, Rapier там крутится максимум тенью и на времена не
+    влияет. Внутри настоящего Rapier (``race_enabled()``) физик две —
+    ``arcade`` и ``sim`` (§12.23, настройка комнаты ``physics``), и у них
+    тоже разные времена (§12.24: разброс кругов на avenue вырос втрое).
+    """
+    if not rapier_host.race_enabled():
+        return records_mod.CLASSIC_PHYSICS
+    mode = settings.get('physics')
+    if mode not in config.PHYSICS_MODES:
+        mode = config.PHYSICS_MODES[0]
+    return 'rapier_' + mode
 
 
 # --- ошибки настроек ---------------------------------------------------------
@@ -1174,14 +1192,12 @@ class Room(object):
             self._system_chat('Этап %d из %d: %s'
                               % (champ.stage_number(), champ.stages,
                                  content.track_name(self.settings['track'])))
-        # Трамплины при physics=rapier из записи трассы вынимаются (§12.24):
-        # в сетке полотна их нет, шаг 14б модулю неизвестен, и машина сквозь
-        # них проезжает. Оставить их нарисованными значило бы показать игроку
-        # прыжок, которого не будет, — честнее не рисовать вовсе.
+        # Трамплины едут КЛИЕНТУ ВСЕГДА (§12.30). До 4i при physics=rapier
+        # они отсюда вынимались: в сетке полотна их не было, машина ехала
+        # сквозь, и рисовать прыжок, которого не будет, было бы враньём.
+        # Теперь трамплин стоит в мире Rapier настоящей геометрией, и обе
+        # физики берут его из одной и той же записи трассы.
         track_payload = track.to_client()
-        if rapier_host.race_enabled() and track_payload.get('ramps'):
-            track_payload = dict(track_payload)
-            track_payload['ramps'] = []
 
         self.broadcast({
             't': 'race_init',
@@ -1222,10 +1238,10 @@ class Room(object):
         """Наложить гандикап на победителя прошлой гонки, если он поехал."""
         self._handicap_slot = -1
         self._handicap_factor = 0.0
-        # Настройки берутся У СИМУЛЯЦИИ, а не у комнаты: при physics=rapier
-        # она могла опустить гандикап (§12.24), и накладывать его после
-        # этого значило бы подменить характеристики, которых мир уже не
-        # прочитает, — то есть тихо ничего не сделать.
+        # Настройки берутся У СИМУЛЯЦИИ, а не у комнаты: она имеет право
+        # опустить часть механик (§12.24), и накладывать опущенное значило бы
+        # обещать игроку то, чего не будет. Гандикап из этого списка ушёл на
+        # §12.30, но правило осталось.
         settings = getattr(sim, 'settings', None) or self.settings
         if not settings.get('handicap') or not self._last_winner_key:
             return
@@ -1241,18 +1257,18 @@ class Room(object):
             return                       # заглушка симуляции: молча мимо
         factor = config.HANDICAP_FACTOR
         try:
-            from game import physics
-            car = getter(target.slot)
-            if car is None:
+            # Накладывает гандикап САМА симуляция (§12.30). Прежняя сборка
+            # перебором physics.CarStats.__slots__ жила здесь и делала две
+            # вещи неправильно: теряла блок tuning каталожной записи (по
+            # нему Rapier собирает машине кузов и управляемость) и ничего
+            # не сообщала миру Rapier, где тела уже расставлены по прежним
+            # характеристикам. Обе чинятся на стороне game/, и обе — там,
+            # где эти знания и живут.
+            apply = getattr(sim, 'apply_handicap', None)
+            if apply is None:
+                return                   # заглушка симуляции: молча мимо
+            if apply(target.slot, factor, config.HANDICAP_STATS) is None:
                 return
-            base = car.stats
-            values = {}
-            for name in physics.CarStats.__slots__:
-                value = float(getattr(base, name))
-                if name in config.HANDICAP_STATS:
-                    value *= factor
-                values[name] = value
-            car.stats = physics.CarStats(**values)
         except Exception as exc:
             self._log('комната %s: гандикап не применился: %s' % (self.id, exc))
             return
@@ -1361,17 +1377,16 @@ class Room(object):
         store = self.manager.records
         if store is None or not store.enabled:
             return
-        # Круг, проеханный на Rapier, в общую таблицу не идёт (§12.24):
-        # таблица рекордов разбита по трассе и машине, но не по физике, а
-        # времена у двух физик разные. Смешать их значит сделать таблицу
-        # бессмысленной для обеих.
-        if rapier_host.race_enabled():
-            return
         slot = event.get('slot')
+        # Таблица рекордов разбита ещё и по физике (§12.24, §12.31): времена
+        # classic, rapier-arcade и rapier-sim не совпадают, и смешать их в
+        # одном разделе значит сделать рекорд одной физики недостижимым
+        # (или тривиальным) в другой.
+        physics = _physics_group(self.settings)
         record = store.submit(self.settings['track'], self.settings['mirror'],
                               self._race_cars.get(slot),
                               self._race_names.get(slot, ''),
-                              event.get('time'))
+                              event.get('time'), physics)
         if record is None:
             return
         content = self.manager.content
@@ -1383,6 +1398,7 @@ class Room(object):
             'track': record['track'],
             'track_name': content.track_name(record['track']),
             'mirror': record['mirror'],
+            'physics': record['physics'],
             'car': record['car'],
             'time': record['time'],
             'scope': record['scope'],

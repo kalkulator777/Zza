@@ -107,7 +107,9 @@ export const GFX_KEYS = {
     weather: 'racing.gfx.weather',
     tireMarks: 'racing.gfx.tiremarks',
     carReflect: 'racing.gfx.carreflect',
-    toneMap: 'racing.gfx.tonemap'
+    toneMap: 'racing.gfx.tonemap',
+    // добавлена вместе с настоящим креном своей машины при Rapier (§12.31)
+    bodyTilt: 'racing.gfx.bodytilt'
 };
 
 export const DECOR_LEVELS = ['sparse', 'normal', 'dense'];
@@ -160,19 +162,23 @@ export const GFX_PRESETS = {
         // запечённый свет включён и на низком: он не тратит ресурсы,
         // а освобождает — треть памяти геометрии и 12 байт выборки на вершину
         bakedLight: true, wetRoad: false, weather: 'auto', tireMarks: false,
-        carReflect: false, toneMap: false
+        carReflect: false, toneMap: false,
+        // разложение кватерниона одной машины — это единицы флопов на
+        // кадр, дешевле, чем уже идущее приближение по скольжению; включён
+        // и на низком
+        bodyTilt: true
     },
     medium: {
         ao: true, glow: true, decor: 'normal', decorAnim: true, particles: 'normal',
         renderScale: 0.75, viewDistance: 'normal', nightLights: 'normal', timeOfDay: 'auto',
         bakedLight: true, wetRoad: true, weather: 'auto', tireMarks: true,
-        carReflect: true, toneMap: true
+        carReflect: true, toneMap: true, bodyTilt: true
     },
     high: {
         ao: true, glow: true, decor: 'dense', decorAnim: true, particles: 'many',
         renderScale: 1.0, viewDistance: 'far', nightLights: 'bright', timeOfDay: 'auto',
         bakedLight: true, wetRoad: true, weather: 'auto', tireMarks: true,
-        carReflect: true, toneMap: true
+        carReflect: true, toneMap: true, bodyTilt: true
     }
 };
 
@@ -236,6 +242,7 @@ export function loadGfxSettings(quality) {
         tireMarks: readBool(GFX_KEYS.tireMarks, preset.tireMarks),
         carReflect: readBool(GFX_KEYS.carReflect, preset.carReflect),
         toneMap: readBool(GFX_KEYS.toneMap, preset.toneMap),
+        bodyTilt: readBool(GFX_KEYS.bodyTilt, preset.bodyTilt),
         renderScale: RENDER_SCALES.indexOf(scaleRaw) >= 0 ? scaleRaw : preset.renderScale
     };
 }
@@ -257,6 +264,7 @@ export function saveGfxSettings(patch, quality) {
     if (patch.tireMarks !== undefined) lsSet(GFX_KEYS.tireMarks, patch.tireMarks ? '1' : '0');
     if (patch.carReflect !== undefined) lsSet(GFX_KEYS.carReflect, patch.carReflect ? '1' : '0');
     if (patch.toneMap !== undefined) lsSet(GFX_KEYS.toneMap, patch.toneMap ? '1' : '0');
+    if (patch.bodyTilt !== undefined) lsSet(GFX_KEYS.bodyTilt, patch.bodyTilt ? '1' : '0');
     return loadGfxSettings(quality);
 }
 
@@ -290,6 +298,9 @@ export const GFX_OPTIONS = [
       hint: 'Чёрные полосы там, где несло и тормозили юзом. Копятся за гонку.' },
     { key: 'toneMap', kind: 'toggle', label: 'Тональная коррекция',
       hint: 'Мягкие света и глубокие тени вместо плоской заливки.' },
+    { key: 'bodyTilt', kind: 'toggle', label: 'Настоящий крен кузова',
+      hint: 'Только при физике Rapier и только своя машина: кузов валится '
+          + 'по-настоящему, а не по прикидке из скорости и руля.' },
     { key: 'decorAnim', kind: 'toggle', label: 'Анимация декора',
       hint: 'Качание деревьев и флагов, движение толпы.' },
     { key: 'decor', kind: 'enum', values: DECOR_LEVELS, label: 'Плотность декора' },
@@ -345,6 +356,12 @@ const ROLL_MAX = 0.16;
 const PITCH_FROM_ACCEL = 0.0075; // рад на м/с² продольного ускорения
 const PITCH_MAX = 0.075;
 const BODY_LERP = 9.0;           // 1/с, сглаживание кренов
+// Крен и тангаж СВОЕЙ машины из настоящей физики Rapier (§12.24/§12.31):
+// кватернион приходит от net.js бесплатно (своя машина, предсказание уже
+// всё это считает), разложить в углы Эйлера тем же порядком, что и
+// root.rotation ('YXZ') — переиспользуемые объекты, ноль аллокаций в кадре.
+const _tiltQuat = new THREE.Quaternion();
+const _tiltEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 const TERRAIN_LERP = 12.0;
 const SLOPE_SAMPLE = 1.4;        // м вперёд/назад для замера уклона
 
@@ -466,6 +483,12 @@ class CarView {
         this.terrainPitch = 0;
         this.prevVfwd = 0;
         this.accel = 0;
+
+        // Настоящий крен/тангаж из физики (§12.24/§12.31): только своя
+        // машина при Rapier, задаётся setCarState. hasTilt=false — обычная
+        // прикидка по скольжению и рулю, как всегда.
+        this.hasTilt = false;
+        this.qx = 0; this.qy = 0; this.qz = 0; this.qw = 1;
 
         this.halfWidth = 0.8;
         this.halfLength = 2.0;
@@ -1303,9 +1326,15 @@ export class RaceRenderer {
 
     /**
      * Состояние одной машины на этот кадр (уже интерполированное в net.js).
+     *
+     * qx..qw — необязательные, только для своей машины при Rapier (§12.31):
+     * настоящий кватернион кузова из клиентской физики, бесплатно по сети
+     * (net.js._readLocalTilt). Classic и чужие машины их не передают —
+     * поведение не меняется ни байтом.
      * @param {number} slot 0..7
      */
-    setCarState(slot, x, z, yaw, vx, vz, steer, flags, driftCharge) {
+    setCarState(slot, x, z, yaw, vx, vz, steer, flags, driftCharge,
+               qx, qy, qz, qw) {
         if (slot < 0 || slot >= MAX_CARS) return;
         const v = this.views[slot];
         if (!v.present) return;
@@ -1318,6 +1347,10 @@ export class RaceRenderer {
         v.flags = flags;
         v.driftCharge = driftCharge;
         v.fresh = true;
+        v.hasTilt = this.gfx.bodyTilt && qx !== undefined && qw !== undefined;
+        if (v.hasTilt) {
+            v.qx = qx; v.qy = qy; v.qz = qz; v.qw = qw;
+        }
     }
 
     /**
@@ -1837,7 +1870,18 @@ export class RaceRenderer {
 
         const root = mesh.root;
         root.position.set(v.x, v.y, v.z);
-        root.rotation.set(v.terrainPitch + v.bodyPitch + v.airPitch, v.yaw, v.roll);
+        if (v.hasTilt) {
+            // Настоящий крен (§12.24/§12.31): кватернион кузова из Rapier,
+            // разложенный тем же порядком осей, что и rotation машины —
+            // 'YXZ'. Курс — свой (v.yaw, интерполяция + доворот
+            // реконсиляции), не из кватерниона: они и так должны совпадать,
+            // а v.yaw уже сглажен под камеру и сеть.
+            _tiltQuat.set(v.qx, v.qy, v.qz, v.qw);
+            _tiltEuler.setFromQuaternion(_tiltQuat, 'YXZ');
+            root.rotation.set(_tiltEuler.x, v.yaw, _tiltEuler.z);
+        } else {
+            root.rotation.set(v.terrainPitch + v.bodyPitch + v.airPitch, v.yaw, v.roll);
+        }
 
         // --- колёса ----------------------------------------------------------
         v.wheelSpin += (vfwd / v.wheelRadius) * dt;

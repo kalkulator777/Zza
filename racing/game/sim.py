@@ -93,6 +93,36 @@ _CATALOG = None
 _CATALOG_TRIED = False
 _DEFAULT_STATS = physics.CarStats()
 
+
+def scale_stats(stats, factor, names):
+    """Копия характеристик с ``names``, умноженными на ``factor`` (§12.30).
+
+    Тип записи СОХРАНЯЕТСЯ. Для каталожной машины это снова ``CarSpec`` —
+    со своим блоком ``tuning``, который читает Rapier, и с пересчитанными
+    ``top_speed`` / ``boost_top``. Для машины по умолчанию — ``CarStats``.
+    """
+    if factor == 1.0 or not names:
+        return stats
+    shape = getattr(stats, 'shape', None)
+    tuning = getattr(stats, 'tuning', None)
+    if shape is None or tuning is None:
+        values = {}
+        for name in physics.CarStats.__slots__:
+            value = float(getattr(stats, name))
+            if name in names:
+                value *= factor
+            values[name] = value
+        return physics.CarStats(**values)
+    from .cars import CarSpec
+    scaled = dict(stats.stats)
+    for name in names:
+        if name in scaled:
+            scaled[name] = float(scaled[name]) * factor
+    return CarSpec({'id': stats.id, 'name': stats.name, 'desc': stats.desc,
+                    'stats': scaled, 'shape': dict(shape),
+                    'bars': dict(stats.bars), 'tuning': tuning})
+
+
 CONTENT_CARS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     'content', 'cars.json')
@@ -134,6 +164,7 @@ class RaceCar(object):
         'finished', 'finish_order', 'finish_time',
         'dnf', 'ghost', 'ghost_time', 'removed',
         'oil_stats', 'oil_src', 'oil_factor',
+        'handicap', 'handicap_stats', 'stats_base',
     )
 
     def __init__(self, slot, name, car_id, color, stats, grid):
@@ -168,6 +199,38 @@ class RaceCar(object):
         self.oil_stats = None
         self.oil_src = None
         self.oil_factor = 0.0
+        # Гандикап победителя прошлой гонки (§12.30): множитель и список
+        # полей, на которые он лёг. Единица — гандикапа нет. Число нужно
+        # обеим физикам: классика читает уже замедленные ``stats``, а Rapier
+        # ещё и домножает те же поля в CarTuning — у модуля тяга и потолок
+        # скорости СВОИ, из блока ``tuning``, и ``stats`` он их не берёт.
+        self.handicap = 1.0
+        self.handicap_stats = ()
+        # Каталожная запись до гандикапа. Классика читает ``stats`` (уже
+        # замедленные), Rapier — эту: множитель он накладывает сам, на поля
+        # блока ``tuning``, которых в ``stats`` нет вовсе (§12.30).
+        self.stats_base = stats
+
+    def apply_handicap(self, factor, names):
+        """Замедлить машину на ``factor`` по полям ``names``.
+
+        Заменяет прежнюю сборку перебором ``physics.CarStats.__slots__``
+        (она жила в ``server/room.py``). Разница принципиальная: там из
+        каталожной записи получался голый ``CarStats``, у которого НЕТ поля
+        ``tuning``, — а по нему Rapier собирает машине кузов и управляемость.
+        Машина с гандикапом уезжала бы на чистом пресете режима: другой
+        габарит, другая масса, другая тяга. Здесь копия сохраняет тип
+        записи, поэтому теряется только скорость, ради которой всё и
+        затевалось.
+        """
+        factor = float(factor)
+        names = tuple(names)
+        self.handicap = factor
+        self.handicap_stats = names
+        self.stats = scale_stats(self.stats, factor, names)
+        # Личная копия «в масле» собрана с прежних характеристик.
+        self.oil_src = None
+        return self.stats
 
     def slippery(self, factor):
         """Характеристики с сцеплением, умноженным на ``factor``.
@@ -301,6 +364,31 @@ class Simulation(object):
         self.rapier = None
         if rapier_host.enabled():
             self.rapier = rapier_host.attach(self)
+
+    # --- гандикап ------------------------------------------------------------
+
+    def apply_handicap(self, slot, factor, names):
+        """Замедлить машину на слоте ``slot``. Возвращает её или None.
+
+        Дверь заведена здесь, а не в комнате, ровно потому, что гандикап
+        обязан лечь ДО ТОГО, как появятся тела Rapier (§12.30): модуль
+        читает настройки машины один раз, в ``spawn_car``, и перенастроить
+        живое тело нечем. Комната накладывает гандикап после конструктора
+        симуляции — значит мир к этому моменту уже собран, и его надо
+        собрать заново. Тиков ещё не было, машины стоят на решётке, поэтому
+        пересборка даёт тот же мир, каким он был бы с гандикапом с самого
+        начала. Пересборка стоит одну сборку сетки полотна за гонку, и
+        только когда гандикап действительно кому-то достался.
+        """
+        car = self.car_by_slot.get(slot)
+        if car is None or not factor or factor == 1.0:
+            return None
+        car.apply_handicap(factor, names)
+        world = self.rapier
+        rebuild = getattr(world, 'rebuild', None)
+        if rebuild is not None:
+            rebuild()
+        return car
 
     # --- приём ввода ---------------------------------------------------------
 

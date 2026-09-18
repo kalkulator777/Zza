@@ -431,6 +431,18 @@ function onRaceInit(msg) {
     // после этого, поэтому и гандикап, и погода ложатся на готовый объект.
     applyWeatherGrip(msg.settings);
     const handicap = applyHandicap(players);
+    // Rapier строит мир по race_init в net.js, то есть ДО того, как
+    // множитель гандикапа разобран здесь. Перенастроить живое тело модуль
+    // не умеет (CarTuning читается один раз, в spawn_car), поэтому мир
+    // пересобирается с замедленной машиной — §12.30. Гандикапа нет —
+    // вызов не делает ничего.
+    if (rapierHost && rapierHost.applyHandicap) {
+        try {
+            rapierHost.applyHandicap(handicap);
+        } catch (err) {
+            console.error('Rapier: гандикап не лёг —', err);
+        }
+    }
     if (spec && spec.stats) {
         hud.setSpeedScale(spec.stats.boost_speed * (handicap || 1));
     }
@@ -954,9 +966,13 @@ function drawRace(t, alpha, dt) {
         localX = net.renderX(alpha);
         localZ = net.renderZ(alpha);
         localYaw = net.renderYaw(alpha);
+        // qx..qw — только Rapier (net.js._readLocalTilt); classic их не
+        // ставит, state.qx остаётся undefined и рендер берёт прежнюю
+        // прикидку крена (§12.24/§12.31).
         renderer.setCarState(local, localX, localZ, localYaw,
             state.vx, state.vz, state.steer,
-            net.viewFlags[local], net.viewDrift[local]);
+            net.viewFlags[local], net.viewDrift[local],
+            state.qx, state.qy, state.qz, state.qw);
     }
 
     // Чужие — из интерполированного буфера снапшотов.

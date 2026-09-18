@@ -12,19 +12,53 @@
 рекорд «Серпантина» побивался бы кругом по «Серпантину наоборот», а это
 разные повороты.
 
+Физика — тоже часть ключа (12.24, 12.31)
+-----------------------------------------
+Времена круга у ``classic`` и у Rapier не совпадают: у Rapier другой контакт
+с полотном, другой занос, другой рельеф (12.24). Внутри Rapier ещё две
+модели управляемости, ``arcade`` и ``sim`` (12.23), и они тоже разъезжаются
+по временам. Смешать любые две физики в одной таблице значит сделать рекорд
+одной физики недостижимым в другой — то есть таблица становится враньём для
+одной из сторон.
+
+Поэтому ключ раздела несёт необязательный суффикс ``#<физика>``:
+``classic`` суффикса не получает вовсе (это и есть обратная совместимость,
+см. ниже), у остальных физик суффикс — их имя: ``rapier_arcade``,
+``rapier_sim``. Значение физики модуль не проверяет и не привязывается к
+конкретному списку намеренно — это просто метка, которую выбирает вызывающий
+код (``server/room.py``); появится третья физика — появится третий суффикс,
+без изменений здесь.
+
+Старый файл не теряется молча
+------------------------------
+Файл версии 1 писал только classic-времена, и делал это БЕЗ суффикса —
+ровно так же, как classic пишется сейчас. Поэтому старый файл читается как
+есть, ни один байт не мигрирует и не переименовывается: старые ключи
+(``serpentine``, ``serpentine@mirror``) остаются classic-рекордами, что
+исторически верно (Rapier во времена версии 1 рекорды не писал вовсе —
+12.24). Новые физики просто добавляют новые ключи рядом. Версия в файле
+поднимется до 2 сама, при первой же новой записи на диск (``_serialize``
+всегда пишет текущую ``config.RECORDS_VERSION``).
+
 Формат файла
 ------------
 Обычный JSON с отступами и `ensure_ascii=False`: его можно открыть, прочитать
 глазами и поправить руками — это прямое требование. Схема::
 
     {
-      "version": 1,
+      "version": 2,
       "tracks": {
         "serpentine": {
           "best":  {"time": 39.58, "name": "Вася", "car": "rocket",
                     "date": "2026-09-15 14:02"},
           "cars":  {"rocket": {"time": 39.58, "name": "Вася",
                                "date": "2026-09-15 14:02"}}
+        },
+        "serpentine#rapier_sim": {
+          "best":  {"time": 41.02, "name": "Петя", "car": "wedge",
+                    "date": "2026-09-18 10:11"},
+          "cars":  {"wedge": {"time": 41.02, "name": "Петя",
+                              "date": "2026-09-18 10:11"}}
         }
       }
     }
@@ -72,16 +106,30 @@ def _now_stamp():
     return time.strftime('%Y-%m-%d %H:%M')
 
 
-def track_key(track_id, mirror=False):
-    """Ключ раздела в файле: зеркальная трасса — отдельная трасса."""
-    return '%s@mirror' % track_id if mirror else str(track_id)
+CLASSIC_PHYSICS = 'classic'   # умолчание; ключ без суффикса — всегда он
+
+
+def track_key(track_id, mirror=False, physics=CLASSIC_PHYSICS):
+    """Ключ раздела в файле: зеркало и физика — отдельные разделы.
+
+    ``physics=CLASSIC_PHYSICS`` (или пусто/None) не добавляет суффикса —
+    это то же самое, что писал файл версии 1, обратная совместимость.
+    """
+    key = '%s@mirror' % track_id if mirror else str(track_id)
+    if physics and physics != CLASSIC_PHYSICS:
+        key = '%s#%s' % (key, physics)
+    return key
 
 
 def split_key(key):
-    """Обратное к track_key: (track_id, mirror)."""
+    """Обратное к track_key: (track_id, mirror, physics)."""
+    physics = CLASSIC_PHYSICS
+    if '#' in key:
+        key, physics = key.split('#', 1)
+        physics = physics or CLASSIC_PHYSICS
     if key.endswith('@mirror'):
-        return key[:-len('@mirror')], True
-    return key, False
+        return key[:-len('@mirror')], True, physics
+    return key, False, physics
 
 
 def _clean_entry(raw, with_car):
@@ -199,21 +247,23 @@ class RecordStore(object):
 
     # --- чтение --------------------------------------------------------------
 
-    def best(self, track_id, mirror=False):
-        """Абсолютный рекорд трассы или None."""
-        section = self._tracks.get(track_key(track_id, mirror))
+    def best(self, track_id, mirror=False, physics=CLASSIC_PHYSICS):
+        """Абсолютный рекорд трассы (в этой физике) или None."""
+        section = self._tracks.get(track_key(track_id, mirror, physics))
         return dict(section['best']) if section and section['best'] else None
 
     def table(self):
         """Таблица рекордов для клиента (едет в событии `rooms`).
 
-        Список разделов, в каждом — абсолютный рекорд и рекорды по машинам.
-        Порядок машин — по времени, чтобы клиенту не пришлось сортировать.
+        Список разделов, в каждом — абсолютный рекорд и рекорды по машинам,
+        плюс физика раздела (12.31): разные физики — разные строки, клиент
+        их не смешивает. Порядок машин — по времени, чтобы клиенту не
+        пришлось сортировать.
         """
         out = []
         for key in sorted(self._tracks):
             section = self._tracks[key]
-            track_id, mirror = split_key(key)
+            track_id, mirror, physics = split_key(key)
             cars = [
                 {'car': car_id, 'time': entry['time'],
                  'name': entry['name'], 'date': entry['date']}
@@ -223,6 +273,7 @@ class RecordStore(object):
             out.append({
                 'track': track_id,
                 'mirror': mirror,
+                'physics': physics,
                 'best': dict(section['best']) if section['best'] else None,
                 'cars': cars,
             })
@@ -230,8 +281,13 @@ class RecordStore(object):
 
     # --- запись --------------------------------------------------------------
 
-    def submit(self, track_id, mirror, car_id, name, lap_time):
+    def submit(self, track_id, mirror, car_id, name, lap_time,
+              physics=CLASSIC_PHYSICS):
         """Учесть круг. Возвращает описание побития или None.
+
+        ``physics`` (12.31) — метка режима физики: разные физики дают разные
+        времена (12.24), поэтому у каждой свой раздел, и рекорд одной не
+        отбирает рекорд у другой.
 
         Зовётся из игрового цикла, поэтому делает только правку словаря
         и взвод таймера: ни байта на диск здесь не уходит.
@@ -247,8 +303,9 @@ class RecordStore(object):
             return None
         car_id = car_id if isinstance(car_id, str) and car_id else '?'
         name = (name or '')[:config.NAME_MAX_LEN]
+        physics = physics if isinstance(physics, str) and physics else CLASSIC_PHYSICS
 
-        key = track_key(track_id, mirror)
+        key = track_key(track_id, mirror, physics)
         section = self._tracks.get(key)
         if section is None:
             if len(self._tracks) >= config.RECORDS_MAX_TRACKS:
@@ -275,6 +332,7 @@ class RecordStore(object):
         if beat_best:
             return {
                 'scope': 'track', 'track': track_id, 'mirror': bool(mirror),
+                'physics': physics,
                 'car': car_id, 'name': name, 'time': lap_time,
                 'prev': prev_best['time'] if prev_best else None,
                 'prev_name': prev_best['name'] if prev_best else None,
@@ -282,6 +340,7 @@ class RecordStore(object):
             }
         return {
             'scope': 'car', 'track': track_id, 'mirror': bool(mirror),
+            'physics': physics,
             'car': car_id, 'name': name, 'time': lap_time,
             'prev': prev_car['time'] if prev_car else None,
             'prev_name': prev_car['name'] if prev_car else None,

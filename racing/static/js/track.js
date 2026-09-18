@@ -37,6 +37,10 @@ export const WALL_BOUNCE = 0.35;     // отражение нормальной 
 // угла въезда: считать его на двух реализациях — верный способ разойтись
 // в последнем разряде.
 export const RAMP_EDGE = 1.0;        // м, боковой скос трамплина
+// Чисел на одну коробку трамплина в поле ramps[].boxes: hx, hy, hz,
+// x, y, z, yaw, pitch. Зеркало game/track.RAMP_BOX_FLOATS (§12.30).
+// Сами числа коробок здесь НЕ считаются — они приезжают с сервера.
+export const RAMP_BOX_FLOATS = 8;
 
 const LAP_EPS = 1e-9;                // запас при floor(progress / length)
 
