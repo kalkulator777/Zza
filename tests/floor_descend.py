@@ -142,6 +142,7 @@ def main():
     n_msgs = [len(c.msgs) for c in conns]
     put_on_stairs(room, a)
     put_on_stairs(room, b)
+    max_id_before = max(room.world.entities)  # для проверки ниже
     room.tick()
     seen_after = w.fog.seen_count()
     lit_after = w.fog.lit_count()
@@ -183,8 +184,14 @@ def main():
           % (a2.x, a2.y, b2.x, b2.y, w.stairs[0], w.stairs[1],
              gen.generate(seed0, room.floor, room.settings.map_w,
                           room.settings.map_h, room.settings.theme).stairs_dist))
-    check(not any(e.kind != W.K_PLAYER for e in w.entities.values()),
-          "на новый этаж переехали только игроки",
+    # Раньше здесь стояло «на новый этаж переехали только игроки». С этапа 2b
+    # это ложно по замыслу: на новом этаже есть свои враги. Смысл проверки
+    # («старое не переезжает») жив, и проверяется он через id: они не
+    # переиспользуются (4.3), значит у всего, что родилось на новом этаже,
+    # id больше любого старого.
+    check(all(e.id > max_id_before
+              for e in w.entities.values() if e.kind != W.K_PLAYER),
+          "старые сущности на новый этаж не переехали",
           "сущностей %d" % len(w.entities))
 
     # --- 4. клиент узнал по протоколу ------------------------------------
