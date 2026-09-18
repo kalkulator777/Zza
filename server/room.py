@@ -241,6 +241,7 @@ class Room(object):
             if ent is not None:
                 ent.flags |= world_mod.F_OFFLINE
                 ent.mv = (0.0, 0.0)
+                ent.btn = 0          # иначе зажатая атака молотит без хозяина
                 ent.vx = ent.vy = 0.0
         if self.count_online() == 0:
             self.empty_since = time.monotonic()
@@ -301,8 +302,62 @@ class Room(object):
             return False         # лобби не считается вообще
         self.apply_inputs()
         self.world.step()
+        if self.stairs_ready():
+            self.descend()       # 8.1: спуск, когда на лестнице ВСЕ живые
+        self.broadcast_events()
         self.broadcast_snapshot()
         return True
+
+    # --- спуск на следующий этаж (8.1) -------------------------------------
+
+    def stairs_ready(self):
+        """Все живые стоят на лестнице. Один группу не утаскивает.
+
+        Считается по ЖИВЫМ (world.alive_players): мёртвый ходит духом (8.5) и
+        воскреснет этажом ниже, ждать его негде — на лестницу дух встать может,
+        но требовать этого значило бы запирать группу до конца забега.
+        """
+        w = self.world
+        if w is None or w.stairs is None:
+            return False
+        alive = w.alive_players()
+        if not alive:
+            return False         # все мертвы — это конец забега (8.1), не спуск
+        for e in alive:
+            if not w.on_stairs(e):
+                return False
+        return True
+
+    def descend(self):
+        """Этаж +1: тот же сид, новая карта, туман с нуля, здоровье с собой."""
+        s = self.settings
+        s.floor += 1
+        fl = gen.generate(s.seed, s.floor, s.map_w, s.map_h, s.theme)
+        self.world.enter_floor(s.floor, fl.grid, fl.spawns, fl.stairs)
+        for p in self.players.values():
+            # 5.2: при смене этажа клиент получает level и полный снапшот.
+            # Порядок обязателен: level чистит у клиента сущности и туман,
+            # полный снапшот заводит их заново.
+            p.needs_full = True
+            if p.online:
+                self.send_level(p)
+        return s.floor
+
+    def broadcast_events(self):
+        """ev (5.2): попадание, смерть, выстрел. Копится в world, шлём тут.
+
+        Мир про сеть не знает — поэтому события он складывает, а рассылает их
+        комната. Потеря ev допустима по 5.2, состояния на них нет: замах и
+        рывок видны битами flags, здоровье и смерть — полями снапшота.
+        """
+        evs = self.world.events
+        if not evs:
+            return 0
+        n = len(evs)
+        for tick, kind, kw in evs:
+            self.broadcast(proto.ev(tick, kind, **kw))
+        del evs[:]
+        return n
 
     def broadcast_snapshot(self):
         w = self.world
