@@ -153,6 +153,12 @@ def damage(w, target, amount, src=None, src_id=0):
             got = items.kill_heal(src)
             if got:
                 items.heal(src, got)
+            # ОПЫТ (8.4a) — здесь же и ровно по тому же доводу, что и Жатва:
+            # точка входа урона одна, значит убийство ударом, снарядом или
+            # тараном стоит одинаково, и ни одной ветки «если это игрок» тут
+            # нет — её делает add_xp, который чужим kind отвечает нулём.
+            # Цена цели = её hp_max: рубака 40, стрелок 25, босс 400 (4.2).
+            items.add_xp(w, src, items.xp_for(target))
     return amount
 
 
@@ -168,6 +174,11 @@ def kill(w, e, src=None, src_id=0):
     e.shot_q = 0
     w.event("die", a=(src.id if src is not None else src_id), b=e.id,
             x=proto.r3(e.x), y=proto.r3(e.y))
+    if e.kind == world_mod.K_BOSS:
+        # 8.5 + 11.8: босс возвращает группе заряд воскрешения. Босс —
+        # единственное, чего в забеге нельзя обойти (8.1 запирает лестницу,
+        # пока он жив), значит пополнение нельзя ни пропустить, ни фармить.
+        items.add_revive(w)
     if e.kind != world_mod.K_PLAYER:
         return False                   # труп убирает вызывающий: см. resolve
     return True
@@ -286,6 +297,12 @@ def resolve(w, dt=DT):
     # собратьями по алтарю), поэтому он идёт ДО прохода, а не внутри него.
     if w.pickups:
         items.resolve_pickups(w)
+    # 8.4a: выбор за уровень ЗАВОДИТ сущности, значит ему сюда же — вне
+    # прохода по словарю. Опыт начисляется в damage() под проходом, а
+    # выкладка ждёт следующего тика: те же 33 мс отсрочки, что и у снаряда,
+    # и по той же причине.
+    if w.level_q:
+        items.resolve_levels(w)
     swings = None
     shots = None
     born = None

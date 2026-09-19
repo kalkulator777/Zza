@@ -374,6 +374,106 @@ function textTexture(text, font, color) {
   return rec;
 }
 
+// --- пинги на карте (8.8) -------------------------------------------------
+//
+// Тот же смысл, что в 2D (см. render2d._drawPings), и те же цвета: красный
+// канал не выше 209, чтобы «самый красный пиксель — это враг» осталось
+// правдой для чужих проверок. Формы тоже те же — ромб «сюда» и треугольник
+// «опасность»: игрок, переключивший бэкенд клавишей B, не должен
+// переучиваться.
+//
+// ЗДЕСЬ ВСЁ РИСУЕТСЯ В ЭКРАННОЙ СЦЕНЕ (hudScene), а не в мире, и это не
+// экономия: пинг обязан быть виден СКВОЗЬ СТЕНЫ и в черноте, то есть он и
+// есть интерфейс. Положи его в мир — и его закроет ближайшая стена, а в
+// неразведанной клетке 3D не рисует вообще ничего (там нет ни пола, ни
+// стены, только чёрный фон).
+const PING_COL3 = [
+  { fill: '#2f86c9', edge: '#a6e4ff', text: '#a6e4ff' },
+  { fill: '#c8401f', edge: '#d1b03c', text: '#d1b03c' },
+];
+const PING_PULSE_MS3 = 1100;
+const PING_EDGE3 = 46;
+const PING_FONT3 = '15px system-ui, sans-serif';
+const PING_FONT_SM3 = '13px ui-monospace, Consolas, monospace';
+const PING_SLOTS = 8;            // room.PING_MAX: больше живых не бывает
+
+// Значок и стрелка — заранее нарисованные КАНВЫ. Форму из прямоугольников
+// три.js не сложит, а текстура стоит один раз за забег и дальше блитится
+// тем же одним квадом, что и текст.
+const shapeCache = new Map();
+function shapeTexture(key, w, h, paint) {
+  let rec = shapeCache.get(key);
+  if (rec) return rec;
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  paint(c.getContext('2d'), w, h);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  rec = { tex: tex, w: w, h: h };
+  shapeCache.set(key, rec);
+  return rec;
+}
+
+function pingBadgeTex(kind) {
+  const col = PING_COL3[kind] || PING_COL3[0];
+  return shapeTexture('badge' + kind, 72, 72, (g, w, h) => {
+    const cx = w / 2, cy = h / 2, r = 28;
+    g.fillStyle = col.fill;
+    g.strokeStyle = col.edge;
+    g.lineWidth = Math.max(2, r * 0.22);
+    g.beginPath();
+    if (kind === 1) {
+      g.moveTo(cx, cy - r);
+      g.lineTo(cx + r * 0.92, cy + r * 0.72);
+      g.lineTo(cx - r * 0.92, cy + r * 0.72);
+    } else {
+      g.moveTo(cx, cy - r);
+      g.lineTo(cx + r * 0.82, cy);
+      g.lineTo(cx, cy + r);
+      g.lineTo(cx - r * 0.82, cy);
+    }
+    g.closePath();
+    g.fill();
+    g.stroke();
+    if (kind === 1) {
+      g.fillStyle = '#1a0e08';
+      g.fillRect(cx - r * 0.11, cy - r * 0.38, r * 0.22, r * 0.66);
+      g.fillRect(cx - r * 0.11, cy + r * 0.44, r * 0.22, r * 0.20);
+    }
+  });
+}
+
+function pingRingTex(kind) {
+  const col = PING_COL3[kind] || PING_COL3[0];
+  return shapeTexture('ring' + kind, 72, 72, (g, w, h) => {
+    g.strokeStyle = col.edge;
+    g.lineWidth = 5;
+    g.beginPath();
+    g.arc(w / 2, h / 2, w / 2 - 4, 0, Math.PI * 2);
+    g.stroke();
+  });
+}
+
+// Стрелка нарисована остриём ВПРАВО (+x): дальше её поворачивает сам меш,
+// и лишней текстуры на каждое направление не заводится.
+function pingArrowTex(kind) {
+  const col = PING_COL3[kind] || PING_COL3[0];
+  return shapeTexture('arrow' + kind, 64, 64, (g, w, h) => {
+    const cx = w / 2, cy = h / 2, r = 22;
+    g.fillStyle = col.fill;
+    g.strokeStyle = col.edge;
+    g.lineWidth = Math.max(2, r * 0.25);
+    g.beginPath();
+    g.moveTo(cx + r * 1.15, cy);
+    g.lineTo(cx - r * 0.6, cy + r * 0.85);
+    g.lineTo(cx - r * 0.6, cy - r * 0.85);
+    g.closePath();
+    g.fill();
+    g.stroke();
+  });
+}
+
+
 export function createRenderer() {
   const m4 = new THREE.Matrix4();
   const q4 = new THREE.Quaternion();
@@ -400,6 +500,10 @@ export function createRenderer() {
 
     torch: true,
     combat: true, windup: true,
+    // 8.8: выключатель рисования пингов — тот же, что в 2D, и ровно затем
+    // же: чтобы стоимость кадра мерилась спина к спине на одной сцене.
+    pings: true,
+    _pingsDrawn: 0, _pingsOff: 0,
 
     // Высота плоскости прицела над полом, в клетках. Наружу выставлена
     // намеренно: проверке, которая хочет знать, куда попадёт курсор, иначе
@@ -489,6 +593,15 @@ export function createRenderer() {
         for (const k in this._hud) {
           const o = this._hud[k];
           if (!o) continue;
+          if (Array.isArray(o)) {                 // 8.8: пул пингов
+            for (const slot of o) {
+              for (const key in slot) {
+                this.hudScene.remove(slot[key]);
+                slot[key].material.dispose();
+              }
+            }
+            continue;
+          }
           if (o.isMesh) {
             this.hudScene.remove(o);
             if (o.isInstancedMesh) o.dispose();
@@ -519,7 +632,8 @@ export function createRenderer() {
     stats() {
       return { drawCalls: this._drawCalls, ents: this._ents, ms: this._ms,
                hidden: this._hidden, fogRepaints: this.fogRepaints,
-               fx: this._fx, tris: this._tris };
+               fx: this._fx, tris: this._tris,
+               pings: this._pingsDrawn, pingsOff: this._pingsOff };
     },
 
     // --- камера ------------------------------------------------------
@@ -770,6 +884,29 @@ export function createRenderer() {
         transparent: true, depthTest: false, depthWrite: false }), 5);
       h.sub = mk(new THREE.MeshBasicMaterial({
         transparent: true, depthTest: false, depthWrite: false }), 5);
+
+      // 8.8: пул под пинги. Заводится ОДИН РАЗ и целиком: живых пингов не
+      // больше room.PING_MAX, а создавать меш в кадре — это мусор на
+      // 60 Гц там, где его можно не создавать вовсе.
+      // Квад стрелки не сдвинут в угол (в отличие от quad выше): её надо
+      // вращать вокруг ЦЕНТРА, а не вокруг левого верхнего угла.
+      const quadC = new THREE.PlaneGeometry(1, 1);
+      h.quadC = quadC;
+      const spriteMat = () => new THREE.MeshBasicMaterial({
+        transparent: true, depthTest: false, depthWrite: false });
+      h.ping = [];
+      for (let i = 0; i < PING_SLOTS; i++) {
+        const mkS = (geo, order) => {
+          const m = new THREE.Mesh(geo, spriteMat());
+          m.renderOrder = order;
+          m.visible = false;
+          this.hudScene.add(m);
+          return m;
+        };
+        h.ping.push({ ring: mkS(quadC, 6), mark: mkS(quad, 7),
+                      arrow: mkS(quadC, 7), name: mkS(quad, 8),
+                      dist: mkS(quad, 8) });
+      }
       this._hud = h;
     },
 
@@ -1145,6 +1282,98 @@ export function createRenderer() {
       this._setQuad(mesh, x, y, rec.w, rec.h);
     },
 
+    // --- пинги (8.8): экранные спрайты поверх всего --------------------
+    //
+    // Геометрия повторяет 2D до пикселя (кольцо на точке, ножка, значок,
+    // имя; вне кадра — стрелка у рамки с расстоянием и именем), потому что
+    // это ОДНА И ТА ЖЕ игра с двумя бэкендами: человек, нажавший B, не
+    // должен переучиваться, а проверка — знать, какой бэкенд включён.
+    _buildPings(view, now) {
+      const h = this._hud;
+      const pool = h.ping;
+      this._pingsDrawn = 0;
+      this._pingsOff = 0;
+      for (let i = 0; i < pool.length; i++) {
+        const s = pool[i];
+        s.ring.visible = s.mark.visible = s.arrow.visible = false;
+        s.name.visible = s.dist.visible = false;
+      }
+      const ps = view.pings;
+      if (!this.pings || !ps || ps.length === 0) return;
+      const tpx = this.tilePx, W = this.w, H = this.h, M = PING_EDGE3;
+      const fade = view.pingFade || 400;
+      const pulse = 0.5 + 0.5 * Math.sin(now * (2 * Math.PI / PING_PULSE_MS3));
+      let slot = 0;
+      for (let i = 0; i < ps.length && slot < pool.length; i++) {
+        const p = ps[i];
+        const left = p.dies - now;
+        if (left <= 0) continue;
+        const a = left < fade ? Math.max(0, left / fade) : 1;
+        const col = PING_COL3[p.u] || PING_COL3[0];
+        // Точка пинга — на полу (высота 0): пинг показывает КЛЕТКУ.
+        const sc = this.worldToScreen(p.x, p.y, 0);
+        const sx = sc[0], sy = sc[1];
+        const g = pool[slot++];
+        const inside = sx >= M && sx <= W - M && sy >= M && sy <= H - M;
+        if (inside) {
+          this._pingsDrawn++;
+          const r = tpx * (0.30 + 0.34 * pulse);
+          this._sprite(g.ring, pingRingTex(p.u), sx - r, sy - r, 2 * r, 2 * r,
+                       a * (0.85 - 0.45 * pulse), true);
+          const top = sy - tpx * 0.92;
+          const br = tpx * 0.34;
+          this._sprite(g.mark, pingBadgeTex(p.u), sx - br, top - br,
+                       2 * br, 2 * br, a, false);
+          this._pingText(g.name, p.nm, PING_FONT3, col.text,
+                         sx, top - tpx * 0.42, a);
+        } else {
+          this._pingsOff++;
+          const self = view.self;
+          const os = self ? this.worldToScreen(self.dx, self.dy, 0)
+                          : [W / 2, H / 2];
+          let dx = sx - os[0], dy = sy - os[1];
+          const d = Math.hypot(dx, dy) || 1;
+          dx /= d; dy /= d;
+          const tx = dx > 0 ? (W - M - os[0]) / dx
+                            : (dx < 0 ? (M - os[0]) / dx : 1e9);
+          const ty = dy > 0 ? (H - M - os[1]) / dy
+                            : (dy < 0 ? (M - os[1]) / dy : 1e9);
+          const t = Math.max(0, Math.min(tx, ty));
+          const ax = os[0] + dx * t, ay = os[1] + dy * t;
+          const r = tpx * 0.42;
+          this._sprite(g.arrow, pingArrowTex(p.u), ax - r / 2, ay - r / 2,
+                       r, r, a, true);
+          g.arrow.rotation.z = -Math.atan2(dy, dx);
+          const cells = Math.round(d / tpx);
+          this._pingText(g.dist, cells + ' кл', PING_FONT_SM3, col.text,
+                         ax - dx * r * 1.4, ay - dy * r * 1.4, a);
+          this._pingText(g.name, p.nm, PING_FONT3, col.text,
+                         ax - dx * r * 1.4, ay - dy * r * 1.4 - 15, a);
+        }
+      }
+    },
+
+    /** Квад с текстурой. centered — начало в ЦЕНТРЕ (для вращения). */
+    _sprite(mesh, rec, x, y, w, hh, alpha, centered) {
+      if (mesh.material.map !== rec.tex) {
+        mesh.material.map = rec.tex;
+        mesh.material.needsUpdate = true;
+      }
+      mesh.material.opacity = alpha;
+      mesh.rotation.z = 0;
+      if (centered) mesh.position.set(x + w / 2, -(y + hh / 2), 0);
+      else mesh.position.set(x, -y, 0);
+      mesh.scale.set(w, hh, 1);
+      mesh.visible = true;
+    },
+
+    _pingText(mesh, text, font, color, cx, cy, alpha) {
+      if (!text) return;
+      const rec = textTexture(text, font, color);
+      this._sprite(mesh, rec, cx - rec.w / 2, cy - rec.h / 2, rec.w, rec.h,
+                   alpha, false);
+    },
+
     _buildHudFrame(view) {
       const h = this._hud;
       for (const k in h) { if (h[k] && h[k].isMesh) h[k].visible = false; }
@@ -1251,6 +1480,11 @@ export function createRenderer() {
       b.prop.end(); b.shot.end(); b.unknown.end();
 
       this._buildHudFrame(view);
+      // 8.8 ПОСЛЕ hud-кадра: тот гасит всё своё в начале, и пинги, погашенные
+      // заодно, не нарисовались бы вовсе. Пул пингов он не трогает (это
+      // массив, а не меш), но порядок всё равно обязателен: пинги рисуются
+      // поверх полоски здоровья.
+      this._buildPings(view, t0);
 
       const r = this.renderer;
       r.info.reset();

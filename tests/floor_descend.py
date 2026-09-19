@@ -33,7 +33,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from server import combat, gen                       # noqa: E402
+from server import boss, combat, gen, items          # noqa: E402
 from server import world as world_mod                # noqa: E402
 from server.room import Player, Room, RoomSettings   # noqa: E402
 
@@ -229,13 +229,61 @@ def main():
           "мёртвого на лестнице не ждут (8.5)",
           "живых на лестнице 1 из 1, этаж %d -> %d"
           % (floor_before, room2.floor))
-    check(not (b4.flags & W.F_DEAD) and b4.hp == b4.hp_max,
-          "мёртвый воскресает на следующем этаже бесплатно (8.5)",
-          "flags %d, hp %d из %d" % (b4.flags, b4.hp, b4.hp_max))
+    # ЦЕНА СМЕРТИ (8.5, дыра 11.8). Раньше здесь стояло «воскресает
+    # бесплатно и с полным здоровьем», и ровно это 11.8 замерил как дыру:
+    # смерть работала полным лечением плюс переносом к лестнице. Теперь
+    # воскрешение тратит общий заряд группы и возвращает половину здоровья.
+    want_hp = int(b4.hp_max * items.REVIVE_SHARE)
+    check(not (b4.flags & W.F_DEAD) and b4.hp == want_hp,
+          "воскрешение даёт ПОЛОВИНУ здоровья, а не полное (8.5, 11.8)",
+          "flags %d, hp %d из %d (ждали %d)"
+          % (b4.flags, b4.hp, b4.hp_max, want_hp))
+    check(room2.world.revives == items.REVIVE_BASE - 1,
+          "воскрешение СТОИЛО группе заряда (8.5, 11.8)",
+          "зарядов %d -> %d из %d"
+          % (items.REVIVE_BASE, room2.world.revives, items.REVIVE_BASE))
     check(a4.dash_end == 0 and a4.atk_hit == 0 and a4.inv_end == 0,
           "боевые таймеры этаж не переживают",
           "dash_end=%d atk_hit=%d inv_end=%d"
           % (a4.dash_end, a4.atk_hit, a4.inv_end))
+
+    # --- 5a. зарядов нет — воскрешения нет -------------------------------
+    # Вторая половина цены смерти, и она обязана краснеть отдельно: пустой
+    # счётчик не должен воскрешать НИКОГО, иначе «кончился» ничего не значит
+    # и вся правка — украшение.
+    room2b, conns2b = build(2, seed=777011)
+    w2b = room2b.world
+    w2b.revives = 0                     # группа уже всё потратила
+    a3b, b3b = ents(room2b)
+    fl_b = room2b.floor
+    combat.damage(w2b, b3b, b3b.hp_max)
+    b3b.x, b3b.y = 2.5, 2.5
+    put_on_stairs(room2b, a3b)
+    room2b.tick()
+    b4b = room2b.world.entities[[p for p in room2b.players.values()][1].ent_id]
+    check(room2b.floor == fl_b + 1,
+          "группа спускается и без зарядов: дух не запирает лестницу (8.1)",
+          "этаж %d -> %d" % (fl_b, room2b.floor))
+    check((b4b.flags & W.F_DEAD) and b4b.hp == 0,
+          "на пустом счётчике мёртвый ОСТАЁТСЯ духом (8.5, 11.8)",
+          "flags %d, hp %d, зарядов %d"
+          % (b4b.flags, b4b.hp, room2b.world.revives))
+    check(len(room2b.world.alive_players()) == 1,
+          "дух по-прежнему летает и видит, но в живых не числится (8.5, 4.4)",
+          "живых %d из 2" % len(room2b.world.alive_players()))
+
+    # --- 5b. босс возвращает заряд ---------------------------------------
+    room2c, conns2c = build(1, seed=777012)
+    w2c = room2c.world
+    w2c.revives = 0
+    pl = ents(room2c)[0]
+    b = boss.make(w2c, 6.5, 6.5) if hasattr(boss, "make") else None
+    if b is None:
+        b = w2c.spawn(W.K_BOSS, 6.5, 6.5, hp=10, hp_max=10)
+    combat.damage(w2c, b, b.hp_max, pl)
+    check(w2c.revives == items.REVIVE_PER_BOSS,
+          "босс возвращает группе заряд воскрешения (8.1, 8.5)",
+          "зарядов 0 -> %d" % w2c.revives)
 
     # --- 6. отвалившегося не ждут ----------------------------------------
     room3, conns3 = build(2, seed=777002)

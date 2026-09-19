@@ -308,16 +308,27 @@ def measure_harvest(stacks):
     e = add_player(w, 8.5, 6.5, ups=[(items.U_HARVEST, stacks)] if stacks else [])
     taken = 0
     kills = 0
-    while e.hp > 0:
-        combat.damage(w, e, combat.MELEE_DMG, None, 0)
-        taken += 1
-        if e.hp <= 0:
-            break
-        if kills < 8:                   # этаж — это 8 врагов (8.1)
-            t = add_enemy(w, 9.2, 6.5, hp=ai.MELEE_HP)
-            combat.damage(w, t, combat.MELEE_DMG, e)
-            combat.damage(w, t, combat.MELEE_DMG, e)
-            kills += 1
+    # ОПЫТ ВЫКЛЮЧЕН НА ВРЕМЯ МЕРКИ (правило 10: стенд выключает то, что он не
+    # меряет). Уровень лечит на items.LEVEL_HEAL, а восемь рубак по 40 hp
+    # дают 320 опыта — это два уровня, то есть +80 hp В КАЖДЫЙ столбец.
+    # Замерено: с опытом столбцы «один стак» и «два стака» встали оба на 13,
+    # и красным становилась исправная Жатва. Мерка здесь про Жатву; про
+    # уровни есть своя, в разделе 8.
+    was = items.XP_ON
+    items.XP_ON = False
+    try:
+        while e.hp > 0:
+            combat.damage(w, e, combat.MELEE_DMG, None, 0)
+            taken += 1
+            if e.hp <= 0:
+                break
+            if kills < 8:               # этаж — это 8 врагов (8.1)
+                t = add_enemy(w, 9.2, 6.5, hp=ai.MELEE_HP)
+                combat.damage(w, t, combat.MELEE_DMG, e)
+                combat.damage(w, t, combat.MELEE_DMG, e)
+                kills += 1
+    finally:
+        items.XP_ON = was
     return taken, kills
 
 

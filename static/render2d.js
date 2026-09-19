@@ -160,6 +160,34 @@ const COL = {
   hurtEdge: 'rgba(190,40,30,0.55)',
 };
 
+// --- пинги на карте (8.8) -------------------------------------------------
+//
+// ПОЧЕМУ КРАСНЫЙ КАНАЛ ЗДЕСЬ ВЕЗДЕ НЕ ВЫШЕ 209. Чужие проверки ищут врага
+// по самому красному пикселю коробки: у рубаки и стрелка красный ровно 209
+// (#d16a6a), и на этом стоит «самый красный пиксель — это враг» (4.2).
+// Пинг рисуется поверх всего и сквозь туман, то есть может оказаться в
+// любой коробке; возьми он красный 255 — и приёмка боя нашла бы «врага»
+// там, где стоит метка. Поэтому «опасность» сделана НЕ самым красным, а
+// самым тёплым и другой ФОРМОЙ: треугольник-знак против кружка «сюда».
+// Различать пинги по форме всё равно обязательно — кадр тёмный, а
+// дальтоник читает форму, а не оттенок (та же логика, что у силуэтов 4.2).
+const PING_COL = [
+  // 0 — «внимание, сюда»: холодный синий. Ни один игровой объект таким не
+  // бывает (игрок зелёный, враг красный, замах жёлтый, рывок голубой —
+  // но рывок это кольцо на теле, а не метка на полу).
+  { fill: '#2f86c9', edge: '#a6e4ff', text: '#a6e4ff' },
+  // 1 — «опасность»: тёплый, с жёлтой каймой знака.
+  { fill: '#c8401f', edge: '#d1b03c', text: '#d1b03c' },
+];
+// Пульс: метка дышит, чтобы её ловил край глаза. Период 1.1 с — медленнее
+// сердцебиения, быстрее, чем «ничего не происходит».
+const PING_PULSE_MS = 1100;
+// Отступ стрелки от края кадра. 46 px — половина метки (0.7 клетки = 45 px
+// при 64 px/клетку), то есть стрелка целиком внутри кадра при любом краю.
+const PING_EDGE = 46;
+const PING_FONT = '15px system-ui, sans-serif';
+const PING_FONT_SM = '13px ui-monospace, Consolas, monospace';
+
 // Порог «мало здоровья»: ниже него полоска краснеет и по краю кадра идёт
 // красная кайма. 0.5 — это ровно 2 попадания врага ближней атакой (20 урона,
 // 4.2) до порога и ещё 2 после: предупреждение приходит на середине пути,
@@ -274,6 +302,7 @@ export function createRenderer() {
 
     camX: 0, camY: 0,
     _drawCalls: 0, _ents: 0, _ms: 0, _hidden: 0, _fx: 0,
+    _pingsDrawn: 0, _pingsOff: 0,
 
     // Выключатели существуют ровно затем же, зачем setFog и setInterp:
     // чтобы проверка боя умела ПОКРАСНЕТЬ, а замер «стоимость кадра до и
@@ -282,6 +311,10 @@ export function createRenderer() {
     //     ни замаха, ни рывка, ни вспышек, ни своего здоровья;
     //   windup=false — всё остальное на месте, не рисуется только замах.
     combat: true, windup: true,
+    // 8.8: выключатель рисования пингов. Существует ровно затем же, зачем
+    // combat и torch: чтобы приёмка умела ПОКРАСНЕТЬ и чтобы стоимость
+    // кадра «с пингами / без» мерилась спина к спине на одной сцене.
+    pings: true,
 
     _pool: [], _vis: [],
 
@@ -331,7 +364,8 @@ export function createRenderer() {
       // не видит). Число для tests/client_fog.py и для оверлея отладки.
       return { drawCalls: this._drawCalls, ents: this._ents, ms: this._ms,
                hidden: this._hidden, fogRepaints: this.fogRepaints,
-               fx: this._fx };
+               fx: this._fx, pings: this._pingsDrawn,
+               pingsOff: this._pingsOff };
     },
 
     // --- камера ------------------------------------------------------
@@ -916,6 +950,154 @@ export function createRenderer() {
       ctx.globalAlpha = 1;
     },
 
+    // --- пинги на карте (8.8) ----------------------------------------
+    //
+    // ПИНГ ВИДЕН СКВОЗЬ СТЕНЫ И В ЧЕРНОТЕ, И ЭТО НЕ НАРУШЕНИЕ 5.2. Запрет
+    // 5.2 — про СУЩНОСТИ: сервер шлёт всех подряд, и клиент, рисующий их в
+    // темноте, выдаёт игроку позиции врагов, которых группа не видит. Пинг
+    // ставит ЧЕЛОВЕК руками из того, что видит сам, — он не выдаёт ничего,
+    // он и есть способ рассказать. Спрятать его в темноте значило бы
+    // выключить 8.8 ровно там, где он нужен: «не ходи в тот чёрный
+    // коридор» — сообщение ИМЕННО про черноту.
+    //
+    // Поэтому пинги рисуются ПОСЛЕ виньетки, вместе со своим здоровьем:
+    // это интерфейс, а не мир. Под виньеткой метка у края кадра гасла бы в
+    // 0.2 раза (замерено в _drawSelfHud) — то есть ровно там, куда смотрит
+    // стрелка «пинг вне кадра».
+    //
+    // ЗАПРЕЩЁННОГО 7.2 здесь нет: ни shadowBlur, ни filter, ни
+    // globalCompositeOperation. Текст — кэшированные спрайты (textSprite).
+
+    _pingBadge(cx, cy, r, kind, a) {
+      const ctx = this.ctx, c = PING_COL[kind] || PING_COL[0];
+      ctx.globalAlpha = a;
+      ctx.fillStyle = c.fill;
+      ctx.strokeStyle = c.edge;
+      ctx.lineWidth = Math.max(2, r * 0.22);
+      ctx.beginPath();
+      if (kind === 1) {
+        // «Опасность» — треугольник вершиной вверх: знак, а не метка.
+        ctx.moveTo(cx, cy - r);
+        ctx.lineTo(cx + r * 0.92, cy + r * 0.72);
+        ctx.lineTo(cx - r * 0.92, cy + r * 0.72);
+      } else {
+        // «Сюда» — ромб: круглым нельзя (кругом нарисованы тела, 4.2).
+        ctx.moveTo(cx, cy - r);
+        ctx.lineTo(cx + r * 0.82, cy);
+        ctx.lineTo(cx, cy + r);
+        ctx.lineTo(cx - r * 0.82, cy);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      this._drawCalls += 2;
+      if (kind === 1) {
+        // Восклицательный знак внутри: два прямоугольника, ноль текста.
+        ctx.fillStyle = '#1a0e08';
+        ctx.fillRect(cx - r * 0.11, cy - r * 0.38, r * 0.22, r * 0.66);
+        ctx.fillRect(cx - r * 0.11, cy + r * 0.44, r * 0.22, r * 0.20);
+        this._drawCalls += 2;
+      }
+    },
+
+    _drawPings(view, now) {
+      this._pingsDrawn = 0;
+      this._pingsOff = 0;
+      const ps = view.pings;
+      if (!this.pings || !ps || ps.length === 0) return;
+      const ctx = this.ctx, tpx = this.tilePx;
+      const fade = view.pingFade || 400;
+      const pulse = 0.5 + 0.5 * Math.sin(now * (2 * Math.PI / PING_PULSE_MS));
+      const W = this.w, H = this.h, M = PING_EDGE;
+      for (let i = 0; i < ps.length; i++) {
+        const p = ps[i];
+        const left = p.dies - now;
+        if (left <= 0) continue;
+        // Гаснет плавно: пинг, пропадающий мгновенно, читается как «что-то
+        // моргнуло», а не как «время вышло».
+        const a = left < fade ? Math.max(0, left / fade) : 1;
+        const sx = (p.x - this.camX) * tpx;
+        const sy = (p.y - this.camY) * tpx;
+        const col = PING_COL[p.u] || PING_COL[0];
+        const inside = sx >= M && sx <= W - M && sy >= M && sy <= H - M;
+        if (inside) {
+          this._pingsDrawn++;
+          // Кольцо на полу: оно и есть «вот эта точка». Расходится по
+          // пульсу — движение ловит край глаза даже в темноте.
+          ctx.globalAlpha = a * (0.85 - 0.45 * pulse);
+          ctx.strokeStyle = col.edge;
+          ctx.lineWidth = Math.max(2, tpx * 0.07);
+          ctx.beginPath();
+          ctx.arc(sx, sy, tpx * (0.30 + 0.34 * pulse), 0, Math.PI * 2);
+          ctx.stroke();
+          this._drawCalls++;
+          // Ножка от точки к значку: без неё значок «висит» и непонятно,
+          // на какую клетку он показывает.
+          const top = sy - tpx * 0.92;
+          ctx.globalAlpha = a;
+          ctx.strokeStyle = col.fill;
+          ctx.lineWidth = Math.max(2, tpx * 0.05);
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(sx, top + tpx * 0.22);
+          ctx.stroke();
+          this._drawCalls++;
+          this._pingBadge(sx, top, tpx * 0.28, p.u, a);
+          this._pingName(p, sx, top - tpx * 0.42, a, col);
+        } else {
+          // ВНЕ КАДРА — стрелка у края, остриём точно на пинг. Без неё
+          // половина смысла 8.8 теряется: «опасность» за спиной не видна
+          // вовсе, а спросить некого.
+          this._pingsOff++;
+          const self = view.self;
+          const ox = self ? (self.dx - this.camX) * tpx : W / 2;
+          const oy = self ? (self.dy - this.camY) * tpx : H / 2;
+          let dx = sx - ox, dy = sy - oy;
+          const d = Math.hypot(dx, dy) || 1;
+          dx /= d; dy /= d;
+          // Точка на рамке кадра по лучу из игрока: параметр t по каждой
+          // оси, берём меньший — он и есть первая пересечённая сторона.
+          const tx = dx > 0 ? (W - M - ox) / dx : (dx < 0 ? (M - ox) / dx : 1e9);
+          const ty = dy > 0 ? (H - M - oy) / dy : (dy < 0 ? (M - oy) / dy : 1e9);
+          const t = Math.max(0, Math.min(tx, ty));
+          const ax = ox + dx * t, ay = oy + dy * t;
+          const r = tpx * 0.26;
+          ctx.globalAlpha = a;
+          ctx.fillStyle = col.fill;
+          ctx.strokeStyle = col.edge;
+          ctx.lineWidth = Math.max(2, r * 0.25);
+          ctx.beginPath();
+          ctx.moveTo(ax + dx * r * 1.35, ay + dy * r * 1.35);
+          ctx.lineTo(ax - dx * r * 0.7 - dy * r, ay - dy * r * 0.7 + dx * r);
+          ctx.lineTo(ax - dx * r * 0.7 + dy * r, ay - dy * r * 0.7 - dx * r);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+          this._drawCalls += 2;
+          // Сколько клеток до метки: без числа стрелка говорит «туда», а
+          // человеку нужно «туда и далеко».
+          const cells = Math.round(d / tpx);
+          const spr = textSprite(cells + ' кл', PING_FONT_SM, col.text);
+          ctx.drawImage(spr, ax - spr.width / 2 - dx * r * 2.2,
+                        ay - spr.height / 2 - dy * r * 2.2);
+          this._drawCalls++;
+          this._pingName(p, ax - dx * r * 2.2, ay - dy * r * 2.2 - 15, a, col);
+        }
+      }
+      ctx.globalAlpha = 1;
+    },
+
+    // КТО ПОСТАВИЛ — обязательная часть, а не подпись для красоты. Четверо
+    // в темноте, метка без автора не говорит ничего: «иду сюда» от того,
+    // кто стоит рядом, и от того, кто ушёл на два экрана, — разные вещи.
+    _pingName(p, cx, cy, a, col) {
+      if (!p.nm) return;
+      const spr = textSprite(p.nm, PING_FONT, col.text);
+      this.ctx.globalAlpha = a;
+      this.ctx.drawImage(spr, cx - spr.width / 2, cy - spr.height / 2);
+      this._drawCalls++;
+    },
+
     // --- своё здоровье и смерть: поверх виньетки ----------------------
     //
     // Рисуется ПОСЛЕ затемнения намеренно. Виньетка у нижнего края кадра
@@ -1083,7 +1265,11 @@ export function createRenderer() {
         this._drawCalls++;
       }
 
-      // 6) своё здоровье и «ты дух» — поверх всего: это интерфейс, а не мир.
+      // 6) пинги (8.8) — ПОВЕРХ виньетки: это речь игроков, а не мир, и
+      // гаснуть в темноте она не должна (см. _drawPings).
+      this._drawPings(view, t0);
+
+      // 7) своё здоровье и «ты дух» — поверх всего: это интерфейс, а не мир.
       this._drawSelfHud(view);
 
       this._ms = performance.now() - t0;

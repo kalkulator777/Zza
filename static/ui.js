@@ -40,6 +40,16 @@ const app = {
   // pick НЕ собирается никогда (5.2: событие теряется).
   builds: new Map(),
   dropEv: false,      // проверка 11.7: «событие потерялось» (см. __zza)
+  // --- пинги на карте (8.8) --------------------------------------------
+  // Живут ЗДЕСЬ, а не в state.js: мир — это то, что прислал сервер в
+  // снапшоте, а пинг сущностью не является и ни одного поля мира не
+  // трогает. Ключ записи — автор и тик постановки: сервер повторяет пинг,
+  // пока тот жив (5.2, событие может потеряться), и повтор обязан обновить
+  // запись, а не завести вторую.
+  pings: [],
+  pingsSeen: 0,       // сколько пингов ПРИШЛО за забег (приёмка)
+  pingsSent: 0,       // сколько пингов УШЛО на сервер (приёмка)
+  lastPingSent: null,
   // кадры
   frames: 0, fps: 0, _fpsT0: 0, _fpsN: 0,
   // запись позиций для проверки плавности (tests/client_interp.py)
@@ -282,7 +292,15 @@ function makeHandlers() {
       app.net.rooms();
       // Ввод шлём только в игре: в меню и лобби сущности нет, и 30 Гц
       // пустых сообщений — это трафик и работа сервера ни за что.
-      app.net.startPump(() => (app.screen === 'game' ? app.input.sample() : null));
+      // Опрос ввода 30 Гц (5.1). По дороге считаем УШЕДШИЕ пинги: без
+      // этого числа «пинга не видно» неразличимо с «пинг не отправляли», а
+      // это две разные поломки в двух разных половинах игры.
+      app.net.startPump(() => {
+        if (app.screen !== 'game') return null;
+        const st = app.input.sample();
+        if (st.btn & 96) { app.pingsSent++; app.lastPingSent = st.aim.slice(); }
+        return st;
+      });
     },
     onClose(wanted) {
       if (wanted) return;
@@ -321,6 +339,10 @@ function makeHandlers() {
     },
     onLevel(m, tiles) {
       if (!tiles) { setStatus('битая карта с сервера', true); return; }
+      // 8.8: пинг — это координаты ЭТОГО этажа. Сервер их тоже чистит при
+      // спуске (room.descend); клиент чистит сам, чтобы метка не пережила
+      // смену карты даже на один кадр.
+      app.pings.length = 0;
       app.world.applyLevel(m, tiles);
       show('game');
       setStatus('');
@@ -349,11 +371,93 @@ function makeHandlers() {
       // dropEv — выключатель для проверки 11.7: он изображает ПОТЕРЮ
       // события. Набор апгрейдов обязан остаться верным и без ev.
       if (app.dropEv) return;
+      // 8.8: пинг — это ev, но не вспышка. Вспышки (state.js) живут 0.3 с и
+      // гаснут в темноте; пинг живёт секунды и в темноте виден нарочно.
+      if (m.k === 'ping') { addPing(m); return; }
       app.world.pushEvent(m);
     },
     onError(m) { setStatus('сервер: ' + (m.msg || m.code), true); },
     onInputSent(seq, mv) { app.world.noteInput(seq, mv); },
   };
+}
+
+// ------------------------------------------------------- пинги (8.8)
+//
+// СРОК ЖИЗНИ СЧИТАЕТСЯ ОТ ТИКА СЕРВЕРА, А НЕ ОТ МОМЕНТА ПОЛУЧЕНИЯ. Сервер
+// повторяет живой пинг (5.2: событие может потеряться) и в каждом повторе
+// шлёт тик ПОСТАНОВКИ. Иначе пинг, поставленный три секунды назад, у
+// вошедшего в идущую партию прожил бы ещё четыре — то есть «опасность»
+// висела бы у одного дольше, чем у остальных, и группа видела бы разное.
+const PING_LIFE_TICKS = 120;        // 4.0 с при 30 Гц; вывод — в room.py
+const PING_FADE_MS = 400;           // последние 0.4 с пинг гаснет плавно
+// Потолки ТЕ ЖЕ, что на сервере (room.PING_PER_PLAYER / PING_MAX), и стоят
+// они здесь не для красоты. Сервер вытесняет третий пинг автора из СВОЕГО
+// списка — то есть перестаёт его повторять, — но уже разосланный пинг
+// живёт у клиента свои 4 секунды. Без потолка на клиенте спамер рисует
+// всем 4.0/0.5 = 8 меток вместо двух: замерено, tests/client_ping.py
+// показывала 5 живых там, где сервер держал 2. Потолок здесь закрывает это
+// так же, как «клиенту не верят» на сервере: не верить надо в обе стороны.
+const PING_PER_AUTHOR = 2;
+const PING_MAX = 8;
+
+function addPing(m) {
+  const key = (m.a | 0) + ':' + (m.tick | 0);
+  const now = performance.now();
+  // Сколько пингу осталось, по тикам сервера. Свежий пинг обгоняет
+  // latestTick на доли тика — отрицательный возраст это норма, не ошибка.
+  const age = Math.max(0, (app.world.latestTick | 0) - (m.tick | 0));
+  const left = (PING_LIFE_TICKS - age) * (1000 / TICK_HZ);
+  if (left <= 0) return;
+  for (let i = 0; i < app.pings.length; i++) {
+    if (app.pings[i].key === key) { app.pings[i].dies = now + left; return; }
+  }
+  app.pings.push({ key: key, a: m.a | 0, u: m.u | 0,
+                   x: +m.x, y: +m.y, nm: m.nm || '',
+                   tick: m.tick | 0, born: now, dies: now + left });
+  app.pingsSeen++;
+  dropExtra(app.pings, m.a | 0);
+}
+
+// Лишние метки гасятся по ТИКУ ПОСТАНОВКИ, а не по времени прихода: тик
+// приходит с сервера и одинаков у всех, а время прихода у каждого своё, и
+// по нему четыре вкладки погасили бы разные пинги.
+function dropExtra(ps, author) {
+  for (;;) {
+    let n = 0, old = -1, oldTick = Infinity;
+    for (let i = 0; i < ps.length; i++) {
+      if (ps[i].a !== author) continue;
+      n++;
+      if (ps[i].tick < oldTick) { oldTick = ps[i].tick; old = i; }
+    }
+    if (n <= PING_PER_AUTHOR || old < 0) break;
+    ps.splice(old, 1);
+  }
+  while (ps.length > PING_MAX) {
+    let old = 0;
+    for (let i = 1; i < ps.length; i++) if (ps[i].tick < ps[old].tick) old = i;
+    ps.splice(old, 1);
+  }
+}
+
+function livePings(now) {
+  const ps = app.pings;
+  let k = 0;
+  for (let i = 0; i < ps.length; i++) {
+    if (ps[i].dies > now) ps[k++] = ps[i];
+  }
+  ps.length = k;
+  return ps;
+}
+
+// Вид для рендера. 7.1 отдаёт бэкенду «состояние на 6.1»; пинги добавляются
+// ЗДЕСЬ, одним местом на все пути рисования, — иначе стенд стоимости кадра
+// (benchDrawFlush) мерил бы кадр без пингов и называл бы его кадром с ними.
+function buildFrameView(now) {
+  const view = app.world.buildView(now);
+  view.pings = livePings(now);
+  view.pingFade = PING_FADE_MS;
+  view.now = now;
+  return view;
 }
 
 // ---------------------------------------------------------------- кадр
@@ -374,7 +478,7 @@ function frame(now) {
   }
   if (app.screen !== 'game') return;
 
-  const view = app.world.buildView(now);
+  const view = buildFrameView(now);
   app.render.draw(view, view.alpha);
 
   if (app.msRec) {
@@ -560,7 +664,7 @@ export function boot() {
   });
   $('backendBtn').onclick = () => setBackend(app.backend === '2d' ? '3d' : '2d');
   // Клавиша B свободна: input.js разбирает WASD/стрелки, F, R, E, Q,
-  // Shift и пробел — B среди них нет.
+  // Shift, пробел и (с 8.8) V, C — B среди них нет.
   window.addEventListener('keydown', (e) => {
     if (e.code === 'KeyB' && app.screen === 'game' && !e.repeat) {
       setBackend(app.backend === '2d' ? '3d' : '2d');
@@ -700,6 +804,36 @@ export function boot() {
     watching: () => app.watch.on,
     watched: () => app.watch.out,
 
+    // --- пинги на карте (tests/client_ping_*.py, 8.8) ------------------
+    // Показания: что клиент СЕЙЧАС считает живым пингом. Рисование этого
+    // не заменяет — приёмка смотрит пиксели, а не этот список.
+    pings: () => app.pings.map((p) => ({ a: p.a, u: p.u, x: p.x, y: p.y,
+                                         nm: p.nm, left: p.dies - performance.now() })),
+    pingsSeen: () => app.pingsSeen,
+    pingsSent: () => app.pingsSent,
+    lastPingSent: () => app.lastPingSent,
+    // Куда поставлен пинг — в ЭКРАННЫХ пикселях, из рендера. Проверке
+    // нужно знать, где искать метку, и списывать эту арифметику в питон
+    // значило бы завести вторую истину о камере.
+    pingScreen: (i) => {
+      const p = app.pings[i];
+      if (!p) return null;
+      const s2 = app.render.worldToScreen(p.x, p.y);
+      return { x: s2[0], y: s2[1], u: p.u, nm: p.nm };
+    },
+    // Пинг в точку мира мимо мыши: за кадр мышью не ткнуть, а стрелку к
+    // внешнему пингу проверить надо. Уезжает тем же опросом 30 Гц, что и
+    // нажатие клавиши, — см. input.pingAtWorld. Обычный путь человека
+    // (клавиша V/C, колесо мыши) приёмка тоже проходит.
+    pingAt: (x, y, kind) => app.input.pingAtWorld(x, y, !!kind),
+    // Число нажатий пинга, посчитанное самим input.js: по нему видно, что
+    // зажатая клавиша даёт ОДИН пинг, а не тридцать.
+    pingPresses: () => app.input.pings,
+    // Выключатель рисования пингов — затем же, зачем setFog и setCombat:
+    // чтобы стоимость кадра мерилась на ОДНОЙ сцене спина к спине.
+    setPingDraw: (v) => { app.render.pings = !!v; return app.render.pings; },
+    getPingDraw: () => app.render.pings,
+
     // --- туман (tests/client_fog.py) ---------------------------------
     // Выключатель «клиент игнорирует vis» — ровно тот клиент, что был до
     // тумана. Нужен, чтобы проверка тумана умела покраснеть.
@@ -804,7 +938,7 @@ export function boot() {
     // размазывается по n. Повторять draw() безопасно: 7.1 запрещает ему
     // менять мир, он только рисует то, что дали.
     benchDraw: (n) => {
-      const view = app.world.buildView(performance.now());
+      const view = buildFrameView(performance.now());
       app.render.draw(view, view.alpha);     // прогрев: кэш карты и маска тумана
       const t0 = performance.now();
       for (let i = 0; i < n; i++) app.render.draw(view, view.alpha);
@@ -818,7 +952,7 @@ export function boot() {
     // накопленное, и в замер входит настоящая закраска. Само чтение стоит
     // одинаково в обоих сравниваемых замерах и потому из отношения уходит.
     benchDrawFlush: (n) => {
-      const view = app.world.buildView(performance.now());
+      const view = buildFrameView(performance.now());
       // Слив у каждого бэкенда свой, а смысл один: заставить браузер
       // ДОРИСОВАТЬ накопленное. У канвы это чтение одного пикселя, у WebGL
       // — readPixels одного пикселя (он тоже синхронный и тоже упирается в
@@ -844,7 +978,7 @@ export function boot() {
     // кадр, а только когда пришла дельта vis. Разница двух пачек: в первой
     // маска перерисовывается перед каждым draw, во второй нет.
     benchFog: (n) => {
-      const view = app.world.buildView(performance.now());
+      const view = buildFrameView(performance.now());
       const r = app.render;
       r.draw(view, view.alpha);
       const t0 = performance.now();
