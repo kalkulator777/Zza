@@ -78,7 +78,12 @@
           "side_friction_stiffness": 0.8,
           "handbrake_side_drop": 0.1,
           "steer_max": 0.5,
-          "downforce": 3.0
+          "downforce": 3.0,
+          "tire_peak_slip": 0.145,
+          "tire_tail": 0.72,
+          "tire_rear_grip": 1.0,
+          "tire_load_sens": 0.16,
+          "tire_roll_couple": 0.85
         }
       }
     },
@@ -159,7 +164,12 @@
           "side_friction_stiffness": 0.745,
           "handbrake_side_drop": 0.0713,
           "steer_max": 0.427,
-          "downforce": 4.05
+          "downforce": 4.05,
+          "tire_peak_slip": 0.185,
+          "tire_tail": 0.8,
+          "tire_rear_grip": 0.94,
+          "tire_load_sens": 0.19,
+          "tire_roll_couple": 0.9
         }
       }
     },
@@ -240,7 +250,12 @@
           "side_friction_stiffness": 0.897,
           "handbrake_side_drop": 0.1261,
           "steer_max": 0.604,
-          "downforce": 2.1
+          "downforce": 2.1,
+          "tire_peak_slip": 0.115,
+          "tire_tail": 0.62,
+          "tire_rear_grip": 1.06,
+          "tire_load_sens": 0.11,
+          "tire_roll_couple": 0.7
         }
       }
     },
@@ -321,7 +336,12 @@
           "side_friction_stiffness": 0.855,
           "handbrake_side_drop": 0.1152,
           "steer_max": 0.438,
-          "downforce": 4.8
+          "downforce": 4.8,
+          "tire_peak_slip": 0.205,
+          "tire_tail": 0.84,
+          "tire_rear_grip": 1.0,
+          "tire_load_sens": 0.22,
+          "tire_roll_couple": 1.0
         }
       }
     },
@@ -402,7 +422,12 @@
           "side_friction_stiffness": 0.712,
           "handbrake_side_drop": 0.0926,
           "steer_max": 0.354,
-          "downforce": 3.3
+          "downforce": 3.3,
+          "tire_peak_slip": 0.105,
+          "tire_tail": 0.6,
+          "tire_rear_grip": 0.98,
+          "tire_load_sens": 0.13,
+          "tire_roll_couple": 0.75
         }
       }
     }

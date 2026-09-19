@@ -104,7 +104,7 @@ ROLLBACK_SEED = 4062
 
 # md5 выпущенного модуля. Сторож, а не украшение: хэши четырёх движков в
 # §12.24 сняты С ЭТИХ БАЙТ, и другой файл их не наследует.
-WASM_MD5 = 'c254183dfe1421c13789f5ae847d2bc1'
+WASM_MD5 = 'ea40274096185f3a964a1a17b21a73ad'
 
 
 # ---------------------------------------------------------------------------
@@ -1449,6 +1449,313 @@ def _report_road(report, ev):
 
 
 # ---------------------------------------------------------------------------
+# Модель шин симулятора (§12.32)
+# ---------------------------------------------------------------------------
+#
+# Пороги здесь выведены из РАЗРЫВА между двумя состояниями, а не подобраны
+# под прогон (§12.20). У каждой проверки рядом измерено, что она краснеет:
+# нейтральное значение `tire_peak_slip = 0` — это ровно прежняя физика, и
+# сравнение идёт с ней же, тем же кодом, в том же прогоне. Поэтому «красное»
+# тут не подсаженная поломка, а второе честное состояние мира.
+
+TIRE_CARS = ('hatch', 'muscle', 'buggy', 'van', 'wedge')
+
+# Пик обязан быть выше полки за пиком. Нейтраль (потолок трения) даёт
+# отношение 0,94-0,97 — сила там не падает, а слегка РАСТЁТ вместе с Fz.
+# Порог 1,05 лежит посреди пустого промежутка между 0,97 и 1,10 (худшая
+# машина с моделью), то есть это не подгонка, а середина разрыва.
+TIRE_PEAK_MIN = 1.05
+# Подъём: на трети угла пика сила обязана быть заметно меньше пиковой.
+# Нейтраль даёт ровно 1,00 (полка с первого градуса).
+TIRE_RISE_MAX = 0.80
+# Круг сцепления. Нейтраль: боковая падает на 0,2 % (то есть не падает
+# вовсе), а тормоз обваливается до 16 % прямого. Модель обязана дать и то,
+# и другое: боковая платит, но и тормоз остаётся тормозом.
+TIRE_CIRCLE_LAT_DROP = 0.05
+TIRE_CIRCLE_BRAKE_KEEP = 0.50
+# Поперечный перенос веса. Нейтраль 1,10-1,16 (встроенный контроллер кладёт
+# боковую силу почти на высоте центра масс, roll_influence = 0,1), модель
+# 1,80-3,34. Порог посреди разрыва.
+TIRE_ROLL_MIN = 1.5
+
+
+class SimCar(object):
+    """Машина каталога на ровной площадке в пресете «симулятор».
+
+    Отдельный класс, а не ``Car``: тому нужен аркадный пресет и одна
+    машина, а здесь нужны все пять и переключатель модели шин.
+    """
+
+    def __init__(self, car_id, tire=True, over=None):
+        h = host()
+        h.reset(1)
+        h.add_ground(6000.0, rh.TRACK_FRICTION)
+        h.tuning_preset(1)
+        values = rh.car_tuning(_tire_catalog().get(car_id), 'sim')
+        if not tire:
+            values['tire_peak_slip'] = 0.0      # нейтраль: прежняя физика
+        if over:
+            values.update(over)
+        h.set_tuning(values)
+        tune = h.tuning_values()
+        self.t = tune
+        self.mass = tune['mass']
+        rest = (tune['wheel_radius'] + tune['suspension_rest']
+                + tune['half_height'] * 0.2)
+        self.h = h
+        self.idx = h.spawn_car(0.0, rest, 0.0, 0.0)
+        self.base = self.idx * OUT.FLOATS
+        for _ in range(rh.SETTLE_TICKS):
+            self.drive(0.0, 0.0, 0.0, 0.0)
+
+    def g(self, field):
+        return self.h.outputs[self.base + field]
+
+    def wheel(self, w, field):
+        return self.h.outputs[self.base + OUT.WHEELS
+                              + w * OUT.WHEELS_STRIDE + field]
+
+    def drive(self, throttle, brake, steer, handbrake):
+        self.h.set_input(self.idx, throttle, brake, steer, handbrake)
+        self.h.step(1)
+
+    def dose(self, **fields):
+        h = self.h
+        h._sync()
+        base = self.idx * EFF.FLOATS
+        for name, value in fields.items():
+            h.effects[base + getattr(EFF, name.upper())] = value
+
+    def axes(self):
+        yaw = self.g(OUT.YAW)
+        fx, fz = math.sin(yaw), math.cos(yaw)
+        return (fx, fz), (fz, -fx)              # вперёд, налево
+
+    def vfl(self):
+        (fx, fz), (lx, lz) = self.axes()
+        vx, vz = self.g(OUT.VX), self.g(OUT.VZ)
+        return vx * fx + vz * fz, vx * lx + vz * lz
+
+    def beta(self):
+        v_fwd, v_lat = self.vfl()
+        if abs(v_fwd) < 0.5:
+            return 0.0
+        return math.degrees(math.atan2(v_lat, abs(v_fwd)))
+
+    def spin_up(self, speed, guard=4000):
+        n = 0
+        while self.g(OUT.SPEED) < speed and n < guard:
+            self.drive(1.0, 0.0, 0.0, 0.0)
+            n += 1
+        for _ in range(8):
+            self.drive(0.0, 0.0, 0.0, 0.0)
+
+    def slide(self, deg):
+        """Поставить телу боковую скорость под угол ``deg`` (налево).
+
+        Толчком-воздействием, а не подменой состояния: своей двери «задать
+        скорость» у модуля нет, а ``push_*`` — это ровно приращение
+        скорости в м/с (§12.27).
+        """
+        (fx, fz), (lx, lz) = self.axes()
+        v_fwd, v_lat = self.vfl()
+        d = v_fwd * math.tan(math.radians(deg)) - v_lat
+        self.dose(push_x=lx * d, push_z=lz * d)
+        self.drive(0.0, 0.0, 0.0, 0.0)
+
+
+_TIRE_CATALOG = None
+
+
+def _tire_catalog():
+    global _TIRE_CATALOG
+    if _TIRE_CATALOG is None:
+        _TIRE_CATALOG = load_cars(os.path.join(BASE_DIR, 'content',
+                                               'cars.json'))
+    return _TIRE_CATALOG
+
+
+def tire_force(car_id, deg, tire=True, brake=0.0, throttle=0.0, speed=20.0,
+               over=None):
+    """Боковая и продольная сила на кузове за один тик под углом увода.
+
+    Меряется ПРИРАЩЕНИЕМ СКОРОСТИ кузова, а не тем, что модуль сам про
+    себя написал в `side_impulse`: иначе проверка сверяла бы модель с её
+    же отчётом. Возврат: (угол, боковая Н, продольная Н, m*g).
+    """
+    car = SimCar(car_id, tire, over)
+    car.spin_up(speed)
+    car.slide(deg)
+    (fx, fz), (lx, lz) = car.axes()
+    vx0, vz0 = car.g(OUT.VX), car.g(OUT.VZ)
+    alpha = abs(car.beta())
+    car.drive(throttle, brake, 0.0, 0.0)
+    dl = (car.g(OUT.VX) - vx0) * lx + (car.g(OUT.VZ) - vz0) * lz
+    df = (car.g(OUT.VX) - vx0) * fx + (car.g(OUT.VZ) - vz0) * fz
+    return alpha, -car.mass * dl / DT, car.mass * df / DT, car.mass * 9.81
+
+
+# Семейство простых водителей для ловимости. Занос считается пойманным,
+# если его поймал ХОТЬ ОДИН: метрика меряет машину, а не автопилот, и
+# «правильные действия» — это право водителя выбрать действие. Сигнал у
+# всех один и физический: угол увода ПЕРЕДНЕЙ оси, в нём уже сидит
+# рыскание, поэтому демпфирование берётся из физики, а не из коэффициента.
+TIRE_DRIVERS = ((0.0, True), (0.5, True), (1.0, True), (1.0, False))
+
+
+def tire_caught(car_id, deg, tire=True, speed=22.0, over=None, ticks=300):
+    for gain, hold in TIRE_DRIVERS:
+        car = SimCar(car_id, tire, over)
+        car.spin_up(speed)
+        car.slide(deg)
+        tune = car.t
+        good = 0
+        spun = False
+        for _ in range(ticks):
+            v_fwd, v_lat = car.vfl()
+            if abs(v_fwd) < 0.5 or abs(car.beta()) > 89.0:
+                spun = True
+                break
+            front = math.atan2(v_lat + car.g(OUT.WY) * tune['axle_z'],
+                               abs(v_fwd))
+            sp = car.g(OUT.SPEED)
+            avail = tune['steer_max'] * (
+                1.0 - tune['steer_speed_falloff']
+                * min(1.0, sp / tune['max_speed']))
+            steer = max(-1.0, min(1.0, gain * front / max(avail, 1e-3)))
+            car.drive(max(0.0, min(0.6, (speed - sp) * 0.3)) if hold else 0.0,
+                      0.0, steer, 0.0)
+            if abs(car.beta()) < 2.0 and abs(car.g(OUT.WY)) < 0.15:
+                good += 1
+                if good >= 12:
+                    return True
+            else:
+                good = 0
+        if spun:
+            continue
+    return False
+
+
+def report_tires(report):
+    """Кривая увода, круг сцепления, перенос веса и ловимость (§12.32)."""
+    print('  модель шин симулятора:')
+
+    # --- 1. у кривой есть ПИК, а не полка ---------------------------------
+    worst_peak = (None, 1e9)
+    worst_rise = (None, 0.0)
+    for car_id in TIRE_CARS:
+        peak_deg = math.degrees(
+            rh.car_tuning(_tire_catalog().get(car_id), 'sim')['tire_peak_slip'])
+        at_peak = tire_force(car_id, peak_deg)[1]
+        after = tire_force(car_id, peak_deg + 20.0)[1]
+        rise = tire_force(car_id, peak_deg / 3.0)[1]
+        if at_peak / after < worst_peak[1]:
+            worst_peak = (car_id, at_peak / after)
+        if rise / at_peak > worst_rise[1]:
+            worst_rise = (car_id, rise / at_peak)
+    report.check(worst_peak[1] >= TIRE_PEAK_MIN,
+                 'за пиком боковая сила ПАДАЕТ у всех пяти машин',
+                 'худшая %s: пик/(пик+20 град) = %.3f при пороге %.2f'
+                 % (worst_peak[0], worst_peak[1], TIRE_PEAK_MIN))
+    report.check(worst_rise[1] <= TIRE_RISE_MAX,
+                 'до пика боковая сила РАСТЁТ, а не стоит полкой',
+                 'худшая %s: (пик/3)/пик = %.3f при пороге %.2f'
+                 % (worst_rise[0], worst_rise[1], TIRE_RISE_MAX))
+    # то же на нейтрали — доказательство, что проверка способна покраснеть
+    peak_deg = math.degrees(
+        rh.car_tuning(_tire_catalog().get('hatch'), 'sim')['tire_peak_slip'])
+    flat_peak = tire_force('hatch', peak_deg, tire=False)[1]
+    flat_after = tire_force('hatch', peak_deg + 20.0, tire=False)[1]
+    flat_rise = tire_force('hatch', peak_deg / 3.0, tire=False)[1]
+    report.check(flat_peak / flat_after < TIRE_PEAK_MIN
+                 and flat_rise / flat_peak > TIRE_RISE_MAX,
+                 'обе проверки кривой краснеют на нейтрали (tire_peak_slip=0)',
+                 'нейтраль: пик/(пик+20) = %.3f, (пик/3)/пик = %.3f — полка'
+                 % (flat_peak / flat_after, flat_rise / flat_peak))
+
+    # --- 2. круг сцепления: бюджет один на двоих --------------------------
+    hatch_peak = peak_deg
+    lat_free = tire_force('hatch', hatch_peak)[1]
+    lat_brake, fwd_brake = tire_force('hatch', hatch_peak, brake=1.0)[1:3]
+    fwd_straight = tire_force('hatch', 0.5, brake=1.0)[2]
+    drop = 1.0 - lat_brake / lat_free
+    keep = fwd_brake / fwd_straight
+    report.check(drop >= TIRE_CIRCLE_LAT_DROP,
+                 'торможение в пол отнимает боковое сцепление',
+                 'боковая %.0f -> %.0f Н (-%.1f %%) при пороге %.0f %%'
+                 % (lat_free, lat_brake, drop * 100.0,
+                    TIRE_CIRCLE_LAT_DROP * 100.0))
+    report.check(keep >= TIRE_CIRCLE_BRAKE_KEEP,
+                 'и при этом тормоз остаётся тормозом, а не пропадает',
+                 'в дуге %.0f %% от прямого торможения при пороге %.0f %%'
+                 % (keep * 100.0, TIRE_CIRCLE_BRAKE_KEEP * 100.0))
+    n_lat = tire_force('hatch', hatch_peak, tire=False)[1]
+    n_lat_b, n_fwd_b = tire_force('hatch', hatch_peak, tire=False, brake=1.0)[1:3]
+    n_fwd_s = tire_force('hatch', 0.5, tire=False, brake=1.0)[2]
+    report.check(1.0 - n_lat_b / n_lat < TIRE_CIRCLE_LAT_DROP
+                 and n_fwd_b / n_fwd_s < TIRE_CIRCLE_BRAKE_KEEP,
+                 'обе проверки круга краснеют на нейтрали',
+                 'нейтраль: боковая -%.1f %%, тормоз %.0f %% от прямого'
+                 % ((1.0 - n_lat_b / n_lat) * 100.0, n_fwd_b / n_fwd_s * 100.0))
+
+    # --- 3. поперечный перенос веса ---------------------------------------
+    def roll_ratio(car_id, tire=True, over=None):
+        car = SimCar(car_id, tire, over)
+        car.spin_up(20.0)
+        car.slide(20.0)
+        for _ in range(30):
+            car.drive(0.0, 0.0, 0.0, 0.0)
+        left = (car.wheel(0, abi.WheelOut.SUSPENSION_FORCE)
+                + car.wheel(2, abi.WheelOut.SUSPENSION_FORCE))
+        right = (car.wheel(1, abi.WheelOut.SUSPENSION_FORCE)
+                 + car.wheel(3, abi.WheelOut.SUSPENSION_FORCE))
+        return max(left, right) / max(min(left, right), 1.0)
+
+    worst_roll = min((roll_ratio(c), c) for c in TIRE_CARS)
+    report.check(worst_roll[0] >= TIRE_ROLL_MIN,
+                 'в дуге машина опирается на внешние колёса',
+                 'худшая %s: нагруженная пара к разгруженной %.2f при '
+                 'пороге %.2f' % (worst_roll[1], worst_roll[0], TIRE_ROLL_MIN))
+    flat_roll = roll_ratio('hatch', tire=False)
+    report.check(flat_roll < TIRE_ROLL_MIN,
+                 'проверка переноса краснеет на нейтрали',
+                 'нейтраль: %.2f — поперечного переноса у встроенного '
+                 'контроллера почти нет' % flat_roll)
+
+    # --- 4. ловимость -----------------------------------------------------
+    # Занос ВТРОЕ круче угла пика обязан ловиться. Тройка не подобрана: это
+    # запас, ниже которого «предел найден» и «машина потеряна» сливаются в
+    # один угол и водителю нечего ловить.
+    bad = [c for c in TIRE_CARS
+           if not tire_caught(c, 3.0 * math.degrees(
+               rh.car_tuning(_tire_catalog().get(c), 'sim')['tire_peak_slip']))]
+    report.check(not bad,
+                 'занос втрое круче угла пика ловится встречным рулём',
+                 (', '.join(bad) + ' — не поймали') if bad
+                 else 'поймали все пять')
+    # Красная половина: кривая-лезвие — пик на 1,7 град и за ним 5 % от
+    # него. Правится ровно то, что проверка охраняет, — форма кривой.
+    report.check(not tire_caught('hatch', 3.0 * hatch_peak,
+                                 over={'tire_peak_slip': 0.03,
+                                       'tire_tail': 0.05}),
+                 'проверка ловимости краснеет на кривой-лезвии',
+                 'при пике 0,03 рад и полке 0,05 тот же занос не ловит ни '
+                 'один из %d водителей' % len(TIRE_DRIVERS))
+
+    # --- 5. аркада моделью шин НЕ тронута ---------------------------------
+    arcade = rh.car_tuning(_tire_catalog().get('hatch'), 'arcade')
+    report.check(arcade.get('tire_peak_slip', 0.0) == 0.0,
+                 'в аркадном блоке каталога модели шин нет',
+                 'tire_peak_slip = %r' % arcade.get('tire_peak_slip', 0.0))
+    host().reset(0)
+    host().tuning_preset(0)
+    report.check(host().tuning_values()['tire_peak_slip'] == 0.0,
+                 'аркадный пресет модуля ставит нейтраль',
+                 'rp_tuning_preset(0) -> tire_peak_slip = %r'
+                 % host().tuning_values()['tire_peak_slip'])
+
+
+# ---------------------------------------------------------------------------
 # Модуль: md5 и сверка движков
 # ---------------------------------------------------------------------------
 # Стенд четырёх движков (tools/test_wasm_parity.py) поднимает wasmtime, Node,
@@ -1518,13 +1825,22 @@ def report_module(report, wasm_parity=True):
     # БРАУЗЕРА (V8 через static/js/rapier_host.js) одни и те же. Замерено,
     # что проверка способна покраснеть: сдвиг ОДНОЙ коробки из 38 на 1 мм
     # разводит движки начиная с 200-го тика.
-    for track_id, what in (('avenue', 'один .wasm — один результат'),
-                           ('ridge', 'коробки трамплина у сервера и у '
-                                     'браузера одни и те же')):
+    # Третий сценарий — тот же avenue в пресете «симулятор» (§12.32).
+    # Без него ни одна сверка движков не трогает модель шин, а она считает
+    # синус и арктангенс: если бы они приезжали импортом от хозяина, движки
+    # разошлись бы именно здесь. У модуля импортов ноль, и это надо не
+    # заявлять, а мерить.
+    for track_id, mode, what in (
+            ('avenue', 'arcade', 'один .wasm — один результат'),
+            ('ridge', 'arcade', 'коробки трамплина у сервера и у '
+                                'браузера одни и те же'),
+            ('avenue', 'sim', 'модель шин считается одинаково у сервера '
+                              'и у браузера')):
         proc = subprocess.run(
             [sys.executable,
              os.path.join(BASE_DIR, 'tools', 'test_wasm_parity.py'),
-             '--engines', 'wasmtime,node', '--track', track_id],
+             '--engines', 'wasmtime,node', '--track', track_id,
+             '--mode', mode],
             cwd=BASE_DIR, capture_output=True, text=True)
         tail = [line for line in proc.stdout.splitlines() if line.strip()]
         report.check(proc.returncode == 0, '%s (wasmtime, Node)' % what,
@@ -2008,6 +2324,7 @@ def main(argv=None):
         report_road(report)
         report_ramps(report)
         report_handicap_fields(report)
+        report_tires(report)
         report_module(report, wasm_parity=not args.no_wasm_parity)
     except rh.HostError as exc:
         print('  ПРОПУЩЕНО: модуль физики недоступен — %s' % exc)

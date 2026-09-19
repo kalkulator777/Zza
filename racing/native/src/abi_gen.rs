@@ -8,13 +8,14 @@
 // ПРАВИЛО ВЕРСИИ (§12.24). abi_version поднимается при ЛЮБОМ изменении размера или раскладки любой структуры — даже если это чистое дополнение в хвост и по смыслу полей ничего не сломалось. Совместимость тут не по смыслу, а по байтам: версия отмечает не «формат несовместим», а «хозяин и модуль из разных сборок не должны молча заработать». Сценарий, ради которого поле и существует: браузер держит в кэше старый .wasm, а страница приезжает новая — новый хозяин читает CarOut как 54 f32 из модуля, который пишет 52, и последние два поля оказываются мусором. Искать это будут в физике.
 // Версия 2 — этап 4e: CarInput 4->5 f32 (offtrack), CarOut 52->54 (boost_time, drift_level), CarTuning 32->40 (награда за занос).
 // Версия 3 — этап 4g: новая структура CarEffect (12 f32) и буфер EFFECTS под ВНЕШНИЕ ВОЗДЕЙСТВИЯ на машину. Размеры прежних структур не тронуты, но правило версии не про смысл, а про байты: новый буфер — это новый экспорт rp_effects_ptr, и хозяин постарше о нём не знает.
+// Версия 4 — этап 4i: CarTuning 40->45 f32, симуляторная модель шин (кривая увода и круг сцепления). Пять полей в хвост: tire_peak_slip, tire_tail, tire_rear_grip, tire_load_sens, tire_roll_couple. tire_peak_slip = 0 значит «модели нет», и аркадный пресет ставит именно ноль — старый путь считается прежним кодом бит в бит.
 
 use core::mem::{offset_of, size_of};
 
 /// Версия раскладки. Хозяин обязан сверить, иначе молча разъедутся раскладки.
 /// Поднимается при любом изменении размера ЛЮБОЙ структуры, даже дополнении в хвост:
 /// совместимость тут по байтам, а не по смыслу полей (правило в шапке файла).
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 /// Максимум машин в мире. Восемь по контракту, держим запас.
 pub const MAX_CARS: usize = 16;
@@ -524,7 +525,7 @@ const _: () = assert!(offset_of!(CarSave, boost_time) == 84);
 const _: () = assert!(offset_of!(CarSave, _pad) == 88);
 
 /// Шаблон настроек машины. Хозяин правит поля напрямую в общей памяти, следующая rp_car_spawn берёт их отсюда.
-/// 40 f32 = 160 байт.
+/// 45 f32 = 180 байт.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct CarTuning {
@@ -599,13 +600,29 @@ pub struct CarTuning {
     pub boost_speed: f32,
     /// с каким ускорением тянет, м/с² (BOOST_ACCEL из 6.4).
     pub boost_accel: f32,
+    /// Угол увода пика боковой силы, рад. ВЫКЛЮЧАТЕЛЬ всей модели шин:
+    /// ноль значит «модели нет» и шина считается встроенным контроллером
+    /// Rapier ровно как раньше. Аркада ставит ноль.
+    pub tire_peak_slip: f32,
+    /// Доля пика, к которой сила падает далеко за пиком (скольжение).
+    pub tire_tail: f32,
+    /// Множитель сцепления ЗАДНЕЙ оси: <1 — избыточная поворачиваемость,
+    /// >1 — недостаточная. Баланс машины.
+    pub tire_rear_grip: f32,
+    /// Чувствительность к нагрузке: mu = mu0*(1 - k*(Fz/Fz0 - 1)).
+    /// Без неё перенос веса не меняет суммарного сцепления вовсе.
+    pub tire_load_sens: f32,
+    /// Доля момента крена от боковой силы шины: 1 — сила приложена в
+    /// пятне контакта, 0 — на высоте центра масс. Тем же приёмом
+    /// встроенный контроллер держит roll_influence = 0,1.
+    pub tire_roll_couple: f32,
 }
 
 impl CarTuning {
     /// Размер записи в байтах.
-    pub const SIZE: usize = 160;
+    pub const SIZE: usize = 180;
     /// Сколько в записи чисел f32.
-    pub const FLOATS: usize = 40;
+    pub const FLOATS: usize = 45;
     /// Запись «всё в нуле» — из неё набиваются общие буферы.
     pub const INIT: Self = CarTuning {
         half_length: 0.0,
@@ -648,6 +665,11 @@ impl CarTuning {
         drift_boost_l3: 0.0,
         boost_speed: 0.0,
         boost_accel: 0.0,
+        tire_peak_slip: 0.0,
+        tire_tail: 0.0,
+        tire_rear_grip: 0.0,
+        tire_load_sens: 0.0,
+        tire_roll_couple: 0.0,
     };
 }
 
@@ -692,6 +714,11 @@ const _: () = assert!(offset_of!(CarTuning, drift_boost_l2) == 144);
 const _: () = assert!(offset_of!(CarTuning, drift_boost_l3) == 148);
 const _: () = assert!(offset_of!(CarTuning, boost_speed) == 152);
 const _: () = assert!(offset_of!(CarTuning, boost_accel) == 156);
+const _: () = assert!(offset_of!(CarTuning, tire_peak_slip) == 160);
+const _: () = assert!(offset_of!(CarTuning, tire_tail) == 164);
+const _: () = assert!(offset_of!(CarTuning, tire_rear_grip) == 168);
+const _: () = assert!(offset_of!(CarTuning, tire_load_sens) == 172);
+const _: () = assert!(offset_of!(CarTuning, tire_roll_couple) == 176);
 
 // --- общие буферы -----------------------------------------------------------
 

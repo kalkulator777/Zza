@@ -21,6 +21,7 @@
 
     python3 tools/test_wasm_parity.py            # все доступные движки
     python3 tools/test_wasm_parity.py --engines wasmtime,node
+    python3 tools/test_wasm_parity.py --mode sim  # с моделью шин §12.32
 """
 
 from __future__ import annotations
@@ -148,7 +149,15 @@ def _ramp_spawn(track, index, count):
     return x, z, math.atan2(track._ctx[i], track._ctz[i]), i
 
 
-def build_scenario(track_id: str = TRACK_ID) -> dict:
+def build_scenario(track_id: str = TRACK_ID, mode: str = 'arcade') -> dict:
+    """Сценарий для движков. ``mode`` — пресет управляемости (§12.23).
+
+    Умолчание — аркада, и менять его нельзя: хэши §12.24 и §12.27 сняты
+    именно с неё. Значение ``sim`` даёт ВТОРОЙ сценарий, а не правку
+    старого: без него ни одна сверка движков не трогает симуляторную
+    модель шин (§12.32), а она считает синус и арктангенс — то самое
+    место, где движки разошлись бы первыми.
+    """
     track = Track.load(os.path.join(BASE_DIR, 'content', 'tracks', track_id + '.json'))
     catalog = load_cars(os.path.join(BASE_DIR, 'content', 'cars.json'))
     margin, height, friction = rh.mesh_params(track)
@@ -158,7 +167,7 @@ def build_scenario(track_id: str = TRACK_ID) -> dict:
     cars = []
     for i, car_id in enumerate(CAR_IDS):
         spec = catalog.get(car_id)
-        tuning = rh.car_tuning(spec, 'arcade')
+        tuning = rh.car_tuning(spec, mode)
         rest = (tuning.get('wheel_radius', 0.34)
                 + tuning.get('suspension_rest', 0.30)
                 + tuning.get('half_height', 0.42) * 0.2)
@@ -179,7 +188,7 @@ def build_scenario(track_id: str = TRACK_ID) -> dict:
     return {
         'track': track.to_client(),
         'mesh': [margin, height, friction],
-        'preset': 0,
+        'preset': 1 if mode == 'sim' else 0,
         'settle': rh.SETTLE_TICKS,
         'ticks': ticks,
         'marks': list(marks),
@@ -367,13 +376,16 @@ def main(argv=None):
                         help='трасса сценария; с трамплинами (industrial, '
                              'serpentine, ridge) машины ставятся перед '
                              'въездом и летят (§12.30)')
+    parser.add_argument('--mode', default='arcade', choices=('arcade', 'sim'),
+                        help='пресет управляемости сценария; sim гоняет '
+                             'модель шин §12.32')
     args = parser.parse_args(argv)
     wanted = [name.strip() for name in args.engines.split(',') if name.strip()]
 
-    scenario = build_scenario(args.track)
-    print('стенд сверки движков: трасса %s, %d машин, %d тиков, '
+    scenario = build_scenario(args.track, args.mode)
+    print('стенд сверки движков: трасса %s, пресет %s, %d машин, %d тиков, '
           '%d контрольных точек'
-          % (args.track, len(scenario['cars']), scenario['ticks'],
+          % (args.track, args.mode, len(scenario['cars']), scenario['ticks'],
              len(scenario['marks'])))
     tmp = args.keep or os.path.join(tempfile.mkdtemp(prefix='wasm-parity-'),
                                     'scenario.json')
